@@ -18,9 +18,11 @@ The API listens on `http://localhost:3000`. Check `GET /health/live` and `GET /h
 
 ## IGDB setup
 
-Register a confidential application in the [Twitch developer console](https://dev.twitch.tv/console/apps), then set `IGDB_CLIENT_ID` and `IGDB_CLIENT_SECRET` in `.env`. Credentials stay on the backend. The application starts without them; only upstream catalog search/import will return `503 igdb_not_configured` (locally stored games still work).
+Register a confidential application in the [Twitch developer console](https://dev.twitch.tv/console/apps), then set `IGDB_CLIENT_ID` and `IGDB_CLIENT_SECRET` in `.env`. Credentials stay on the backend. The application starts without them; operations requiring upstream metadata return `503 igdb_not_configured` (locally stored games still work).
 
-Catalog search is a read-only proxy: it queries IGDB and returns results without writing anything. A game earns a row in PostgreSQL when a user commits to it — adding it to a library or recording a playthrough — or through an explicit import, so the catalog holds games this instance actually references rather than everything anyone searched for. Games are named publicly by their IGDB ID; the local UUID is an internal primary key that never appears in a URL, which keeps the identifier a client needs available before any row exists.
+Catalog search and detail lookup are public, read-only proxies: they query IGDB and return the same descriptive fields without writing anything. The SPA can use `GET /api/catalog/games/{igdb_id}` for direct links and page reloads without a prior search, import, or sign-in. A game earns a row in PostgreSQL when an authenticated user commits to it — adding it to a library or recording a playthrough — or through an explicit import, so the local catalog holds games this instance actually references. Games are named publicly by their IGDB ID; the local UUID is an internal primary key that never appears in a URL, which keeps the identifier a client needs available before any row exists.
+
+Catalog lookup always contacts IGDB and reports provider errors without a local fallback. `GET /api/games/{igdb_id}` remains a separate read of stored metadata that works without IGDB and returns 404 for games not stored locally. Neither read inserts or refreshes a stored game.
 
 Storing a game reuses metadata refreshed within 24 hours and refreshes anything older, preserving the local UUID and every attached library entry and playthrough. If IGDB is unavailable, an already-stored game is still served and can still be added to a library, using its stale metadata; only a game never seen before needs a successful upstream call. Local game reads never require IGDB. The client caches OAuth tokens and refreshes them single-flight, retries once on an upstream 401, throttles requests below four per second, caps how many upstream requests are in flight at once and observes upstream rate limits. Callers past that cap queue for a slot rather than failing; `429 catalog_busy` is returned only when the queue behind it is also full. There is no full-catalog crawl or scheduled metadata synchronization yet.
 
@@ -73,6 +75,8 @@ This is a backend foundation for one application process. Before deployment, use
 Production SMTP uses authenticated STARTTLS. Audit records persist in PostgreSQL; Doorman's audit sink is best-effort, with failures logged. Set retention and backups for these potentially sensitive records. Expired authentication sessions and challenges are purged every five minutes. Request logging excludes query strings, headers and bodies; do not enable development terminal email in production (configuration rejects it).
 
 Authentication rate limiting and IGDB throttling are per process. Before running multiple replicas, add shared limiting and review Doorman's session cache invalidation across replicas.
+
+Public catalog search and lookup share the bounded IGDB queue and throttle with authenticated imports. Before public launch, add per-client catalog limits and edge abuse controls so one visitor cannot consume the shared provider capacity.
 
 Authentication client identity comes from the immediate socket peer via Axum's `ConnectInfo<SocketAddr>`, supplied by the server in `src/main.rs`. Doorman uses that IP for rate-limit buckets and recorded client IPs, ignoring the source port and incoming `Forwarded`, `X-Forwarded-For`, and `X-Real-IP` headers. Authentication routes that require client identity reject missing connection metadata with `500 internal_error`.
 

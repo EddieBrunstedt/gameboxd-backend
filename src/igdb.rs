@@ -159,7 +159,7 @@ impl ProviderGame {
 }
 
 /// One upstream game as the API exposes it. Distinct from [`crate::models::Game`]:
-/// this carries no local identity and no import timestamps, because a searched
+/// this carries no local identity and no import timestamps, because a viewed
 /// game need not exist in the database at all. Games are named publicly by
 /// `igdb_id`; the local UUID is an internal primary key and never appears in
 /// a URL or a catalog response.

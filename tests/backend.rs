@@ -196,6 +196,158 @@ async fn json_body(response: Response, status: StatusCode) -> Value {
     }
 }
 
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn public_catalog_details_work_without_search_or_import_and_never_write() {
+    let fixture = Fixture::new().await;
+    let detail_path = "/api/catalog/games/42";
+    // A direct URL works before any search, import or sign-in.
+    let detail = json_body(
+        fixture.call("GET", detail_path, None, Value::Null).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(detail["igdb_id"], 42);
+    assert_eq!(detail["developers"][0]["name"], "Test Studio");
+    for field in ["id", "imported_at", "refreshed_at"] {
+        assert!(detail.get(field).is_none());
+    }
+    let search = json_body(
+        fixture
+            .call("GET", "/api/catalog/search?q=Test", None, Value::Null)
+            .await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(detail, search["data"][0]);
+    let reloaded = json_body(
+        fixture.call("GET", detail_path, None, Value::Null).await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(reloaded, detail);
+    let counts: (i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM games), (SELECT count(*) FROM library_entries),
+                (SELECT count(*) FROM playthroughs)",
+    )
+    .fetch_one(&fixture.database.app)
+    .await
+    .unwrap();
+    assert_eq!(counts, (0, 0, 0));
+    json_body(
+        fixture
+            .call("GET", "/api/games/42", None, Value::Null)
+            .await,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+
+    let (_, token) = fixture.user("catalog").await;
+    fixture
+        .value(
+            "POST",
+            "/api/catalog/import/42",
+            &token,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    // Even stale stored metadata is untouched when the upstream view changes.
+    sqlx::query("UPDATE games SET name='Stored title', refreshed_at=now()-interval '2 days'")
+        .execute(&fixture.database.app)
+        .await
+        .unwrap();
+    let stored = json_body(
+        fixture
+            .call("GET", "/api/games/42", None, Value::Null)
+            .await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        json_body(
+            fixture.call("GET", detail_path, None, Value::Null).await,
+            StatusCode::OK
+        )
+        .await,
+        detail
+    );
+    let after = json_body(
+        fixture
+            .call("GET", "/api/games/42", None, Value::Null)
+            .await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(after, stored);
+
+    // Provider failure is not a missing game; local reads still work offline.
+    fixture.server.reset().await;
+    Mock::given(path("/games"))
+        .respond_with(ResponseTemplate::new(500).set_body_string("provider secret"))
+        .expect(1)
+        .mount(&fixture.server)
+        .await;
+    let error = json_body(
+        fixture.call("GET", detail_path, None, Value::Null).await,
+        StatusCode::BAD_GATEWAY,
+    )
+    .await;
+    assert_eq!(error["error"]["code"], "igdb_unavailable");
+    assert!(!error.to_string().contains("provider secret"));
+    assert_eq!(
+        json_body(
+            fixture
+                .call("GET", "/api/games/42", None, Value::Null)
+                .await,
+            StatusCode::OK
+        )
+        .await,
+        stored
+    );
+    fixture.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn public_catalog_lookup_validates_ids_and_reports_missing_games() {
+    let fixture = Fixture::new().await;
+    for id in ["0", "-1", "not-an-id", "9223372036854775808", "42;limit=50"] {
+        let error = json_body(
+            fixture
+                .call(
+                    "GET",
+                    &format!("/api/catalog/games/{id}"),
+                    None,
+                    Value::Null,
+                )
+                .await,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_eq!(error["error"]["code"], "validation_error");
+    }
+    assert!(fixture.server.received_requests().await.unwrap().is_empty());
+    Mock::given(path("/games"))
+        .and(wiremock::matchers::body_string_contains(
+            "where id = 999; limit 1;",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!([])))
+        .with_priority(1)
+        .expect(1)
+        .mount(&fixture.server)
+        .await;
+    let missing = json_body(
+        fixture
+            .call("GET", "/api/catalog/games/999", None, Value::Null)
+            .await,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert_eq!(missing["error"]["code"], "not_found");
+    fixture.finish().await;
+}
+
 const AUTHENTICATE_START: &str = "/auth/passkey/authenticate/start";
 
 fn authentication_request(peer: Option<SocketAddr>) -> Request<Body> {
@@ -386,7 +538,7 @@ async fn authenticated_catalog_and_library_flow_with_ownership_and_logout() {
     );
     assert_eq!(
         fixture
-            .call("GET", "/api/catalog/search?q=Halo", None, Value::Null)
+            .call("POST", "/api/catalog/import/42", None, Value::Null)
             .await
             .status(),
         401

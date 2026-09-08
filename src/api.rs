@@ -27,6 +27,7 @@ pub fn routes() -> Router<AppState> {
         .route("/api/games", get(games))
         .route("/api/games/{igdb_id}", get(game))
         .route("/api/catalog/search", get(search))
+        .route("/api/catalog/games/{igdb_id}", get(catalog_game))
         .route("/api/catalog/import/{igdb_id}", post(import))
         .route(
             "/api/me/playthroughs",
@@ -163,7 +164,6 @@ async fn game(
 }
 
 async fn search(
-    _user: AuthUser,
     State(state): State<AppState>,
     params: Result<Query<PageQuery>, QueryRejection>,
 ) -> ApiResult<Json<Value>> {
@@ -183,6 +183,15 @@ async fn search(
     Ok(Json(
         json!({ "data": data, "limit": params.limit, "offset": params.offset, "next_offset": next_offset }),
     ))
+}
+
+async fn catalog_game(
+    State(state): State<AppState>,
+    igdb_id: Result<Path<i64>, PathRejection>,
+) -> ApiResult<Json<CatalogGame>> {
+    // Like search, viewing a game never imports or refreshes a local row.
+    let game = state.igdb.get(igdb_path(igdb_id)?).await?;
+    Ok(Json(CatalogGame::from(game)))
 }
 
 async fn import(

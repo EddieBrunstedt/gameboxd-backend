@@ -32,7 +32,7 @@ pub struct Game {
 ///
 /// Materializing a game is a side effect of an operation the user actually
 /// intends — adding it to a library, recording a playthrough, or an explicit
-/// import — never of a search.
+/// import — never of a search or catalog lookup.
 /// If upstream is unavailable but a stale local row exists, the stale row is
 /// used: an existing game stays usable while IGDB is down, and only a genuinely
 /// unknown game requires a successful upstream call.

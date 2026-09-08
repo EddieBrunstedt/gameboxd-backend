@@ -284,6 +284,10 @@ async fn credentials_are_optional_and_invalid_inputs_do_not_call_provider() {
         client.search("Halo", 20, 0).await.unwrap_err().code,
         "igdb_not_configured"
     );
+    assert_eq!(
+        client.get(42).await.unwrap_err().code,
+        "igdb_not_configured"
+    );
     assert_eq!(client.get(-1).await.unwrap_err().status, 400);
     assert_eq!(client.search("Halo", 500, 0).await.unwrap_err().status, 400);
     assert!(validate_search(" \n ").is_err());

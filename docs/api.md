@@ -12,7 +12,8 @@ Base URL: `http://localhost:3000`. All bodies are JSON unless a response is `204
 | PUT | `/api/me` | Yes | Replace display name and bio |
 | GET | `/api/games?q=halo&limit=20&offset=0` | No | Search games stored locally |
 | GET | `/api/games/{igdb_id}` | No | Locally stored game details |
-| GET | `/api/catalog/search?q=halo&limit=20&offset=0` | Yes | Search IGDB; read-only, stores nothing |
+| GET | `/api/catalog/search?q=halo&limit=20&offset=0` | No | Search IGDB; read-only, stores nothing |
+| GET | `/api/catalog/games/{igdb_id}` | No | Look up IGDB game details; read-only, stores nothing |
 | POST | `/api/catalog/import/{igdb_id}` | Yes | Store one game or refresh metadata older than 24 hours |
 | GET | `/api/me/library?status=playing&q=halo&limit=20&offset=0` | Yes | Own library with nested game details |
 | GET | `/api/me/library/{igdb_id}` | Yes | Own entry for a game |
@@ -26,7 +27,11 @@ Base URL: `http://localhost:3000`. All bodies are JSON unless a response is `204
 
 A stored game includes `id`, `igdb_id`, `name`, `slug`, nullable `summary`, `cover_url`, `first_release_date`, arrays of `{id,name}` for `platforms`, `genres`, `developers`, nullable `game_type`, `parent_igdb_id`, `version_parent_igdb_id`, `source_url`, `imported_at` and `refreshed_at`. Taxonomy/parent IDs are upstream IGDB IDs, not local UUIDs. The `game` nested in a library listing is that same object, field for field.
 
-Catalog search results are a different shape: they carry the same descriptive fields but no `id`, `imported_at` or `refreshed_at`, because a searched game need not exist locally. Address them by `igdb_id`.
+Catalog search results and catalog lookup share one descriptive shape: `igdb_id`, `name`, `slug`, nullable `summary`, `cover_url`, `first_release_date`, arrays of `{id,name}` for `platforms`, `genres`, `developers`, nullable `game_type`, `parent_igdb_id`, `version_parent_igdb_id`, and `source_url`. They carry no `id`, `imported_at` or `refreshed_at`, because a viewed game need not exist locally. Address them by `igdb_id`.
+
+Use `GET /api/catalog/games/{igdb_id}` for frontend detail pages, including direct links and reloads. It returns a single catalog game object and needs no prior search, import, or sign-in. Search and lookup always query IGDB and never insert or refresh local games, create library entries, or record playthroughs. Imports and personal records still require authentication.
+
+Catalog lookup accepts a positive signed 64-bit integer ID; malformed, overflowing, zero and negative IDs return `400 validation_error` before contacting IGDB. A game absent from IGDB returns `404 not_found`; provider failures retain the IGDB errors below, including `503 igdb_not_configured` when credentials are missing. Catalog lookup has no local fallback. Use `GET /api/games/{igdb_id}` when specifically reading stored metadata without IGDB; that route still returns 404 for games not stored here.
 
 `PUT /api/me` body (both fields required):
 
