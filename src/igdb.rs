@@ -1,12 +1,12 @@
-use std::{
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::{sync::Arc, time::Duration};
 
 use axum::http::StatusCode;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::{
+    sync::{Mutex, Semaphore},
+    time::Instant,
+};
 
 use crate::error::{ApiError, ApiResult};
 
@@ -52,7 +52,7 @@ struct ClientState {
     /// single-flight, so racing callers await one fetch instead of each
     /// starting their own.
     token: Mutex<Option<(String, Instant)>>,
-    /// Request spacing and upstream cooldown share a lock so reservations see
+    /// Request spacing and upstream cooldown share a lock so callers see
     /// a consistent schedule. Never held across I/O.
     throttle: Mutex<Throttle>,
     in_flight: Semaphore,
@@ -376,22 +376,28 @@ impl IgdbClient {
         }
     }
 
-    /// Claims the next throttle slot and waits for it, holding the lock only
-    /// while reserving. Admitted callers may wait for normal request spacing;
+    /// Waits until dispatch is allowed, rechecking the schedule after every
+    /// sleep. Admitted callers may wait for normal request spacing;
     /// only an upstream cooldown beyond [`MAX_COOLDOWN_WAIT`] rejects them.
     async fn reserve_slot(&self) -> ApiResult<()> {
-        let wait = {
-            let mut throttle = self.state.throttle.lock().await;
-            let now = Instant::now();
-            if throttle.cooldown_until.saturating_duration_since(now) > MAX_COOLDOWN_WAIT {
-                return Err(rate_limited());
-            }
-            let slot = throttle.next_request.max(throttle.cooldown_until).max(now);
-            throttle.next_request = slot + MIN_REQUEST_INTERVAL;
-            slot.duration_since(now)
-        };
-        tokio::time::sleep(wait).await;
-        Ok(())
+        loop {
+            let slot = {
+                let mut throttle = self.state.throttle.lock().await;
+                let now = Instant::now();
+                if throttle.cooldown_until.saturating_duration_since(now) > MAX_COOLDOWN_WAIT {
+                    return Err(rate_limited());
+                }
+                let slot = throttle.next_request.max(throttle.cooldown_until);
+                if slot <= now {
+                    // Claim only a ready slot. Other waking callers must wait
+                    // another interval, including after a cooldown extension.
+                    throttle.next_request = now + MIN_REQUEST_INTERVAL;
+                    return Ok(());
+                }
+                slot
+            };
+            tokio::time::sleep_until(slot).await;
+        }
     }
 
     /// Records upstream cooldown separately from the ordinary dispatch queue.
@@ -417,5 +423,61 @@ pub fn validate_search(query: &str) -> ApiResult<&str> {
         ))
     } else {
         Ok(query)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::{sync::mpsc, time::advance};
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_dispatches_honor_cooldown_extensions_and_resume_with_spacing() {
+        let client = IgdbClient::new(None, Endpoints::default()).unwrap();
+        assert!(client.reserve_slot().await.is_ok());
+        let (sent, mut received) = mpsc::unbounded_channel();
+        let mut callers = tokio::task::JoinSet::new();
+        for _ in 0..3 {
+            let client = client.clone();
+            let sent = sent.clone();
+            callers.spawn(async move {
+                assert!(client.reserve_slot().await.is_ok());
+                sent.send(Instant::now()).unwrap();
+            });
+        }
+        // Let all callers start waiting on ordinary request spacing.
+        tokio::task::yield_now().await;
+        advance(Duration::from_millis(50)).await;
+        client.back_off(Duration::from_secs(1)).await;
+        advance(MIN_REQUEST_INTERVAL).await;
+        assert!(received.try_recv().is_err());
+
+        // A second in-flight response extends the cooldown while they sleep.
+        client.back_off(Duration::from_secs(1)).await;
+        let cooldown_until = Instant::now() + Duration::from_secs(1);
+        // A shorter response must not overwrite that extension.
+        client.back_off(Duration::from_millis(100)).await;
+        // This crosses the original cooldown expiry, but not the extension.
+        advance(Duration::from_millis(800)).await;
+        assert!(received.try_recv().is_err());
+
+        // Include a caller arriving during the extended cooldown.
+        let arrival = client.clone();
+        callers.spawn(async move {
+            assert!(arrival.reserve_slot().await.is_ok());
+            sent.send(Instant::now()).unwrap();
+        });
+        while let Some(result) = callers.join_next().await {
+            result.unwrap();
+        }
+        let mut times = Vec::new();
+        while let Ok(time) = received.try_recv() {
+            times.push(time);
+        }
+        assert_eq!(times.len(), 4);
+        assert!(times[0] >= cooldown_until);
+        for pair in times.windows(2) {
+            assert!(pair[1].duration_since(pair[0]) >= MIN_REQUEST_INTERVAL);
+        }
     }
 }

@@ -222,6 +222,38 @@ async fn provider_rate_limit_stops_subsequent_upstream_requests() {
 }
 
 #[tokio::test]
+async fn provider_cooldown_stops_already_waiting_requests() {
+    let server = MockServer::start().await;
+    token(&server, 1).await;
+    Mock::given(path("/games"))
+        .respond_with(
+            ResponseTemplate::new(429)
+                .insert_header("Retry-After", "60")
+                .set_delay(Duration::from_millis(50)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let client = client(&server).await;
+    let mut callers = tokio::task::JoinSet::new();
+    for _ in 0..4 {
+        let client = client.clone();
+        callers.spawn(async move { client.get(1).await });
+    }
+    timeout(Duration::from_secs(5), async {
+        while let Some(result) = callers.join_next().await {
+            let error = result.unwrap().unwrap_err();
+            assert_eq!(error.status, 503);
+            assert_eq!(error.code, "igdb_rate_limited");
+        }
+    })
+    .await
+    .unwrap();
+    let error = client.get(1).await.unwrap_err();
+    assert_eq!(error.code, "igdb_rate_limited");
+}
+
+#[tokio::test]
 async fn malformed_upstream_data_becomes_safe_gateway_error() {
     let server = MockServer::start().await;
     token(&server, 1).await;
