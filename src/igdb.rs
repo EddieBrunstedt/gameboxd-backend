@@ -8,7 +8,7 @@ use tokio::{
     time::Instant,
 };
 
-use crate::error::{ApiError, ApiResult};
+use crate::error::{ApiError, ApiResult, ErrorCode};
 
 /// Upstream requests allowed to be in flight at once. Callers beyond this
 /// queue on the semaphore rather than failing.
@@ -64,7 +64,8 @@ struct Throttle {
     cooldown_until: Instant,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct NamedItem {
     pub id: i64,
     pub name: String,
@@ -163,7 +164,8 @@ impl ProviderGame {
 /// game need not exist in the database at all. Games are named publicly by
 /// `igdb_id`; the local UUID is an internal primary key and never appears in
 /// a URL or a catalog response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ts_rs::TS)]
+#[ts(export)]
 pub struct CatalogGame {
     pub igdb_id: i64,
     pub name: String,
@@ -260,7 +262,7 @@ impl IgdbClient {
         let (id, secret) = self.credentials.as_ref().ok_or_else(|| {
             ApiError::new(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "igdb_not_configured",
+                ErrorCode::IgdbNotConfigured,
                 "IGDB credentials have not been configured",
             )
         })?;
@@ -269,7 +271,7 @@ impl IgdbClient {
         let _admitted = self.state.admitted.try_acquire().map_err(|_| {
             ApiError::new(
                 StatusCode::TOO_MANY_REQUESTS,
-                "catalog_busy",
+                ErrorCode::CatalogBusy,
                 "Catalog is busy; retry shortly",
             )
         })?;
@@ -410,7 +412,7 @@ impl IgdbClient {
 fn rate_limited() -> ApiError {
     ApiError::new(
         StatusCode::SERVICE_UNAVAILABLE,
-        "igdb_rate_limited",
+        ErrorCode::IgdbRateLimited,
         "Game provider is rate limited; retry later",
     )
 }

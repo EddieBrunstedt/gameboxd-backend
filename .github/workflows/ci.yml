@@ -27,3 +27,9 @@ jobs:
       - run: cargo clippy --locked --all-targets -- -D warnings
       - run: cargo test --locked
       - run: cargo test --locked --test backend -- --ignored
+      # `cargo test` regenerates contract/types from the Rust structs. A change
+      # to a wire struct without regenerating leaves the working tree dirty
+      # here, which is the whole drift guarantee: the generated TypeScript
+      # cannot fall behind the types that actually serialize the responses.
+      - name: Generated contract types are up to date
+        run: git diff --exit-code -- contract/types

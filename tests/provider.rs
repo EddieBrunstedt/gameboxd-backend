@@ -148,7 +148,7 @@ async fn catalog_queue_bounds_admission_concurrency_and_dispatch_rate() {
         .unwrap()
         .unwrap_err();
     assert_eq!(error.status, 429);
-    assert_eq!(error.code, "catalog_busy");
+    assert_eq!(error.code.as_str(), "catalog_busy");
 
     let mut times = Vec::new();
     for _ in 0..8 {
@@ -217,7 +217,7 @@ async fn provider_rate_limit_stops_subsequent_upstream_requests() {
     for _ in 0..2 {
         let error = client.get(1).await.unwrap_err();
         assert_eq!(error.status, 503);
-        assert_eq!(error.code, "igdb_rate_limited");
+        assert_eq!(error.code.as_str(), "igdb_rate_limited");
     }
 }
 
@@ -244,13 +244,13 @@ async fn provider_cooldown_stops_already_waiting_requests() {
         while let Some(result) = callers.join_next().await {
             let error = result.unwrap().unwrap_err();
             assert_eq!(error.status, 503);
-            assert_eq!(error.code, "igdb_rate_limited");
+            assert_eq!(error.code.as_str(), "igdb_rate_limited");
         }
     })
     .await
     .unwrap();
     let error = client.get(1).await.unwrap_err();
-    assert_eq!(error.code, "igdb_rate_limited");
+    assert_eq!(error.code.as_str(), "igdb_rate_limited");
 }
 
 #[tokio::test]
@@ -281,11 +281,16 @@ async fn empty_result_is_not_found() {
 async fn credentials_are_optional_and_invalid_inputs_do_not_call_provider() {
     let client = IgdbClient::new(None, Endpoints::default()).unwrap();
     assert_eq!(
-        client.search("Halo", 20, 0).await.unwrap_err().code,
+        client
+            .search("Halo", 20, 0)
+            .await
+            .unwrap_err()
+            .code
+            .as_str(),
         "igdb_not_configured"
     );
     assert_eq!(
-        client.get(42).await.unwrap_err().code,
+        client.get(42).await.unwrap_err().code.as_str(),
         "igdb_not_configured"
     );
     assert_eq!(client.get(-1).await.unwrap_err().status, 400);

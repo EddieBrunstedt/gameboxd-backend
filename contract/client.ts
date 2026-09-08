@@ -1,0 +1,240 @@
+// Typed client for the Gameboxd application routes.
+//
+// Every request and response type here is imported from `./types`, which is
+// generated from the Rust structs that actually serialize the wire format —
+// nothing in this file restates a field name, so a renamed or removed field is
+// a TypeScript error rather than a runtime surprise.
+//
+// What *is* written by hand is the route table: paths, methods, and which
+// routes carry a precondition. Axum's router erases all of that at the type
+// level, so no generator can recover it. It changes rarely, and a mistake here
+// fails immediately and loudly as a 404 or 405.
+//
+// Authentication lives in `./auth.ts`; this file assumes a session cookie is
+// already present and sends `credentials: "include"` so the browser attaches it.
+
+import type { CatalogGame } from "./types/CatalogGame";
+import type { CatalogPage } from "./types/CatalogPage";
+import type { CreatePlaythroughInput } from "./types/CreatePlaythroughInput";
+import type { EntryInput } from "./types/EntryInput";
+import type { ErrorBody } from "./types/ErrorBody";
+import type { ErrorCode } from "./types/ErrorCode";
+import type { FieldError } from "./types/FieldError";
+import type { Game } from "./types/Game";
+import type { LibraryEntry } from "./types/LibraryEntry";
+import type { LibraryRow } from "./types/LibraryRow";
+import type { Me } from "./types/Me";
+import type { Page } from "./types/Page";
+import type { PlayStatus } from "./types/PlayStatus";
+import type { Playthrough } from "./types/Playthrough";
+import type { PlaythroughInput } from "./types/PlaythroughInput";
+import type { PlaythroughPatch } from "./types/PlaythroughPatch";
+import type { Profile } from "./types/Profile";
+import type { ProfileInput } from "./types/ProfileInput";
+
+let baseUrl = "";
+
+/**
+ * Points every call at the backend's origin, which is not the SPA's. Pass it
+ * without a trailing slash, for example `http://localhost:3000`.
+ */
+export function configureApi(options: { baseUrl: string }): void {
+  baseUrl = options.baseUrl.replace(/\/$/, "");
+}
+
+/**
+ * A non-2xx response from an application route.
+ *
+ * `code` is the closed union the backend publishes, so a caller can switch on
+ * it exhaustively. `fields` is present exactly when individual fields were
+ * rejected — by our own validation or by the JSON schema — and is the thing a
+ * form should branch on, since both kinds arrive the same way.
+ */
+export class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: ErrorCode | null,
+    message: string,
+    readonly fields: readonly FieldError[] = [],
+  ) {
+    super(message);
+    this.name = "ApiError";
+  }
+
+  /** The rejections keyed by field name, for a form that renders per control. */
+  byField(): Record<string, FieldError> {
+    return Object.fromEntries(this.fields.map((field) => [field.field, field]));
+  }
+}
+
+/**
+ * True when a playthrough edit lost a race and must be reloaded and reapplied.
+ * See `edit` below for why every edit carries a precondition in the first place.
+ */
+export function isStale(error: unknown): boolean {
+  return error instanceof ApiError && error.code === "precondition_failed";
+}
+
+type Query = Record<string, string | number | undefined | null>;
+
+function url(path: string, query?: Query): string {
+  const search = new URLSearchParams();
+  for (const [key, value] of Object.entries(query ?? {})) {
+    if (value !== undefined && value !== null) search.set(key, String(value));
+  }
+  const suffix = search.toString();
+  return `${baseUrl}${path}${suffix ? `?${suffix}` : ""}`;
+}
+
+async function request<T>(
+  method: string,
+  path: string,
+  options: { query?: Query; body?: unknown; ifMatch?: string } = {},
+): Promise<T> {
+  const headers: Record<string, string> = {};
+  if (options.body !== undefined) headers["Content-Type"] = "application/json";
+  if (options.ifMatch !== undefined) headers["If-Match"] = options.ifMatch;
+  const response = await fetch(url(path, options.query), {
+    method,
+    credentials: "include",
+    headers,
+    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+  });
+  const text = await response.text();
+  if (!response.ok) throw toError(response.status, text);
+  // 204 responses, and only those, have no body.
+  return (text ? JSON.parse(text) : undefined) as T;
+}
+
+function toError(status: number, text: string): ApiError {
+  try {
+    const { error } = JSON.parse(text) as ErrorBody;
+    return new ApiError(status, error.code, error.message, error.fields ?? []);
+  } catch {
+    // A proxy, a CORS failure, or anything else that never reached the app's
+    // own error handling. There is no code to report, and inventing one would
+    // let a caller believe it matched a case the backend never produced.
+    return new ApiError(status, null, `Request failed with status ${status}`);
+  }
+}
+
+/**
+ * The precondition a playthrough edit must carry.
+ *
+ * Read from the record itself rather than from the `ETag` header: the backend
+ * publishes `version` in every playthrough body, including inside listings, so
+ * an editor opened from a list needs no extra request to learn its revision.
+ */
+function precondition(playthrough: Pick<Playthrough, "version">): string {
+  return `"${playthrough.version}"`;
+}
+
+// --- Identity and profile -------------------------------------------------
+
+export const me = (): Promise<Me> => request("GET", "/api/me");
+
+export const updateProfile = (input: ProfileInput): Promise<Profile> =>
+  request("PUT", "/api/me", { body: input });
+
+// --- Catalog --------------------------------------------------------------
+
+/** Searches IGDB. Public, read-only, and stores nothing locally. */
+export const searchCatalog = (
+  q: string,
+  page: { limit?: number; offset?: number } = {},
+): Promise<CatalogPage<CatalogGame>> =>
+  request("GET", "/api/catalog/search", { query: { q, ...page } });
+
+/**
+ * One IGDB game, for a detail page. Works without a prior search, without an
+ * import, and without a session, so a direct link or a reload is enough.
+ */
+export const catalogGame = (igdbId: number): Promise<CatalogGame> =>
+  request("GET", `/api/catalog/games/${igdbId}`);
+
+/** Games already stored locally. Does not contact IGDB. */
+export const games = (
+  query: { q?: string; limit?: number; offset?: number } = {},
+): Promise<Page<Game>> => request("GET", "/api/games", { query });
+
+export const game = (igdbId: number): Promise<Game> => request("GET", `/api/games/${igdbId}`);
+
+export const importGame = (igdbId: number): Promise<Game> =>
+  request("POST", `/api/catalog/import/${igdbId}`);
+
+// --- Library --------------------------------------------------------------
+
+export const library = (
+  query: { status?: PlayStatus; q?: string; limit?: number; offset?: number } = {},
+): Promise<Page<LibraryRow>> => request("GET", "/api/me/library", { query });
+
+export const libraryEntry = (igdbId: number): Promise<LibraryEntry> =>
+  request("GET", `/api/me/library/${igdbId}`);
+
+/**
+ * Sets the library status for a game, storing the game if it is not known yet.
+ *
+ * `status` is the only writable field: the entry's `rating` is derived from
+ * playthroughs and is edited there. That is also why this route carries no
+ * precondition — a complete intent cannot silently discard anything.
+ */
+export const saveLibraryEntry = (igdbId: number, input: EntryInput): Promise<LibraryEntry> =>
+  request("PUT", `/api/me/library/${igdbId}`, { body: input });
+
+/** Removes library membership. Playthroughs for the game are preserved. */
+export const removeLibraryEntry = (igdbId: number): Promise<void> =>
+  request("DELETE", `/api/me/library/${igdbId}`);
+
+// --- Playthroughs ---------------------------------------------------------
+
+export const playthroughs = (
+  query: { igdb_id?: number; limit?: number; offset?: number } = {},
+): Promise<Page<Playthrough>> => request("GET", "/api/me/playthroughs", { query });
+
+export const playthrough = (id: string): Promise<Playthrough> =>
+  request("GET", `/api/me/playthroughs/${id}`);
+
+export const createPlaythrough = (input: CreatePlaythroughInput): Promise<Playthrough> =>
+  request("POST", "/api/me/playthroughs", { body: input });
+
+/**
+ * Replaces every editable field. An omitted field is cleared, exactly as an
+ * explicit `null` is — use it only where one form owns the whole record.
+ */
+export const replacePlaythrough = (
+  current: Playthrough,
+  input: PlaythroughInput,
+): Promise<Playthrough> =>
+  request("PUT", `/api/me/playthroughs/${current.id}`, {
+    body: input,
+    ifMatch: precondition(current),
+  });
+
+/**
+ * Changes only the fields present. An omitted field keeps its stored value and
+ * an explicit `null` clears it, so a rating widget, a review editor and a date
+ * picker can each send only what they own.
+ *
+ * The precondition is mandatory server-side, which is why it is taken from the
+ * record here rather than offered as an option: an edit that cannot say which
+ * revision it read is an edit that can overwrite work the user never saw.
+ */
+export const updatePlaythrough = (
+  current: Playthrough,
+  patch: PlaythroughPatch,
+): Promise<Playthrough> =>
+  request("PATCH", `/api/me/playthroughs/${current.id}`, {
+    body: patch,
+    ifMatch: precondition(current),
+  });
+
+/**
+ * Deletes a playthrough. Passing the record asserts its revision; passing an id
+ * alone is unconditional and stays idempotent.
+ */
+export const deletePlaythrough = (target: Playthrough | string): Promise<void> =>
+  typeof target === "string"
+    ? request("DELETE", `/api/me/playthroughs/${target}`)
+    : request("DELETE", `/api/me/playthroughs/${target.id}`, {
+        ifMatch: precondition(target),
+      });

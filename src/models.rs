@@ -1,6 +1,7 @@
 use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool, types::Json};
+use ts_rs::TS;
 use uuid::Uuid;
 
 use crate::{
@@ -8,7 +9,8 @@ use crate::{
     igdb::{IgdbClient, NamedItem, ProviderGame},
 };
 
-#[derive(Debug, Serialize, FromRow)]
+#[derive(Debug, Serialize, FromRow, TS)]
+#[ts(export)]
 pub struct Game {
     pub id: Uuid,
     pub igdb_id: i64,
@@ -17,8 +19,13 @@ pub struct Game {
     pub summary: Option<String>,
     pub cover_url: Option<String>,
     pub first_release_date: Option<DateTime<Utc>>,
+    // The `Json` wrapper is how sqlx reads a jsonb column; it is transparent
+    // on the wire, so the published type is the array it contains.
+    #[ts(as = "Vec<NamedItem>")]
     pub platforms: Json<Vec<NamedItem>>,
+    #[ts(as = "Vec<NamedItem>")]
     pub genres: Json<Vec<NamedItem>>,
+    #[ts(as = "Vec<NamedItem>")]
     pub developers: Json<Vec<NamedItem>>,
     pub game_type: Option<i64>,
     pub parent_igdb_id: Option<i64>,
@@ -46,7 +53,7 @@ pub async fn ensure_game(pool: &PgPool, igdb: &IgdbClient, igdb_id: i64) -> ApiR
             Some(stale) => {
                 tracing::warn!(
                     igdb_id,
-                    code = error.code,
+                    code = error.code.as_str(),
                     "Serving stale metadata; upstream refresh failed"
                 );
                 Ok(stale)
@@ -90,7 +97,8 @@ pub async fn upsert_game(pool: &PgPool, game: ProviderGame) -> ApiResult<Game> {
     Ok(row)
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, sqlx::Type)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, sqlx::Type, TS)]
+#[ts(export)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
 pub enum PlayStatus {
@@ -101,7 +109,8 @@ pub enum PlayStatus {
     Dropped,
 }
 
-#[derive(Serialize, FromRow)]
+#[derive(Serialize, FromRow, TS)]
+#[ts(export)]
 pub struct LibraryEntry {
     pub igdb_id: i64,
     pub status: PlayStatus,
@@ -111,7 +120,8 @@ pub struct LibraryEntry {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Serialize, FromRow)]
+#[derive(Serialize, FromRow, TS)]
+#[ts(export)]
 pub struct Playthrough {
     pub id: Uuid,
     pub igdb_id: i64,
@@ -128,7 +138,8 @@ pub struct Playthrough {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Serialize, FromRow)]
+#[derive(Serialize, FromRow, TS)]
+#[ts(export)]
 pub struct Profile {
     pub display_name: String,
     pub bio: String,

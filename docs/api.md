@@ -40,7 +40,7 @@ Catalog lookup accepts a positive signed 64-bit integer ID; malformed, overflowi
 {"display_name":"Eddie","bio":"I like RPGs."}
 ```
 
-Display name is trimmed and limited to 80 characters; bio to 1000. The response is the profile object with those fields plus `created_at` and `updated_at`. `GET /api/me` returns `{id,email,profile}`.
+Display name is trimmed and limited to 80 characters; bio to 1000. The response is the profile object with those fields plus `created_at` and `updated_at`. `GET /api/me` returns `{id,email,profile}`, where `id` is the Doorman user UUID and `email` may be null.
 
 `PUT /api/me/library/{igdb_id}` body:
 
@@ -115,7 +115,7 @@ Local games, library, and playthrough listings return:
 
 Local games sort by lowercase name then internal UUID. Library entries sort by most recently updated then internal game UUID, and each item is `{game,entry}`. Playthrough listing accepts only `limit`, `offset`, and optional positive `igdb_id`; it returns playthrough objects ordered by the chronology above. A game with no own playthroughs returns an empty page, even if it is not stored locally. Offset pagination can shift if entries change between requests.
 
-Catalog search returns `{data,limit,offset,next_offset}`. A full upstream page sets the next offset (until the offset cap); it does not guarantee another result exists. No total-count query is made. Being read-only, it is safe to retry and cache. A successful import returns a single stored game and HTTP 200 whether newly created or refreshed.
+Catalog search returns `{data,limit,offset,next_offset}`, where `next_offset` is null on the last page. A full upstream page sets the next offset (until the offset cap); it does not guarantee another result exists. No total-count query is made. Being read-only, it is safe to retry and cache. A successful import returns a single stored game and HTTP 200 whether newly created or refreshed.
 
 ## Errors
 
@@ -123,9 +123,30 @@ Catalog search returns `{data,limit,offset,next_offset}`. A full upstream page s
 {"error":{"code":"validation_error","message":"rating must be an integer from 1 to 10, or null"}}
 ```
 
-Application error codes include `validation_error`, `invalid_json`, `not_found`, `method_not_allowed`, `precondition_required`, `precondition_failed`, `request_rejected`, `internal_error`, `database_unavailable`, `igdb_not_configured`, `igdb_unavailable`, `igdb_rate_limited`, `catalog_busy`. Validation is generally 400; malformed JSON/schema/content type retains Axum's 400/422/415 status; oversized bodies return 413. A playthrough edit without `If-Match` returns 428 and one whose precondition no longer holds returns 412. Upstream failures return 502, unavailable/configuration/rate-limited upstreams return 503, and local catalog contention returns 429 with `Retry-After: 1`. Doorman auth errors retain Doorman's own codes, including `csrf_origin_mismatch` and `reauth_required`.
+Application error codes are exactly `validation_error`, `invalid_json`, `not_found`, `method_not_allowed`, `precondition_required`, `precondition_failed`, `request_rejected`, `internal_error`, `database_unavailable`, `igdb_not_configured`, `igdb_unavailable`, `igdb_rate_limited`, `catalog_busy` — a closed set, published as a TypeScript union and checked against this list by `tests/contract.rs`. Validation is generally 400; malformed JSON/schema/content type retains Axum's 400/422/415 status; oversized bodies return 413.
+
+### Field-level errors
+
+When a request body is rejected because of specific fields, the error carries a `fields` array naming them:
+
+```json
+{"error":{"code":"validation_error","message":"2 fields are invalid","fields":[
+  {"field":"rating","code":"out_of_range","message":"rating must be an integer from 1 to 10, or null"},
+  {"field":"finished_on","code":"before_start","message":"finished_on must be on or after started_on"}
+]}}
+```
+
+`fields` is **absent**, not empty, when no individual field is at fault — a bad path segment, a bad query parameter, a missing resource, or JSON that never parsed. Clients should branch on the presence of `fields` rather than on the code, because the same array arrives from two places: our own validation (`400 validation_error`) and the JSON schema check that runs before a handler (`422 invalid_json`, or `400 invalid_json` for a malformed document, which names no field). Both statuses and both codes are unchanged from before `fields` existed; the array is purely additive.
+
+Field codes are `required`, `out_of_range`, `too_long`, `invalid_format`, `before_start`, and `unknown_field`. `field` is the JSON name as sent. Every failing field of one submission is reported together, so a form marks everything it got wrong in a single round trip; `message` at the top level summarizes for a client that renders no per-field detail.
+
+Cross-field rules are attributed to the constrained field: a finish date before its start is reported against `finished_on`, which is the control a date picker can mark. Body routes report fields; query parameters and path segments do not, because no control owns them. A playthrough edit without `If-Match` returns 428 and one whose precondition no longer holds returns 412. Upstream failures return 502, unavailable/configuration/rate-limited upstreams return 503, and local catalog contention returns 429 with `Retry-After: 1`. Doorman auth errors retain Doorman's own codes, including `csrf_origin_mismatch` and `reauth_required`.
 
 `ETag` and `Retry-After` are exposed to the browser through CORS, and `If-Match` is an allowed request header, so a `fetch` may both read a tag and send one back. Every response carries an `x-request-id` for correlation. App/auth responses use `Cache-Control: no-store` to avoid leaking private or auth data through shared browser caches. No database details, upstream response bodies or credentials are returned in app errors.
+
+## Generated types and client
+
+`contract/` publishes this contract as TypeScript. `contract/types` is generated from the Rust structs that serialize these responses, so no field name is declared twice and a change here cannot silently diverge from the server. `contract/client.ts` is a hand-written route table over those types, and `contract/auth.ts` is the browser adapter for the Doorman flows below. See [contract/README.md](../contract/README.md) for how each half is kept honest, and prefer them over the raw `fetch` calls shown next.
 
 ## SolidJS browser integration
 
@@ -160,7 +181,7 @@ The browser must run at `FRONTEND_ORIGIN`. Cookie writes require a matching Orig
 
 ## Doorman routes and passkey flows
 
-Mounted unchanged at `/auth`; authoritative DTOs and flow behavior come from the [pinned Doorman source](https://codeberg.org/EddieBrunstedt/Doorman/src/commit/7525cc3fdaf58e0905f6ba3677058319071e8380/crates/axum/src/dto.rs).
+Mounted unchanged at `/auth`; authoritative DTOs and flow behavior come from the [pinned Doorman source](https://codeberg.org/EddieBrunstedt/Doorman/src/commit/17bb0dcd509de6ca3bfd2742d3c9e422c92b4597/crates/axum/src/dto.rs).
 
 - Signup: `POST /auth/signup/request` with `{email}` → email link to SPA `/signup?token=...` → `POST /auth/signup/consume` with `{token}` → WebAuthn registration in browser → `POST /auth/signup/finish` with challenge ID and credential.
 - Sign-in: `POST /auth/passkey/authenticate/start` → browser WebAuthn assertion → `POST /auth/passkey/authenticate/finish`.
@@ -170,4 +191,4 @@ Mounted unchanged at `/auth`; authoritative DTOs and flow behavior come from the
 - Account: `POST /auth/account/email`, `POST /auth/account/email/confirm`, `DELETE /auth/account`.
 - Re-authentication: `POST /auth/reauth/start`; provide the resulting fresh assertion in the protected action's `reauthentication` field according to Doorman's DTOs.
 
-Email links only start signup/recovery; they do not create sessions on their own. Successful passkey finish sets the HttpOnly session cookie. Email changes, passkey removal and account deletion require re-authentication; recovery cooldowns also apply. Render frontend screens for `/signup`, `/recovery` and `/account/email`, consume their tokens once, and remove tokens from browser history after reading them. Use the [Doorman browser helper reference](https://codeberg.org/EddieBrunstedt/Doorman/src/commit/7525cc3fdaf58e0905f6ba3677058319071e8380/examples/web-client) to serialize WebAuthn ArrayBuffers correctly.
+Email links only start signup/recovery; they do not create sessions on their own. Successful passkey finish sets the HttpOnly session cookie. Email changes, passkey removal and account deletion require re-authentication; recovery cooldowns also apply. Render frontend screens for `/signup`, `/recovery` and `/account/email`, consume their tokens once, and remove tokens from browser history after reading them. Use the [Doorman browser helper reference](https://codeberg.org/EddieBrunstedt/Doorman/src/commit/17bb0dcd509de6ca3bfd2742d3c9e422c92b4597/examples/web-client) to serialize WebAuthn ArrayBuffers correctly.

@@ -1,0 +1,45 @@
+// The Gameboxd frontend contract: generated wire types, a typed client for the
+// application routes, and the browser adapter for Doorman's passkey flows.
+//
+// See ./README.md for what is generated, what is hand-written, and how each
+// half is kept from drifting away from the server.
+
+export * from "./client";
+export * from "./auth";
+
+export type { CatalogGame } from "./types/CatalogGame";
+export type { CatalogPage } from "./types/CatalogPage";
+export type { CreatePlaythroughInput } from "./types/CreatePlaythroughInput";
+export type { EntryInput } from "./types/EntryInput";
+export type { ErrorBody } from "./types/ErrorBody";
+export type { ErrorCode } from "./types/ErrorCode";
+export type { ErrorPayload } from "./types/ErrorPayload";
+export type { FieldError } from "./types/FieldError";
+export type { FieldErrorCode } from "./types/FieldErrorCode";
+export type { Game } from "./types/Game";
+export type { LibraryEntry } from "./types/LibraryEntry";
+export type { LibraryRow } from "./types/LibraryRow";
+export type { Me } from "./types/Me";
+export type { NamedItem } from "./types/NamedItem";
+export type { Page } from "./types/Page";
+export type { PlayStatus } from "./types/PlayStatus";
+export type { Playthrough } from "./types/Playthrough";
+export type { PlaythroughInput } from "./types/PlaythroughInput";
+export type { PlaythroughPatch } from "./types/PlaythroughPatch";
+export type { Profile } from "./types/Profile";
+export type { ProfileInput } from "./types/ProfileInput";
+
+import { configureApi } from "./client";
+import { configureAuth } from "./auth";
+
+/**
+ * Points both halves of the contract at the backend. Call once at startup.
+ *
+ * The SPA and the API are separate origins, so nothing here works on relative
+ * paths, and the backend's CORS layer only names the origin configured as
+ * `FRONTEND_ORIGIN`.
+ */
+export function configureGameboxd(options: { baseUrl: string }): void {
+  configureApi(options);
+  configureAuth(options);
+}

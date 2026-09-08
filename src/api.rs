@@ -1,8 +1,9 @@
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{
-        Path, Query, State,
-        rejection::{JsonRejection, PathRejection, QueryRejection},
+        FromRequest, Path, Query, Request, State,
+        rejection::{PathRejection, QueryRejection},
     },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
@@ -10,14 +11,14 @@ use axum::{
 };
 use chrono::NaiveDate;
 use doorman::prelude::AuthUser;
-use serde::{Deserialize, Deserializer, Serialize};
-use serde_json::{Value, json};
+use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use sqlx::FromRow;
+use ts_rs::TS;
 use uuid::Uuid;
 
 use crate::{
     AppState,
-    error::{ApiError, ApiResult},
+    error::{ApiError, ApiResult, ErrorCode, FieldError, FieldErrorCode},
     igdb::{CatalogGame, validate_search},
     models::{Game, LibraryEntry, PlayStatus, Playthrough, Profile, ensure_game, find_game},
 };
@@ -94,12 +95,26 @@ impl PageQuery {
     }
 }
 
-#[derive(Serialize)]
-struct Page<T> {
-    data: Vec<T>,
-    limit: u32,
-    offset: u32,
-    has_more: bool,
+/// A page of locally held records, where one extra row was fetched to learn
+/// whether another page exists.
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct Page<T> {
+    pub data: Vec<T>,
+    pub limit: u32,
+    pub offset: u32,
+    pub has_more: bool,
+}
+
+/// A page of upstream catalog results. IGDB returns no total, so a full page
+/// only offers the next offset to try; it never promises a further result.
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct CatalogPage<T> {
+    pub data: Vec<T>,
+    pub limit: u32,
+    pub offset: u32,
+    pub next_offset: Option<u32>,
 }
 
 fn page<T>(mut data: Vec<T>, limit: u32, offset: u32) -> Json<Page<T>> {
@@ -134,14 +149,131 @@ fn igdb_path(value: Result<Path<i64>, PathRejection>) -> ApiResult<i64> {
     }
     Ok(id)
 }
-fn body<T>(value: Result<Json<T>, JsonRejection>) -> ApiResult<T> {
-    value.map(|Json(value)| value).map_err(|error| {
-        ApiError::new(
-            error.status(),
-            "invalid_json",
-            "Request body does not match the expected JSON schema",
+/// A JSON request body that reports *which* field it could not read.
+///
+/// Axum's `Json` rejects a schema failure with prose only, so a form could
+/// learn that a body was wrong but never which control to mark. Deserializing
+/// through `serde_path_to_error` keeps the path to the offending value, which
+/// becomes the `field` of a `FieldError` alongside the ones our own validation
+/// produces. Content-type, size and syntax handling stay as they were.
+pub struct Body<T>(pub T);
+
+impl<T, S> FromRequest<S> for Body<T>
+where
+    T: DeserializeOwned,
+    S: Send + Sync,
+{
+    type Rejection = ApiError;
+
+    async fn from_request(request: Request, state: &S) -> Result<Self, Self::Rejection> {
+        if !is_json(request.headers()) {
+            return Err(ApiError::new(
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                ErrorCode::InvalidJson,
+                "Request body must be sent as application/json",
+            ));
+        }
+        // `DefaultBodyLimit` is what turns an oversized body into 413 here;
+        // this extractor only forwards the status it already produces.
+        let bytes = Bytes::from_request(request, state)
+            .await
+            .map_err(|rejection| {
+                ApiError::new(
+                    rejection.status(),
+                    ErrorCode::InvalidJson,
+                    "Request body could not be read",
+                )
+            })?;
+        let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
+        serde_path_to_error::deserialize(&mut deserializer)
+            .map(Body)
+            .map_err(|error| schema_error(&error))
+    }
+}
+
+/// Accepts `application/json` and the `+json` structured-suffix family,
+/// ignoring any parameters such as `; charset=utf-8`.
+fn is_json(headers: &HeaderMap) -> bool {
+    let Some(value) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let mime = value.split(';').next().unwrap_or_default().trim();
+    mime.eq_ignore_ascii_case("application/json")
+        || (mime.len() > "application/+json".len()
+            && mime.starts_with("application/")
+            && mime.ends_with("+json"))
+}
+
+fn schema_error(error: &serde_path_to_error::Error<serde_json::Error>) -> ApiError {
+    // Malformed JSON has no field to blame: nothing was parsed to a position a
+    // form could point at, so it stays the prose 400 it has always been.
+    if matches!(
+        error.inner().classify(),
+        serde_json::error::Category::Syntax | serde_json::error::Category::Eof
+    ) {
+        return ApiError::new(
+            StatusCode::BAD_REQUEST,
+            ErrorCode::InvalidJson,
+            "Request body is not valid JSON",
+        );
+    }
+    let rejection = ApiError::new(
+        StatusCode::UNPROCESSABLE_ENTITY,
+        ErrorCode::InvalidJson,
+        "Request body does not match the expected JSON schema",
+    );
+    match schema_field(&error.path().to_string(), &error.inner().to_string()) {
+        Some(field) => rejection.with_field(field),
+        None => rejection,
+    }
+}
+
+/// Names the field a schema failure belongs to.
+///
+/// A wrong type reaches us with a path to the value. A missing or unknown key
+/// does not: the path stops at the struct, because the key serde is complaining
+/// about is precisely the one that is not in the document. For those two, the
+/// name appears only in serde's message, whose wording is fixed by serde itself
+/// and is pinned here by unit tests.
+fn schema_field(path: &str, message: &str) -> Option<FieldError> {
+    if let Some(name) = quoted_after(message, "missing field ") {
+        return Some(FieldError::new(
+            name,
+            FieldErrorCode::Required,
+            "This field is required",
+        ));
+    }
+    if let Some(name) = quoted_after(message, "unknown field ") {
+        return Some(FieldError::new(
+            name,
+            FieldErrorCode::UnknownField,
+            "This route does not accept this field",
+        ));
+    }
+    // `.` is what serde_path_to_error calls the document root, which is no more
+    // use to a form than no field at all.
+    (!path.is_empty() && path != ".").then(|| {
+        FieldError::new(
+            path,
+            FieldErrorCode::InvalidFormat,
+            "This field has the wrong type or format",
         )
     })
+}
+
+fn quoted_after<'a>(message: &'a str, prefix: &str) -> Option<&'a str> {
+    message
+        .strip_prefix(prefix)?
+        .strip_prefix('`')?
+        .split('`')
+        .next()
+}
+
+fn body<T>(value: Result<Body<T>, ApiError>) -> ApiResult<T> {
+    value.map(|Body(value)| value)
 }
 
 async fn games(
@@ -168,7 +300,7 @@ async fn game(
 async fn search(
     State(state): State<AppState>,
     params: Result<Query<PageQuery>, QueryRejection>,
-) -> ApiResult<Json<Value>> {
+) -> ApiResult<Json<CatalogPage<CatalogGame>>> {
     let params = query(params)?;
     let q = params
         .q
@@ -182,9 +314,12 @@ async fn search(
     let next_offset = (data.len() == params.limit as usize)
         .then_some(params.offset + params.limit)
         .filter(|offset| *offset <= 10_000);
-    Ok(Json(
-        json!({ "data": data, "limit": params.limit, "offset": params.offset, "next_offset": next_offset }),
-    ))
+    Ok(Json(CatalogPage {
+        data,
+        limit: params.limit,
+        offset: params.offset,
+        next_offset,
+    }))
 }
 
 async fn catalog_game(
@@ -205,7 +340,18 @@ async fn import(
     Ok(Json(game))
 }
 
-async fn me(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Value>> {
+/// The signed-in user, as the SPA sees them: Doorman's identity plus this
+/// application's profile. Doorman's own `UserDto` is richer and is served on
+/// its own routes; this route publishes only what the app itself owns.
+#[derive(Serialize, TS)]
+#[ts(export)]
+pub struct Me {
+    pub id: Uuid,
+    pub email: Option<String>,
+    pub profile: Profile,
+}
+
+async fn me(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Me>> {
     sqlx::query("INSERT INTO profiles (user_id) VALUES ($1) ON CONFLICT DO NOTHING")
         .bind(user.0.id.0.as_bytes().as_slice())
         .execute(&state.pool)
@@ -216,33 +362,67 @@ async fn me(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Val
     .bind(user.0.id.0.as_bytes().as_slice())
     .fetch_one(&state.pool)
     .await?;
-    Ok(Json(
-        json!({"id": user.0.id, "email": user.0.email, "profile": profile}),
-    ))
+    Ok(Json(Me {
+        id: user.0.id.0,
+        email: user.0.email.clone(),
+        profile,
+    }))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, TS)]
+#[ts(export)]
 #[serde(deny_unknown_fields)]
-struct ProfileInput {
-    display_name: String,
-    bio: String,
+pub struct ProfileInput {
+    pub display_name: String,
+    pub bio: String,
+}
+
+impl ProfileInput {
+    /// Both limits are reported together, so a profile form marks every field
+    /// it got wrong in one round trip rather than one per save.
+    fn validated(&self) -> ApiResult<()> {
+        let mut fields = Vec::new();
+        if self.display_name.trim().chars().count() > 80 {
+            fields.push(FieldError::new(
+                "display_name",
+                FieldErrorCode::TooLong,
+                "Display name is limited to 80 characters",
+            ));
+        } else if self.display_name.contains('\0') {
+            fields.push(FieldError::new(
+                "display_name",
+                FieldErrorCode::InvalidFormat,
+                "Display name may not contain NUL",
+            ));
+        }
+        if self.bio.chars().count() > 1000 {
+            fields.push(FieldError::new(
+                "bio",
+                FieldErrorCode::TooLong,
+                "Bio is limited to 1000 characters",
+            ));
+        } else if self.bio.contains('\0') {
+            fields.push(FieldError::new(
+                "bio",
+                FieldErrorCode::InvalidFormat,
+                "Bio may not contain NUL",
+            ));
+        }
+        if fields.is_empty() {
+            Ok(())
+        } else {
+            Err(ApiError::fields(fields))
+        }
+    }
 }
 
 async fn update_profile(
     user: AuthUser,
     State(state): State<AppState>,
-    payload: Result<Json<ProfileInput>, JsonRejection>,
+    payload: Result<Body<ProfileInput>, ApiError>,
 ) -> ApiResult<Json<Profile>> {
     let input = body(payload)?;
-    if input.display_name.trim().chars().count() > 80
-        || input.bio.chars().count() > 1000
-        || input.display_name.contains('\0')
-        || input.bio.contains('\0')
-    {
-        return Err(ApiError::invalid(
-            "display_name is limited to 80 characters and bio to 1000; neither may contain NUL",
-        ));
-    }
+    input.validated()?;
     let profile = sqlx::query_as("INSERT INTO profiles (user_id,display_name,bio) VALUES ($1,$2,$3)
         ON CONFLICT (user_id) DO UPDATE SET display_name=EXCLUDED.display_name,bio=EXCLUDED.bio,updated_at=now()
         RETURNING display_name,bio,created_at,updated_at")
@@ -256,8 +436,9 @@ async fn update_profile(
 /// `GET /api/me/library/{igdb_id}` return, so a column added to either table
 /// is published only once it is added to a struct — never implicitly, and
 /// never by one route without the other.
-#[derive(Serialize, FromRow)]
-struct LibraryRow {
+#[derive(Serialize, FromRow, TS)]
+#[ts(export)]
+pub struct LibraryRow {
     #[sqlx(flatten)]
     game: Game,
     #[sqlx(flatten)]
@@ -307,7 +488,8 @@ async fn entry(
     Ok(Json(row))
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(export)]
 #[serde(deny_unknown_fields)]
 pub struct EntryInput {
     pub status: PlayStatus,
@@ -317,7 +499,7 @@ async fn save_entry(
     user: AuthUser,
     State(state): State<AppState>,
     igdb_id: Result<Path<i64>, PathRejection>,
-    payload: Result<Json<EntryInput>, JsonRejection>,
+    payload: Result<Body<EntryInput>, ApiError>,
 ) -> ApiResult<Json<LibraryEntry>> {
     let igdb_id = igdb_path(igdb_id)?;
     let input = body(payload)?;
@@ -427,30 +609,47 @@ impl PlaythroughFields {
     /// Normalizes the free-text label, then checks everything the table also
     /// constrains, so bad input is a 400 here rather than a constraint
     /// violation surfacing as an internal error.
+    ///
+    /// Every failing field is collected before returning. A playthrough form
+    /// shows a rating, a review and two dates at once, and fixing them one
+    /// refused save at a time would be a worse form for no benefit — the checks
+    /// are pure and cheap.
     pub fn validated(mut self) -> ApiResult<Self> {
+        let mut fields = Vec::new();
         if self
             .rating
             .is_some_and(|rating| !(1..=10).contains(&rating))
         {
-            return Err(ApiError::invalid(
+            fields.push(FieldError::new(
+                "rating",
+                FieldErrorCode::OutOfRange,
                 "rating must be an integer from 1 to 10, or null",
             ));
         }
-        if self
-            .review
-            .as_ref()
-            .is_some_and(|review| review.chars().count() > 10_000 || review.contains('\0'))
-        {
-            return Err(ApiError::invalid(
-                "review is limited to 10000 characters and may not contain NUL",
-            ));
+        if let Some(review) = self.review.as_ref() {
+            if review.chars().count() > 10_000 {
+                fields.push(FieldError::new(
+                    "review",
+                    FieldErrorCode::TooLong,
+                    "review is limited to 10000 characters",
+                ));
+            } else if review.contains('\0') {
+                fields.push(FieldError::new(
+                    "review",
+                    FieldErrorCode::InvalidFormat,
+                    "review may not contain NUL",
+                ));
+            }
         }
         // Checked on the merged values, so a partial edit cannot move one date
-        // past the stored other one.
+        // past the stored other one. Reported against `finished_on`: it is the
+        // constrained end of the pair, and the one a date picker can mark.
         if let (Some(start), Some(finish)) = (self.started_on, self.finished_on)
             && finish < start
         {
-            return Err(ApiError::invalid(
+            fields.push(FieldError::new(
+                "finished_on",
+                FieldErrorCode::BeforeStart,
                 "finished_on must be on or after started_on",
             ));
         }
@@ -459,17 +658,33 @@ impl PlaythroughFields {
             // constraint uses; every other control character stays visible to
             // the rejection below instead of being silently normalized away.
             let platform = platform.trim_matches(' ');
-            if platform.is_empty()
-                || platform.chars().count() > 100
-                || platform.chars().any(char::is_control)
-            {
-                return Err(ApiError::invalid(
-                    "platform must contain 1–100 characters without control characters",
+            if platform.is_empty() {
+                fields.push(FieldError::new(
+                    "platform",
+                    FieldErrorCode::Required,
+                    "platform must not be blank; send null to clear it",
                 ));
+            } else if platform.chars().count() > 100 {
+                fields.push(FieldError::new(
+                    "platform",
+                    FieldErrorCode::TooLong,
+                    "platform is limited to 100 characters",
+                ));
+            } else if platform.chars().any(char::is_control) {
+                fields.push(FieldError::new(
+                    "platform",
+                    FieldErrorCode::InvalidFormat,
+                    "platform may not contain control characters",
+                ));
+            } else {
+                self.platform = Some(platform.to_owned());
             }
-            self.platform = Some(platform.to_owned());
         }
-        Ok(self)
+        if fields.is_empty() {
+            Ok(self)
+        } else {
+            Err(ApiError::fields(fields))
+        }
     }
 }
 
@@ -487,7 +702,8 @@ impl From<&Playthrough> for PlaythroughFields {
 
 /// A complete replacement of the editable fields: an omitted field is cleared,
 /// exactly as an explicit `null` is.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(export)]
 #[serde(deny_unknown_fields)]
 pub struct PlaythroughInput {
     pub rating: Option<i16>,
@@ -499,12 +715,21 @@ pub struct PlaythroughInput {
 
 impl From<PlaythroughInput> for PlaythroughFields {
     fn from(input: PlaythroughInput) -> Self {
+        // Destructured rather than field-by-field: a new editable field then
+        // fails to compile here until it is actually carried across.
+        let PlaythroughInput {
+            rating,
+            review,
+            started_on,
+            finished_on,
+            platform,
+        } = input;
         Self {
-            rating: input.rating,
-            review: input.review,
-            started_on: input.started_on,
-            finished_on: input.finished_on,
-            platform: input.platform,
+            rating,
+            review,
+            started_on,
+            finished_on,
+            platform,
         }
     }
 }
@@ -512,18 +737,28 @@ impl From<PlaythroughInput> for PlaythroughFields {
 /// A partial edit: an omitted field keeps its stored value and an explicit
 /// `null` clears it. Separate status, rating and review controls can each send
 /// only what they own, so one widget cannot erase another's field.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, TS)]
+#[ts(export)]
 #[serde(deny_unknown_fields)]
 pub struct PlaythroughPatch {
+    // `optional = nullable` is what carries the three states into TypeScript:
+    // the key may be absent, present as `null`, or present with a value, which
+    // is exactly what `Patch` distinguishes. `as` names the shape to describe,
+    // since `Patch` itself is a Rust-side detail.
     #[serde(default)]
+    #[ts(optional = nullable, as = "Option<i16>")]
     pub rating: Patch<i16>,
     #[serde(default)]
+    #[ts(optional = nullable, as = "Option<String>")]
     pub review: Patch<String>,
     #[serde(default)]
+    #[ts(optional = nullable, as = "Option<NaiveDate>")]
     pub started_on: Patch<NaiveDate>,
     #[serde(default)]
+    #[ts(optional = nullable, as = "Option<NaiveDate>")]
     pub finished_on: Patch<NaiveDate>,
     #[serde(default)]
+    #[ts(optional = nullable, as = "Option<String>")]
     pub platform: Patch<String>,
 }
 
@@ -539,12 +774,45 @@ impl PlaythroughPatch {
     }
 }
 
-#[derive(Deserialize)]
+/// The create body: a game to record against, plus the same editable fields
+/// the replacement body carries.
+///
+/// Spelled out rather than `#[serde(flatten)]`ing [`PlaythroughInput`], which
+/// produces the identical JSON but buffers the flattened keys during
+/// deserialization — and a buffered key has no path, so a badly typed `rating`
+/// or an impossible `started_on` could not be reported against the field that
+/// sent it. The conversion below destructures exhaustively, so the two bodies
+/// cannot quietly drift apart.
+#[derive(Deserialize, TS)]
+#[ts(export)]
 #[serde(deny_unknown_fields)]
-struct CreatePlaythroughInput {
-    igdb_id: i64,
-    #[serde(flatten)]
-    entry: PlaythroughInput,
+pub struct CreatePlaythroughInput {
+    pub igdb_id: i64,
+    pub rating: Option<i16>,
+    pub review: Option<String>,
+    pub started_on: Option<NaiveDate>,
+    pub finished_on: Option<NaiveDate>,
+    pub platform: Option<String>,
+}
+
+impl From<CreatePlaythroughInput> for PlaythroughFields {
+    fn from(input: CreatePlaythroughInput) -> Self {
+        let CreatePlaythroughInput {
+            igdb_id: _,
+            rating,
+            review,
+            started_on,
+            finished_on,
+            platform,
+        } = input;
+        Self {
+            rating,
+            review,
+            started_on,
+            finished_on,
+            platform,
+        }
+    }
 }
 
 /// An `If-Match` precondition, parsed from the request headers.
@@ -643,7 +911,7 @@ fn required_precondition(headers: &HeaderMap) -> ApiResult<Precondition> {
     if_match(headers)?.ok_or_else(|| {
         ApiError::new(
             StatusCode::PRECONDITION_REQUIRED,
-            "precondition_required",
+            ErrorCode::PreconditionRequired,
             "Send If-Match with the version this edit was based on, so a stale editor cannot overwrite newer work",
         )
     })
@@ -652,7 +920,7 @@ fn required_precondition(headers: &HeaderMap) -> ApiResult<Precondition> {
 fn stale() -> ApiError {
     ApiError::new(
         StatusCode::PRECONDITION_FAILED,
-        "precondition_failed",
+        ErrorCode::PreconditionFailed,
         "The playthrough changed since it was read; reload it and reapply the edit",
     )
 }
@@ -728,14 +996,15 @@ async fn playthrough(
 async fn create_playthrough(
     user: AuthUser,
     State(state): State<AppState>,
-    payload: Result<Json<CreatePlaythroughInput>, JsonRejection>,
+    payload: Result<Body<CreatePlaythroughInput>, ApiError>,
 ) -> ApiResult<(StatusCode, Tagged)> {
     let input = body(payload)?;
     if input.igdb_id <= 0 {
         return Err(ApiError::invalid("IGDB ID must be positive"));
     }
-    let fields = PlaythroughFields::from(input.entry).validated()?;
-    let game = ensure_game(&state.pool, &state.igdb, input.igdb_id).await?;
+    let igdb_id = input.igdb_id;
+    let fields = PlaythroughFields::from(input).validated()?;
+    let game = ensure_game(&state.pool, &state.igdb, igdb_id).await?;
     let row = sqlx::query_as(
         "INSERT INTO playthroughs (id,user_id,game_id,rating,review,started_on,finished_on,platform)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *, $9::bigint AS igdb_id",
@@ -743,7 +1012,7 @@ async fn create_playthrough(
     .bind(Uuid::new_v4()).bind(user.0.id.0.as_bytes().as_slice()).bind(game.id)
     .bind(fields.rating).bind(fields.review).bind(fields.started_on)
     .bind(fields.finished_on).bind(fields.platform)
-    .bind(input.igdb_id).fetch_one(&state.pool).await?;
+    .bind(igdb_id).fetch_one(&state.pool).await?;
     Ok((StatusCode::CREATED, Tagged(row)))
 }
 
@@ -752,7 +1021,7 @@ async fn replace_playthrough(
     State(state): State<AppState>,
     id: Result<Path<Uuid>, PathRejection>,
     headers: HeaderMap,
-    payload: Result<Json<PlaythroughInput>, JsonRejection>,
+    payload: Result<Body<PlaythroughInput>, ApiError>,
 ) -> ApiResult<Tagged> {
     let id = path(id)?;
     let precondition = required_precondition(&headers)?;
@@ -768,7 +1037,7 @@ async fn update_playthrough(
     State(state): State<AppState>,
     id: Result<Path<Uuid>, PathRejection>,
     headers: HeaderMap,
-    payload: Result<Json<PlaythroughPatch>, JsonRejection>,
+    payload: Result<Body<PlaythroughPatch>, ApiError>,
 ) -> ApiResult<Tagged> {
     let id = path(id)?;
     let precondition = required_precondition(&headers)?;
@@ -868,6 +1137,7 @@ async fn remove_playthrough(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn headers(values: &[&str]) -> HeaderMap {
         let mut headers = HeaderMap::new();
@@ -995,5 +1265,152 @@ mod tests {
             .validated()
             .unwrap();
         assert_eq!(trimmed.platform.as_deref(), Some("Steam Deck"));
+    }
+
+    /// Runs a body through the same deserializer the extractor uses, so these
+    /// assertions pin serde's real wording rather than an assumption about it.
+    fn schema_rejection<T: DeserializeOwned>(body: &str) -> ApiError {
+        let mut deserializer = serde_json::Deserializer::from_slice(body.as_bytes());
+        let error = serde_path_to_error::deserialize::<_, T>(&mut deserializer)
+            .err()
+            .expect("body should have been rejected");
+        schema_error(&error)
+    }
+
+    fn only_field(error: &ApiError) -> &FieldError {
+        match error.fields.as_slice() {
+            [field] => field,
+            other => panic!("expected exactly one field error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_schema_failure_names_the_field_that_caused_it() {
+        // A missing or unknown key is not at a path, because the key serde is
+        // complaining about is the one absent from the document.
+        let missing = schema_rejection::<CreatePlaythroughInput>("{}");
+        assert_eq!(missing.status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert_eq!(missing.code, ErrorCode::InvalidJson);
+        assert_eq!(only_field(&missing).field, "igdb_id");
+        assert_eq!(only_field(&missing).code, FieldErrorCode::Required);
+
+        let unknown =
+            schema_rejection::<CreatePlaythroughInput>(r#"{"igdb_id":42,"user_id":"someone"}"#);
+        assert_eq!(only_field(&unknown).field, "user_id");
+        assert_eq!(only_field(&unknown).code, FieldErrorCode::UnknownField);
+
+        // A wrong type does have a path, and it is the path that is used.
+        let wrong_type = schema_rejection::<CreatePlaythroughInput>(r#"{"igdb_id":"forty-two"}"#);
+        assert_eq!(only_field(&wrong_type).field, "igdb_id");
+        assert_eq!(only_field(&wrong_type).code, FieldErrorCode::InvalidFormat);
+
+        // A date that parses as a string but is not a real calendar date is a
+        // failure of the field, not of the document.
+        let bad_date = schema_rejection::<CreatePlaythroughInput>(
+            r#"{"igdb_id":42,"started_on":"2026-02-30"}"#,
+        );
+        assert_eq!(only_field(&bad_date).field, "started_on");
+        assert_eq!(only_field(&bad_date).code, FieldErrorCode::InvalidFormat);
+
+        // A patch names its field too, even though every key is optional there.
+        let patch = schema_rejection::<PlaythroughPatch>(r#"{"rating":"nine"}"#);
+        assert_eq!(only_field(&patch).field, "rating");
+    }
+
+    #[test]
+    fn malformed_json_stays_a_document_level_failure() {
+        // Nothing parsed far enough to blame a field, and inventing one would
+        // point a form at a control that may not be the problem at all.
+        for body in ["{", "", "not json", r#"{"igdb_id":42,}"#] {
+            let error = schema_rejection::<CreatePlaythroughInput>(body);
+            assert_eq!(error.status, StatusCode::BAD_REQUEST, "{body:?}");
+            assert_eq!(error.code, ErrorCode::InvalidJson, "{body:?}");
+            assert!(error.fields.is_empty(), "{body:?}");
+        }
+    }
+
+    #[test]
+    fn json_content_types_are_accepted_with_parameters_and_suffixes() {
+        let header = |value: &str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(header::CONTENT_TYPE, HeaderValue::from_str(value).unwrap());
+            headers
+        };
+        for value in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "APPLICATION/JSON",
+            "application/merge-patch+json",
+        ] {
+            assert!(is_json(&header(value)), "{value}");
+        }
+        for value in ["text/plain", "application/xml", "application/+json", ""] {
+            assert!(!is_json(&header(value)), "{value}");
+        }
+        assert!(!is_json(&HeaderMap::new()));
+    }
+
+    #[test]
+    fn every_invalid_field_is_reported_from_one_request() {
+        // A form showing four controls should not have to discover its errors
+        // one refused save at a time.
+        let error = PlaythroughFields {
+            rating: Some(11),
+            review: Some("x".repeat(10_001)),
+            started_on: NaiveDate::from_ymd_opt(2026, 2, 1),
+            finished_on: NaiveDate::from_ymd_opt(2026, 1, 1),
+            platform: Some("  ".to_owned()),
+        }
+        .validated()
+        .expect_err("every field is invalid");
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.code, ErrorCode::ValidationError);
+        let reported: Vec<_> = error
+            .fields
+            .iter()
+            .map(|field| (field.field.as_str(), field.code))
+            .collect();
+        assert_eq!(
+            reported,
+            [
+                ("rating", FieldErrorCode::OutOfRange),
+                ("review", FieldErrorCode::TooLong),
+                ("finished_on", FieldErrorCode::BeforeStart),
+                ("platform", FieldErrorCode::Required),
+            ]
+        );
+        // The summary stays useful for a caller that renders no field detail.
+        assert_eq!(error.message, "4 fields are invalid");
+
+        let profile = ProfileInput {
+            display_name: "n".repeat(81),
+            bio: "b".repeat(1001),
+        }
+        .validated()
+        .expect_err("both profile fields are too long");
+        assert_eq!(
+            profile
+                .fields
+                .iter()
+                .map(|field| field.field.as_str())
+                .collect::<Vec<_>>(),
+            ["display_name", "bio"]
+        );
+
+        // A single failure keeps its own message as the summary, so nothing
+        // reads worse than it did before field errors existed.
+        let single = PlaythroughFields {
+            rating: Some(0),
+            review: None,
+            started_on: None,
+            finished_on: None,
+            platform: None,
+        }
+        .validated()
+        .expect_err("rating is out of range");
+        assert_eq!(
+            single.message,
+            "rating must be an integer from 1 to 10, or null"
+        );
     }
 }

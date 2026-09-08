@@ -176,6 +176,23 @@ impl Fixture {
             .unwrap()
     }
 
+    /// Sends a body exactly as given, with a chosen content type. `send` always
+    /// serializes valid JSON, which cannot express the two failures below: a
+    /// malformed document, and a body that never claimed to be JSON at all.
+    async fn raw(&self, path: &str, token: &str, content_type: &str, body: &str) -> Response {
+        let request = Request::builder()
+            .method("POST")
+            .uri(path)
+            .extension(ConnectInfo(
+                "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+            ))
+            .header("Content-Type", content_type)
+            .header("Authorization", format!("Bearer {token}"))
+            .body(Body::from(body.to_owned()))
+            .unwrap();
+        self.app.clone().oneshot(request).await.unwrap()
+    }
+
     async fn finish(self) {
         drop(self.app);
         drop(self.auth);
@@ -1985,5 +2002,191 @@ async fn partial_playthrough_edits_reject_stale_and_unconditional_writes() {
     fixture
         .value("DELETE", &path, &alice, Value::Null, StatusCode::NO_CONTENT)
         .await;
+    fixture.finish().await;
+}
+
+/// Field-level validation errors, as a form consumes them.
+///
+/// The envelope gained `fields` without changing any status or code that was
+/// already published, so this covers both halves: the errors our own checks
+/// raise, and the ones serde raises before a handler runs.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn validation_errors_name_the_fields_a_form_must_mark() {
+    let fixture = Fixture::new().await;
+    let (_, token) = fixture.user("fields").await;
+
+    /// The `(field, code)` pairs of one error response, in order.
+    fn reported(body: &Value) -> Vec<(&str, &str)> {
+        body["error"]["fields"]
+            .as_array()
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+            .iter()
+            .map(|field| {
+                (
+                    field["field"].as_str().expect("a field name"),
+                    field["code"].as_str().expect("a field code"),
+                )
+            })
+            .collect()
+    }
+
+    // Every broken field of one submission comes back together, so the form
+    // does not reveal its problems one refused save at a time.
+    let invalid = fixture
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &token,
+            json!({
+                "igdb_id": 42,
+                "rating": 11,
+                "started_on": "2026-02-01",
+                "finished_on": "2026-01-01",
+                "platform": "   ",
+            }),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    assert_eq!(invalid["error"]["code"], "validation_error");
+    assert_eq!(
+        reported(&invalid),
+        [
+            ("rating", "out_of_range"),
+            ("finished_on", "before_start"),
+            ("platform", "required"),
+        ]
+    );
+    // The summary stays populated for a caller that renders no field detail.
+    assert_eq!(invalid["error"]["message"], "3 fields are invalid");
+
+    // Schema failures name their field too, keeping the status and code they
+    // have always had rather than being reclassified.
+    for (body, field, code) in [
+        (json!({}), "igdb_id", "required"),
+        (
+            json!({"igdb_id": 42, "user_id": "someone-else"}),
+            "user_id",
+            "unknown_field",
+        ),
+        (json!({"igdb_id": "forty-two"}), "igdb_id", "invalid_format"),
+        // A date that is a string but not a real day belongs to the date
+        // picker that sent it, not to the document.
+        (
+            json!({"igdb_id": 42, "started_on": "2026-02-30"}),
+            "started_on",
+            "invalid_format",
+        ),
+    ] {
+        let rejected = fixture
+            .value(
+                "POST",
+                "/api/me/playthroughs",
+                &token,
+                body.clone(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            )
+            .await;
+        assert_eq!(rejected["error"]["code"], "invalid_json", "{body}");
+        assert_eq!(reported(&rejected), [(field, code)], "{body}");
+    }
+
+    // A document that never parsed has no field to blame, and says so by
+    // omitting `fields` entirely rather than sending an empty array.
+    let malformed = json_body(
+        fixture
+            .raw(
+                "/api/me/playthroughs",
+                &token,
+                "application/json",
+                r#"{"igdb_id":42,"#,
+            )
+            .await,
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(malformed["error"]["code"], "invalid_json");
+    assert_eq!(malformed["error"]["fields"], Value::Null);
+
+    // A body that never claimed to be JSON is refused before parsing.
+    let wrong_type = json_body(
+        fixture
+            .raw(
+                "/api/me/playthroughs",
+                &token,
+                "text/plain",
+                r#"{"igdb_id":42}"#,
+            )
+            .await,
+        StatusCode::UNSUPPORTED_MEDIA_TYPE,
+    )
+    .await;
+    assert_eq!(wrong_type["error"]["code"], "invalid_json");
+
+    // The `+json` suffix family is still JSON.
+    let suffixed = json_body(
+        fixture
+            .raw(
+                "/api/me/playthroughs",
+                &token,
+                "application/merge-patch+json; charset=utf-8",
+                r#"{"igdb_id":42,"rating":11}"#,
+            )
+            .await,
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    assert_eq!(reported(&suffixed), [("rating", "out_of_range")]);
+
+    // Profiles report both of their fields at once as well.
+    let profile = fixture
+        .value(
+            "PUT",
+            "/api/me",
+            &token,
+            json!({"display_name": "n".repeat(81), "bio": "b".repeat(1001)}),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    assert_eq!(
+        reported(&profile),
+        [("display_name", "too_long"), ("bio", "too_long")]
+    );
+
+    // Failures that belong to no field carry none: a path, a query parameter,
+    // and a missing resource all keep the shape they had before.
+    for (method, path, body, status) in [
+        (
+            "POST",
+            "/api/me/playthroughs",
+            json!({"igdb_id": 0}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "GET",
+            "/api/me/library?limit=0",
+            Value::Null,
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "GET",
+            "/api/me/playthroughs/00000000-0000-0000-0000-000000000000",
+            Value::Null,
+            StatusCode::NOT_FOUND,
+        ),
+    ] {
+        let error = fixture.value(method, path, &token, body, status).await;
+        assert_eq!(error["error"]["fields"], Value::Null, "{path}");
+        assert!(
+            error["error"]["message"]
+                .as_str()
+                .is_some_and(|message| !message.is_empty()),
+            "{path}"
+        );
+    }
+
+    // None of this reached the provider: every rejection happened first.
+    assert!(fixture.server.received_requests().await.unwrap().is_empty());
     fixture.finish().await;
 }

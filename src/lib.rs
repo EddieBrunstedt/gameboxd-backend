@@ -22,7 +22,11 @@ use tower_http::{
     trace::TraceLayer,
 };
 
-use crate::{config::Config, error::ApiError, igdb::IgdbClient};
+use crate::{
+    config::Config,
+    error::{ApiError, ErrorCode},
+    igdb::IgdbClient,
+};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -65,7 +69,7 @@ pub fn router(config: &Config, state: AppState, auth: &AuthService) -> Router {
         .route("/health/live", get(|| async { Json(serde_json::json!({"status":"ok"})) }))
         .route("/health/ready", get(ready).with_state(state))
         .fallback(|| async { ApiError::not_found() })
-        .method_not_allowed_fallback(|| async { ApiError::new(StatusCode::METHOD_NOT_ALLOWED, "method_not_allowed", "Method not allowed") })
+        .method_not_allowed_fallback(|| async { ApiError::new(StatusCode::METHOD_NOT_ALLOWED, ErrorCode::MethodNotAllowed, "Method not allowed") })
         .layer(DefaultBodyLimit::max(64 * 1024))
         .layer(middleware::from_fn(response_policy))
         .layer(cors)
@@ -83,7 +87,7 @@ async fn ready(State(state): State<AppState>) -> Response {
         Ok(_) => Json(serde_json::json!({"status":"ok"})).into_response(),
         Err(_) => ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
-            "database_unavailable",
+            ErrorCode::DatabaseUnavailable,
             "Database is unavailable",
         )
         .into_response(),
@@ -102,7 +106,7 @@ async fn response_policy(request: Request, next: Next) -> Response {
         let status = response.status();
         response = ApiError::new(
             status,
-            "request_rejected",
+            ErrorCode::RequestRejected,
             status.canonical_reason().unwrap_or("Request rejected"),
         )
         .into_response();

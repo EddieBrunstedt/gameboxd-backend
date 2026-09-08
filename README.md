@@ -1,6 +1,6 @@
 # Gameboxd backend
 
-Rust / Axum backend for a video game diary and library, ready for a future SolidJS SPA. Authentication is provided by [Doorman](https://codeberg.org/EddieBrunstedt/Doorman), pinned to commit `7525cc3fdaf58e0905f6ba3677058319071e8380`. Game metadata comes from [IGDB](https://api-docs.igdb.com/).
+Rust / Axum backend for a video game diary and library, ready for a future SolidJS SPA. Authentication is provided by [Doorman](https://codeberg.org/EddieBrunstedt/Doorman), pinned to commit `17bb0dcd509de6ca3bfd2742d3c9e422c92b4597`. Game metadata comes from [IGDB](https://api-docs.igdb.com/).
 
 ## Run locally
 
@@ -36,7 +36,7 @@ Use browser `fetch` with `credentials: "include"`. CORS allows only `FRONTEND_OR
 
 The first `/api/me` request creates the user's app profile. Authenticated users can update that profile and their own library. Reviews and library entries are private in this milestone. One library entry per user/game stores the current status. Separate playthroughs preserve repeat experiences with optional ratings, reviews, dates and platform labels. The library displays the most recent rated experience; unrated replays do not clear it. Playthroughs support both replacement (`PUT`) and partial (`PATCH`) edits, and both require an `If-Match` precondition, so a rating widget cannot erase a review and a stale tab cannot overwrite newer work. History is independent of library membership and stays private. Public social features can be added later. Distinct IGDB editions retain distinct local records, with upstream parent IDs retained for future grouping.
 
-See [docs/api.md](docs/api.md) for routes, request bodies, errors and the frontend contract.
+See [docs/api.md](docs/api.md) for routes, request bodies, errors and the frontend contract. [contract/](contract/) publishes that contract as TypeScript: wire types generated from the Rust structs, a typed client for the application routes, and the browser adapter for Doorman's passkey flows.
 
 ## Verify
 

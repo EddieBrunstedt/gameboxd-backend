@@ -1,0 +1,7 @@
+# ts-rs writes the generated TypeScript for every `#[ts(export)]` type here when
+# `cargo test` runs. `TS_RS_LARGE_INT` matters: the default binding for `i64` is
+# `bigint`, which no `JSON.parse` result ever satisfies. IGDB IDs and the other
+# 64-bit fields are far below 2^53, so `number` is both correct and usable.
+[env]
+TS_RS_EXPORT_DIR = { value = "contract/types", relative = true }
+TS_RS_LARGE_INT = "number"
