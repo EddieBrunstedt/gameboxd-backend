@@ -5,6 +5,7 @@ use gameboxd_backend::{
     config::Config,
     db::Database,
     igdb::{Endpoints, IgdbClient},
+    refresh::Refresher,
     router,
 };
 use tracing_subscriber::EnvFilter;
@@ -25,11 +26,13 @@ async fn main() -> anyhow::Result<()> {
     if config.igdb_credentials.is_none() {
         tracing::info!("IGDB not configured; local catalog remains available");
     }
+    let (refresher, refresh) = Refresher::spawn(database.app.clone(), igdb.clone());
     let app = router(
         &config,
         AppState {
             pool: database.app.clone(),
             igdb,
+            refresher,
         },
         &auth,
     );
@@ -55,6 +58,16 @@ async fn main() -> anyhow::Result<()> {
     .await;
     purge.abort();
     let _ = purge.await;
+    // Serving has returned, so the router state — and with it the only handle
+    // on the refresh queue — is gone and the worker stops after at most one
+    // already-started refresh. Bound the wait so a slow provider cannot hold
+    // shutdown open.
+    if tokio::time::timeout(Duration::from_secs(5), refresh)
+        .await
+        .is_err()
+    {
+        tracing::warn!("Background metadata refresh did not finish before shutdown");
+    }
     database.app.close().await;
     database.auth.pool().close().await;
     result?;

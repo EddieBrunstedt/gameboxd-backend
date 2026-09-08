@@ -1,4 +1,4 @@
-use chrono::{DateTime, NaiveDate, Utc};
+use chrono::{DateTime, NaiveDate, TimeDelta, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool, types::Json};
 use ts_rs::TS;
@@ -7,7 +7,11 @@ use uuid::Uuid;
 use crate::{
     error::ApiResult,
     igdb::{IgdbClient, NamedItem, ProviderGame},
+    refresh::Refresher,
 };
+
+/// How long stored metadata is treated as current before a refresh is due.
+pub const METADATA_TTL: TimeDelta = TimeDelta::hours(24);
 
 #[derive(Debug, Serialize, FromRow, TS)]
 #[ts(export)]
@@ -35,44 +39,81 @@ pub struct Game {
     pub refreshed_at: DateTime<Utc>,
 }
 
-/// The local row for an upstream game, importing or refreshing it as needed.
-///
-/// Materializing a game is a side effect of an operation the user actually
-/// intends — adding it to a library, recording a playthrough, or an explicit
-/// import — never of a search or catalog lookup.
-/// If upstream is unavailable but a stale local row exists, the stale row is
-/// used: an existing game stays usable while IGDB is down, and only a genuinely
-/// unknown game requires a successful upstream call.
-pub async fn ensure_game(pool: &PgPool, igdb: &IgdbClient, igdb_id: i64) -> ApiResult<Game> {
-    if let Some(fresh) = find_game(pool, igdb_id, true).await? {
-        return Ok(fresh);
-    }
-    match igdb.get(igdb_id).await {
-        Ok(upstream) => upsert_game(pool, upstream).await,
-        Err(error) => match find_game(pool, igdb_id, false).await? {
-            Some(stale) => {
-                tracing::warn!(
-                    igdb_id,
-                    code = error.code.as_str(),
-                    "Serving stale metadata; upstream refresh failed"
-                );
-                Ok(stale)
-            }
-            None => Err(error),
-        },
+impl Game {
+    /// Whether stored metadata is still current.
+    ///
+    /// Decided here rather than in the query so the rule has a single
+    /// definition, and so a caller can tell "stale" apart from "not stored" —
+    /// the two now call for different things.
+    pub fn is_fresh(&self) -> bool {
+        Utc::now().signed_duration_since(self.refreshed_at) < METADATA_TTL
     }
 }
 
-/// Looks up a game by its upstream ID, optionally requiring metadata refreshed
-/// within the last 24 hours.
-pub async fn find_game(pool: &PgPool, igdb_id: i64, fresh_only: bool) -> ApiResult<Option<Game>> {
-    let row = sqlx::query_as::<_, Game>(
-        "SELECT * FROM games WHERE igdb_id=$1 AND (NOT $2 OR refreshed_at > now() - interval '24 hours')",
-    )
-    .bind(igdb_id)
-    .bind(fresh_only)
-    .fetch_optional(pool)
-    .await?;
+/// The local row for an upstream game, importing or refreshing it in line.
+///
+/// This is the explicit-import path, where waiting for IGDB is the point of
+/// the request: stale metadata is refreshed before the caller is answered. If
+/// upstream is unavailable but a stale local row exists, the stale row is
+/// served, so an import of a game already stored still succeeds while IGDB is
+/// down. Only a genuinely unknown game requires a successful upstream call.
+///
+/// Personal records take [`attach_game`] instead, which never waits.
+pub async fn ensure_game(pool: &PgPool, igdb: &IgdbClient, igdb_id: i64) -> ApiResult<Game> {
+    let Some(stored) = find_game(pool, igdb_id).await? else {
+        return upsert_game(pool, igdb.get(igdb_id).await?).await;
+    };
+    if stored.is_fresh() {
+        return Ok(stored);
+    }
+    match igdb.get(igdb_id).await {
+        Ok(upstream) => upsert_game(pool, upstream).await,
+        Err(error) => {
+            tracing::warn!(
+                igdb_id,
+                code = error.code.as_str(),
+                "Serving stale metadata; upstream refresh failed"
+            );
+            Ok(stored)
+        }
+    }
+}
+
+/// The local row a personal record — a library entry or a playthrough —
+/// attaches to.
+///
+/// A stored game is used immediately, however old its metadata, and a stale
+/// one is queued for a background refresh instead. Saving a game the user
+/// already has therefore never waits for IGDB: not for its request spacing,
+/// not for its queue, and not for a timeout while it is down. Only a game that
+/// was never stored requires a successful upstream call, because there is
+/// otherwise no row for the record to reference.
+///
+/// Materializing a game stays a side effect of an operation the user actually
+/// intends — adding it to a library, recording a playthrough, or an explicit
+/// import — never of a search or a catalog lookup.
+pub async fn attach_game(
+    pool: &PgPool,
+    igdb: &IgdbClient,
+    refresher: &Refresher,
+    igdb_id: i64,
+) -> ApiResult<Game> {
+    if let Some(stored) = find_game(pool, igdb_id).await? {
+        if !stored.is_fresh() {
+            refresher.request(igdb_id);
+        }
+        return Ok(stored);
+    }
+    upsert_game(pool, igdb.get(igdb_id).await?).await
+}
+
+/// The locally stored game for an upstream ID, however old its metadata.
+/// Callers decide what staleness means to them through [`Game::is_fresh`].
+pub async fn find_game(pool: &PgPool, igdb_id: i64) -> ApiResult<Option<Game>> {
+    let row = sqlx::query_as::<_, Game>("SELECT * FROM games WHERE igdb_id=$1")
+        .bind(igdb_id)
+        .fetch_optional(pool)
+        .await?;
     Ok(row)
 }
 

@@ -20,7 +20,9 @@ use crate::{
     AppState,
     error::{ApiError, ApiResult, ErrorCode, FieldError, FieldErrorCode},
     igdb::{CatalogGame, validate_search},
-    models::{Game, LibraryEntry, PlayStatus, Playthrough, Profile, ensure_game, find_game},
+    models::{
+        Game, LibraryEntry, PlayStatus, Playthrough, Profile, attach_game, ensure_game, find_game,
+    },
 };
 
 pub fn routes() -> Router<AppState> {
@@ -291,7 +293,7 @@ async fn game(
     State(state): State<AppState>,
     igdb_id: Result<Path<i64>, PathRejection>,
 ) -> ApiResult<Json<Game>> {
-    let row = find_game(&state.pool, igdb_path(igdb_id)?, false)
+    let row = find_game(&state.pool, igdb_path(igdb_id)?)
         .await?
         .ok_or_else(ApiError::not_found)?;
     Ok(Json(row))
@@ -504,9 +506,9 @@ async fn save_entry(
     let igdb_id = igdb_path(igdb_id)?;
     let input = body(payload)?;
     // Adding a game is the point at which it earns a local row, so this is the
-    // only library route that may import. Existing metadata follows the shared
-    // refresh policy, with stale fallback when the provider is unavailable.
-    let game = ensure_game(&state.pool, &state.igdb, igdb_id).await?;
+    // only library route that may import. A game already stored is reused as
+    // it stands, so this save is independent of provider latency.
+    let game = attach_game(&state.pool, &state.igdb, &state.refresher, igdb_id).await?;
     let mut transaction = state.pool.begin().await?;
     sqlx::query(
         "INSERT INTO library_entries (user_id,game_id,status) VALUES ($1,$2,$3)
@@ -1004,7 +1006,7 @@ async fn create_playthrough(
     }
     let igdb_id = input.igdb_id;
     let fields = PlaythroughFields::from(input).validated()?;
-    let game = ensure_game(&state.pool, &state.igdb, igdb_id).await?;
+    let game = attach_game(&state.pool, &state.igdb, &state.refresher, igdb_id).await?;
     let row = sqlx::query_as(
         "INSERT INTO playthroughs (id,user_id,game_id,rating,review,started_on,finished_on,platform)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *, $9::bigint AS igdb_id",

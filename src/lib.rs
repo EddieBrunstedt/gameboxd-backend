@@ -5,6 +5,7 @@ pub mod db;
 pub mod error;
 pub mod igdb;
 pub mod models;
+pub mod refresh;
 
 use axum::{
     Json, Router,
@@ -26,12 +27,16 @@ use crate::{
     config::Config,
     error::{ApiError, ErrorCode},
     igdb::IgdbClient,
+    refresh::Refresher,
 };
 
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub igdb: IgdbClient,
+    /// Queues metadata refreshes for games already stored, so a save reuses
+    /// what is on hand instead of waiting for the provider.
+    pub refresher: Refresher,
 }
 
 pub fn router(config: &Config, state: AppState, auth: &AuthService) -> Router {

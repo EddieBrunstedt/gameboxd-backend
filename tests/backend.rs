@@ -1,4 +1,8 @@
-use std::{net::SocketAddr, str::FromStr, time::Duration};
+use std::{
+    net::SocketAddr,
+    str::FromStr,
+    time::{Duration, Instant},
+};
 
 use axum::{
     Router,
@@ -17,6 +21,7 @@ use gameboxd_backend::{
     config::Config,
     db::Database,
     igdb::{Endpoints, IgdbClient},
+    refresh::Refresher,
     router,
 };
 use serde_json::{Value, json};
@@ -24,6 +29,7 @@ use sqlx::{
     PgPool,
     postgres::{PgConnectOptions, PgPoolOptions},
 };
+use tokio::{task::JoinHandle, time::timeout};
 use tower::ServiceExt;
 use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
@@ -35,10 +41,23 @@ struct Fixture {
     auth: AuthService,
     app: Router,
     server: MockServer,
+    refresh: Option<JoinHandle<()>>,
 }
 
 impl Fixture {
+    /// A fixture that runs no background metadata refresh, so every upstream
+    /// request a test observes was made by the request under test.
     async fn new() -> Self {
+        Self::build(false).await
+    }
+
+    /// A fixture whose background metadata refresher really runs, for the
+    /// tests that assert a stale game is brought up to date after a save.
+    async fn refreshing() -> Self {
+        Self::build(true).await
+    }
+
+    async fn build(refresh: bool) -> Self {
         dotenvy::dotenv().ok();
         let url = std::env::var("TEST_DATABASE_URL").expect(
             "Set TEST_DATABASE_URL to a PostgreSQL account with CREATE DATABASE permission",
@@ -99,11 +118,18 @@ impl Fixture {
             },
         )
         .unwrap();
+        let (refresher, refresh) = if refresh {
+            let (refresher, worker) = Refresher::spawn(database.app.clone(), igdb.clone());
+            (refresher, Some(worker))
+        } else {
+            (Refresher::disabled(), None)
+        };
         let app = router(
             &config,
             AppState {
                 pool: database.app.clone(),
                 igdb,
+                refresher,
             },
             &auth,
         );
@@ -114,6 +140,7 @@ impl Fixture {
             auth,
             app,
             server,
+            refresh,
         }
     }
 
@@ -196,6 +223,14 @@ impl Fixture {
     async fn finish(self) {
         drop(self.app);
         drop(self.auth);
+        if let Some(worker) = self.refresh {
+            // The router held the only queue handle, so the worker stops on its
+            // own; waiting for it keeps a refresh from racing the drop below.
+            timeout(Duration::from_secs(10), worker)
+                .await
+                .expect("refresh worker must stop when the router is dropped")
+                .unwrap();
+        }
         self.database.app.close().await;
         self.database.auth.pool().close().await;
         // Same locally generated identifier used in CREATE DATABASE above.
@@ -2188,5 +2223,263 @@ async fn validation_errors_name_the_fields_a_form_must_mark() {
 
     // None of this reached the provider: every rejection happened first.
     assert!(fixture.server.received_requests().await.unwrap().is_empty());
+    fixture.finish().await;
+}
+
+/// How many game lookups the provider has been asked for. Token fetches are
+/// excluded: they are cached and their timing says nothing about whether a
+/// request consulted upstream.
+async fn provider_lookups(fixture: &Fixture) -> usize {
+    fixture
+        .server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|request| request.url.path() == "/games")
+        .count()
+}
+
+/// Saving a game that is already stored must not depend on IGDB at all, and
+/// must not quietly fall back to it either: a provider outage is invisible to
+/// the save, and only a game that was never stored still needs upstream.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn saving_a_stored_game_never_waits_for_the_provider() {
+    let fixture = Fixture::new().await;
+    let (_, token) = fixture.user("offline").await;
+    fixture
+        .value(
+            "POST",
+            "/api/catalog/import/42",
+            &token,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    // Age the stored metadata past the refresh interval, which under the old
+    // policy is exactly what made a save wait for a provider round trip.
+    sqlx::query("UPDATE games SET name='Stored title', refreshed_at=now()-interval '2 days'")
+        .execute(&fixture.database.app)
+        .await
+        .unwrap();
+    let stale = json_body(
+        fixture
+            .call("GET", "/api/games/42", None, Value::Null)
+            .await,
+        StatusCode::OK,
+    )
+    .await;
+
+    // Every upstream call from here on fails.
+    fixture.server.reset().await;
+    Mock::given(path("/games"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&fixture.server)
+        .await;
+    let before = provider_lookups(&fixture).await;
+
+    let entry = fixture
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &token,
+            json!({"status":"playing"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(entry["status"], "playing");
+    let playthrough = fixture
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &token,
+            json!({"igdb_id":42,"rating":9,"review":"Saved during an outage"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_eq!(playthrough["igdb_id"], 42);
+    let entry = fixture
+        .value(
+            "GET",
+            "/api/me/library/42",
+            &token,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(entry["rating"], 9, "the save attached to the stored game");
+    assert_eq!(
+        provider_lookups(&fixture).await,
+        before,
+        "a stored game must be reused without an upstream lookup"
+    );
+
+    // The saves reused the stale row untouched; with no worker running, nothing
+    // else may write it either.
+    assert_eq!(
+        json_body(
+            fixture
+                .call("GET", "/api/games/42", None, Value::Null)
+                .await,
+            StatusCode::OK
+        )
+        .await,
+        stale
+    );
+
+    // An explicit import is the separate operation that does wait for a
+    // refresh, and it still falls back to the stored row when that fails.
+    let imported = fixture
+        .value(
+            "POST",
+            "/api/catalog/import/42",
+            &token,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(imported["name"], "Stored title");
+
+    // A game that was never stored has nothing to attach a record to, so it
+    // still reports the outage rather than inventing a local row.
+    for (method, route, body) in [
+        ("PUT", "/api/me/library/7", json!({"status":"backlog"})),
+        ("POST", "/api/me/playthroughs", json!({"igdb_id":7})),
+    ] {
+        let error = fixture
+            .value(method, route, &token, body, StatusCode::BAD_GATEWAY)
+            .await;
+        assert_eq!(error["error"]["code"], "igdb_unavailable");
+    }
+    assert_eq!(
+        provider_lookups(&fixture).await - before,
+        3,
+        "only the import and the two unknown games reached the provider"
+    );
+    let (games, entries): (i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM games), (SELECT count(*) FROM library_entries)",
+    )
+    .fetch_one(&fixture.database.app)
+    .await
+    .unwrap();
+    assert_eq!((games, entries), (1, 1), "a failed save stores nothing");
+    fixture.finish().await;
+}
+
+/// The refresh a save no longer waits for still happens, just out of band, and
+/// on a row the save's own records stay attached to.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn a_save_queues_the_refresh_it_no_longer_waits_for() {
+    let fixture = Fixture::refreshing().await;
+    let (_, token) = fixture.user("refresh").await;
+    let imported = fixture
+        .value(
+            "POST",
+            "/api/catalog/import/42",
+            &token,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    let local_id = imported["id"].clone();
+    sqlx::query("UPDATE games SET name='Stored title', refreshed_at=now()-interval '2 days'")
+        .execute(&fixture.database.app)
+        .await
+        .unwrap();
+
+    // Every upstream answer from here on is slow. The delay is what separates
+    // a refresh that happens later from one the save is still waiting for.
+    let provider_delay = Duration::from_secs(5);
+    fixture.server.reset().await;
+    Mock::given(path("/games"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(provider_delay)
+                .set_body_json(json!([{
+                    "id":42,"name":"Refreshed title","slug":"test-game","summary":"A fixture game",
+                    "url":"https://www.igdb.com/games/test-game"
+                }])),
+        )
+        .mount(&fixture.server)
+        .await;
+
+    let started = Instant::now();
+    let entry = fixture
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &token,
+            json!({"status":"playing"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(entry["status"], "playing");
+    assert!(
+        started.elapsed() < provider_delay,
+        "the save answered only after the provider would have"
+    );
+    // It answered from the stale row, too: the refresh has not landed yet.
+    let (pending,): (String,) = sqlx::query_as("SELECT name FROM games WHERE igdb_id=42")
+        .fetch_one(&fixture.database.app)
+        .await
+        .unwrap();
+    assert_eq!(pending, "Stored title");
+
+    // The refresh runs on its own schedule, so wait for its effect rather than
+    // for a fixed interval.
+    let refreshed = timeout(provider_delay * 4, async {
+        loop {
+            let (name, fresh): (String, bool) = sqlx::query_as(
+                "SELECT name, refreshed_at > now()-interval '1 hour' FROM games WHERE igdb_id=42",
+            )
+            .fetch_one(&fixture.database.app)
+            .await
+            .unwrap();
+            if fresh {
+                return name;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("a stale save must queue a background refresh");
+    assert_eq!(refreshed, "Refreshed title");
+
+    // The refresh updated the row in place, so the entry saved a moment before
+    // it still points at the same game.
+    let game = json_body(
+        fixture
+            .call("GET", "/api/games/42", None, Value::Null)
+            .await,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(game["id"], local_id);
+    assert_eq!(
+        fixture
+            .call("GET", "/api/me/library/42", Some(&token), Value::Null)
+            .await
+            .status(),
+        200
+    );
+
+    // The game is current now, so a further save queues nothing at all: the
+    // count below can no longer grow.
+    fixture
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &token,
+            json!({"status":"completed"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        provider_lookups(&fixture).await,
+        1,
+        "one refresh, and only for the stale save"
+    );
     fixture.finish().await;
 }

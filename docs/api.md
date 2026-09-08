@@ -14,7 +14,7 @@ Base URL: `http://localhost:3000`. All bodies are JSON unless a response is `204
 | GET | `/api/games/{igdb_id}` | No | Locally stored game details |
 | GET | `/api/catalog/search?q=halo&limit=20&offset=0` | No | Search IGDB; read-only, stores nothing |
 | GET | `/api/catalog/games/{igdb_id}` | No | Look up IGDB game details; read-only, stores nothing |
-| POST | `/api/catalog/import/{igdb_id}` | Yes | Store one game or refresh metadata older than 24 hours |
+| POST | `/api/catalog/import/{igdb_id}` | Yes | Store one game, or refresh metadata older than 24 hours in line |
 | GET | `/api/me/library?status=playing&q=halo&limit=20&offset=0` | Yes | Own library with nested game details |
 | GET | `/api/me/library/{igdb_id}` | Yes | Own entry for a game |
 | PUT | `/api/me/library/{igdb_id}` | Yes | Create or replace own entry, storing the game if needed |
@@ -52,7 +52,9 @@ Allowed statuses: `backlog`, `playing`, `completed`, `on_hold`, `dropped`. `stat
 
 The displayed rating comes from the most recent **rated** playthrough, using the chronology defined below. `rating_playthrough_id` identifies that experience. An unrated replay does not hide a previous rating. Editing or deleting a playthrough recalculates the displayed rating automatically; if none remain rated, both derived fields are null. Changing library status never edits a playthrough. Library timestamps describe changes to library membership/status, not changes to the derived rating.
 
-Saving an entry stores an unknown game automatically, so no import call is needed first. Existing metadata older than 24 hours currently triggers a refresh attempt; provider failure falls back to that local game. An unknown game requires a successful IGDB fetch, and an IGDB ID no game exists under returns 404.
+Saving an entry stores an unknown game automatically, so no import call is needed first. A game already stored is reused exactly as it stands, however old its metadata, so this save never waits for IGDB — not for its request spacing, its rate limit, or a timeout while it is down. Only a game never stored here requires a successful IGDB fetch; an IGDB ID no game exists under returns 404, and a provider failure returns the IGDB errors below. The same applies to recording a playthrough.
+
+Stale metadata found this way is queued for a background refresh instead, so the game is brought up to date shortly after the save rather than during it. The refresh is invisible to the client: it changes no response, and its failure is not reported, because the save it followed has already succeeded. Refreshing happens in place, so records saved a moment earlier stay attached to the same game. `POST /api/catalog/import/{igdb_id}` remains the request that waits for a refresh, which is the point of asking for one; it falls back to the stored game when the provider fails.
 
 ## Playthroughs and diary
 
