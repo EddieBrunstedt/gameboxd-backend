@@ -481,7 +481,7 @@ dependencies = [
 [[package]]
 name = "doorman"
 version = "0.1.0"
-source = "git+https://codeberg.org/EddieBrunstedt/Doorman?rev=7525cc3fdaf58e0905f6ba3677058319071e8380#7525cc3fdaf58e0905f6ba3677058319071e8380"
+source = "git+https://codeberg.org/EddieBrunstedt/Doorman?rev=17bb0dcd509de6ca3bfd2742d3c9e422c92b4597#17bb0dcd509de6ca3bfd2742d3c9e422c92b4597"
 dependencies = [
  "doorman-axum",
  "doorman-core",
@@ -491,7 +491,7 @@ dependencies = [
 [[package]]
 name = "doorman-axum"
 version = "0.1.0"
-source = "git+https://codeberg.org/EddieBrunstedt/Doorman?rev=7525cc3fdaf58e0905f6ba3677058319071e8380#7525cc3fdaf58e0905f6ba3677058319071e8380"
+source = "git+https://codeberg.org/EddieBrunstedt/Doorman?rev=17bb0dcd509de6ca3bfd2742d3c9e422c92b4597#17bb0dcd509de6ca3bfd2742d3c9e422c92b4597"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -513,7 +513,7 @@ dependencies = [
 [[package]]
 name = "doorman-core"
 version = "0.1.0"
-source = "git+https://codeberg.org/EddieBrunstedt/Doorman?rev=7525cc3fdaf58e0905f6ba3677058319071e8380#7525cc3fdaf58e0905f6ba3677058319071e8380"
+source = "git+https://codeberg.org/EddieBrunstedt/Doorman?rev=17bb0dcd509de6ca3bfd2742d3c9e422c92b4597#17bb0dcd509de6ca3bfd2742d3c9e422c92b4597"
 dependencies = [
  "async-trait",
  "base64 0.22.1",
@@ -535,7 +535,7 @@ dependencies = [
 [[package]]
 name = "doorman-sqlx"
 version = "0.1.0"
-source = "git+https://codeberg.org/EddieBrunstedt/Doorman?rev=7525cc3fdaf58e0905f6ba3677058319071e8380#7525cc3fdaf58e0905f6ba3677058319071e8380"
+source = "git+https://codeberg.org/EddieBrunstedt/Doorman?rev=17bb0dcd509de6ca3bfd2742d3c9e422c92b4597#17bb0dcd509de6ca3bfd2742d3c9e422c92b4597"
 dependencies = [
  "async-trait",
  "chrono",

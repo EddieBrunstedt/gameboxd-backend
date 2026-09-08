@@ -1,14 +1,15 @@
-use std::str::FromStr;
+use std::{net::SocketAddr, str::FromStr, time::Duration};
 
 use axum::{
     Router,
     body::{Body, to_bytes},
+    extract::ConnectInfo,
     http::{Request, StatusCode},
     response::Response,
 };
 use chrono::Utc;
 use doorman::{
-    core::storage::AccountStatus,
+    core::{audit::Actor, storage::AccountStatus},
     prelude::{AuthService, OperatorActor, SessionContext, User, UserId},
 };
 use gameboxd_backend::{
@@ -145,6 +146,9 @@ impl Fixture {
         let mut request = Request::builder()
             .method(method)
             .uri(path)
+            .extension(ConnectInfo(
+                "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+            ))
             .header("Content-Type", "application/json");
         if let Some(token) = token {
             request = request.header("Authorization", format!("Bearer {token}"));
@@ -179,6 +183,181 @@ async fn json_body(response: Response, status: StatusCode) -> Value {
     } else {
         serde_json::from_slice(&bytes).unwrap()
     }
+}
+
+const AUTHENTICATE_START: &str = "/auth/passkey/authenticate/start";
+
+fn authentication_request(peer: Option<SocketAddr>) -> Request<Body> {
+    let mut request = Request::builder()
+        .method("POST")
+        .uri(AUTHENTICATE_START)
+        .header("Origin", "http://localhost:5173")
+        .body(Body::empty())
+        .unwrap();
+    if let Some(peer) = peer {
+        request.extensions_mut().insert(ConnectInfo(peer));
+    }
+    request
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn socket_authentication_limits_and_audit_ignore_forwarding_headers() {
+    let fixture = Fixture::new().await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = fixture.app.clone();
+    let (shutdown, stopping) = tokio::sync::oneshot::channel();
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            stopping.await.ok();
+        })
+        .await
+        .unwrap();
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    // Bound the sequence so a slow test cannot silently cross a limiter window.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        for number in 1..=61 {
+            let response = client
+                .post(format!("{base}{AUTHENTICATE_START}"))
+                .send()
+                .await
+                .unwrap();
+            let expected = if number <= 60 {
+                StatusCode::OK
+            } else {
+                StatusCode::TOO_MANY_REQUESTS
+            };
+            assert_eq!(response.status(), expected, "request {number}");
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            let body = response.json::<Value>().await.unwrap();
+            if expected == StatusCode::OK {
+                assert!(body["challenge_id"].is_string());
+            } else {
+                assert_eq!(body["error"]["code"], "rate_limited");
+            }
+        }
+        for headers in [
+            vec![("x-forwarded-for", "203.0.113.1")],
+            vec![("x-real-ip", "203.0.113.2")],
+            vec![
+                ("x-forwarded-for", "203.0.113.3, 10.0.0.1"),
+                ("x-real-ip", "203.0.113.4"),
+                ("forwarded", "for=203.0.113.5"),
+            ],
+        ] {
+            let mut request = client.post(format!("{base}{AUTHENTICATE_START}"));
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            let response = request.send().await.unwrap();
+            assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+            assert!(
+                response.headers()["retry-after"]
+                    .to_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+                    > 0
+            );
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"]["code"],
+                "rate_limited"
+            );
+        }
+    })
+    .await
+    .expect("rate-limit regression must finish within one window");
+
+    // Exercise the real database audit sink, not a context-only test endpoint.
+    for number in 1..=2 {
+        let response = client
+            .post(format!("{base}/auth/signup/request"))
+            .header("x-forwarded-for", format!("203.0.113.{number}"))
+            .header("x-real-ip", format!("198.51.100.{number}"))
+            .header("user-agent", "client-ip-regression")
+            .json(&json!({"email": format!("ip-test-{number}@example.test")}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+    let events: Vec<sqlx::types::Json<doorman::core::audit::AuditEvent>> =
+        sqlx::query_scalar("SELECT event FROM auth_audit_events")
+            .fetch_all(&fixture.database.app)
+            .await
+            .unwrap();
+    assert!(events.len() >= 2, "signup must persist audit events");
+    for event in events {
+        assert!(matches!(event.0.actor,
+            Actor::Subject { ip: Some(ref ip), user_agent: Some(ref ua) }
+            if ip == "127.0.0.1" && ua == "client-ip-regression"
+        ));
+    }
+    shutdown.send(()).unwrap();
+    server.await.unwrap();
+    fixture.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn authentication_requires_socket_metadata_and_buckets_by_ip() {
+    let fixture = Fixture::new().await;
+    // Headers cannot replace absent server metadata.
+    for spoofed in [false, true] {
+        let mut request = authentication_request(None);
+        if spoofed {
+            request
+                .headers_mut()
+                .insert("x-forwarded-for", "203.0.113.1".parse().unwrap());
+            request
+                .headers_mut()
+                .insert("x-real-ip", "203.0.113.2".parse().unwrap());
+        }
+        let response = fixture.app.clone().oneshot(request).await.unwrap();
+        let body = json_body(response, StatusCode::INTERNAL_SERVER_ERROR).await;
+        assert_eq!(body["error"]["code"], "internal_error");
+    }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        // Changing the connection's source port must not create a new bucket.
+        for port in 1000..1060 {
+            let request = authentication_request(Some(SocketAddr::from(([192, 0, 2, 1], port))));
+            json_body(
+                fixture.app.clone().oneshot(request).await.unwrap(),
+                StatusCode::OK,
+            )
+            .await;
+        }
+        for peer in ["192.0.2.1:9000", "[::ffff:192.0.2.1]:9001"] {
+            let request = authentication_request(Some(peer.parse().unwrap()));
+            let body = json_body(
+                fixture.app.clone().oneshot(request).await.unwrap(),
+                StatusCode::TOO_MANY_REQUESTS,
+            )
+            .await;
+            assert_eq!(body["error"]["code"], "rate_limited");
+        }
+        for peer in ["192.0.2.2:1000", "[2001:db8::1]:1000"] {
+            let request = authentication_request(Some(peer.parse().unwrap()));
+            json_body(
+                fixture.app.clone().oneshot(request).await.unwrap(),
+                StatusCode::OK,
+            )
+            .await;
+        }
+    })
+    .await
+    .expect("rate-limit regression must finish within one window");
+    fixture.finish().await;
 }
 
 #[tokio::test]
