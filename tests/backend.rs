@@ -143,6 +143,19 @@ impl Fixture {
     }
 
     async fn call(&self, method: &str, path: &str, token: Option<&str>, body: Value) -> Response {
+        self.send(method, path, token, &[], body).await
+    }
+
+    /// Sends a request carrying extra headers, such as the `If-Match`
+    /// precondition every playthrough edit requires.
+    async fn send(
+        &self,
+        method: &str,
+        path: &str,
+        token: Option<&str>,
+        headers: &[(&str, &str)],
+        body: Value,
+    ) -> Response {
         let mut request = Request::builder()
             .method(method)
             .uri(path)
@@ -152,6 +165,9 @@ impl Fixture {
             .header("Content-Type", "application/json");
         if let Some(token) = token {
             request = request.header("Authorization", format!("Bearer {token}"));
+        }
+        for (name, value) in headers {
+            request = request.header(*name, *value);
         }
         self.app
             .clone()
@@ -183,6 +199,36 @@ impl Fixture {
     ) -> Value {
         json_body(self.call(method, path, Some(token), body).await, status).await
     }
+
+    /// A conditional playthrough edit, asserting its status and returning the
+    /// response body.
+    async fn edit(
+        &self,
+        method: &str,
+        path: &str,
+        token: &str,
+        etag: &str,
+        body: Value,
+        status: StatusCode,
+    ) -> Value {
+        json_body(
+            self.send(method, path, Some(token), &[("If-Match", etag)], body)
+                .await,
+            status,
+        )
+        .await
+    }
+}
+
+/// The entity tag naming a playthrough's current revision, in the form
+/// `If-Match` expects.
+fn tag(playthrough: &Value) -> String {
+    format!(
+        "\"{}\"",
+        playthrough["version"]
+            .as_i64()
+            .expect("every playthrough publishes its version")
+    )
 }
 
 async fn json_body(response: Response, status: StatusCode) -> Value {
@@ -869,7 +915,32 @@ async fn browser_security_validation_and_account_deletion_cascade() {
     );
     assert_eq!(response.headers()["cache-control"], "no-store");
     assert!(response.headers().contains_key("x-request-id"));
+    // An entity tag is useless to the SPA unless the browser lets it be read.
+    assert!(
+        response.headers()["access-control-expose-headers"]
+            .to_str()
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("etag")
+    );
     json_body(response, StatusCode::OK).await;
+
+    // Conditional playthrough edits must survive the browser's preflight.
+    let preflight = Request::builder()
+        .method("OPTIONS")
+        .uri("/api/me/playthroughs/00000000-0000-0000-0000-000000000000")
+        .header("Origin", "http://localhost:5173")
+        .header("Access-Control-Request-Method", "PATCH")
+        .header("Access-Control-Request-Headers", "content-type, if-match")
+        .body(Body::empty())
+        .unwrap();
+    let allowed = fixture.app.clone().oneshot(preflight).await.unwrap();
+    assert_eq!(allowed.status(), 200);
+    let headers = allowed.headers()["access-control-allow-headers"]
+        .to_str()
+        .unwrap()
+        .to_ascii_lowercase();
+    assert!(headers.contains("if-match"), "{headers}");
 
     let preflight = Request::builder()
         .method("OPTIONS")
@@ -1146,7 +1217,7 @@ async fn repeat_playthroughs_preserve_history_and_derive_library_rating() {
     }
     let original_path = format!("{collection}/{}", original["id"].as_str().unwrap());
     let replay_path = format!("{collection}/{}", replay["id"].as_str().unwrap());
-    for method in ["GET", "PUT", "DELETE"] {
+    for method in ["GET", "PUT", "PATCH", "DELETE"] {
         assert_eq!(
             fixture
                 .call(method, &original_path, None, json!({}))
@@ -1164,15 +1235,20 @@ async fn repeat_playthroughs_preserve_history_and_derive_library_rating() {
             StatusCode::NOT_FOUND,
         )
         .await;
-    fixture
-        .value(
-            "PUT",
-            &original_path,
-            &bob,
-            json!({"rating":1}),
-            StatusCode::NOT_FOUND,
-        )
-        .await;
+    // Ownership is settled before the precondition, so holding a valid entity
+    // tag for someone else's playthrough neither edits it nor confirms it.
+    for method in ["PUT", "PATCH"] {
+        fixture
+            .edit(
+                method,
+                &original_path,
+                &bob,
+                &tag(&original),
+                json!({"rating":1}),
+                StatusCode::NOT_FOUND,
+            )
+            .await;
+    }
     fixture
         .value(
             "DELETE",
@@ -1203,15 +1279,17 @@ async fn repeat_playthroughs_preserve_history_and_derive_library_rating() {
 
     // Editing an older review preserves its identity/recording time and recency.
     let edited = fixture
-        .value(
+        .edit(
             "PUT",
             &original_path,
             &alice,
+            &tag(&original),
             json!({"rating":8,"review":"Edited first experience","finished_on":"2022-04-01"}),
             StatusCode::OK,
         )
         .await;
     assert_eq!(edited["id"], original["id"]);
+    assert_eq!(edited["version"], 2, "an edit is a new revision");
     assert_eq!(edited["created_at"], original["created_at"]);
     assert!(edited["platform"].is_null(), "PUT replaces nullable fields");
     let current = fixture
@@ -1225,11 +1303,12 @@ async fn repeat_playthroughs_preserve_history_and_derive_library_rating() {
 
     // Clearing the current rating falls back; changing its experience date
     // also recomputes which rated playthrough is the newest.
-    fixture
-        .value(
+    let unrated_replay = fixture
+        .edit(
             "PUT",
             &replay_path,
             &alice,
+            &tag(&replay),
             json!({"review":"Replay without a rating","finished_on":"2026-02-01","rating":null}),
             StatusCode::OK,
         )
@@ -1239,10 +1318,11 @@ async fn repeat_playthroughs_preserve_history_and_derive_library_rating() {
         .await;
     assert_eq!(current["rating"], 8);
     fixture
-        .value(
+        .edit(
             "PUT",
             &replay_path,
             &alice,
+            &tag(&unrated_replay),
             json!({"rating":6,"finished_on":"2019-01-01"}),
             StatusCode::OK,
         )
@@ -1290,8 +1370,9 @@ async fn repeat_playthroughs_preserve_history_and_derive_library_rating() {
         fixture
             .value("GET", &path, &alice, Value::Null, StatusCode::NOT_FOUND)
             .await;
+        // Not even `*` resurrects a deleted playthrough.
         fixture
-            .value("PUT", &path, &alice, json!({}), StatusCode::NOT_FOUND)
+            .edit("PUT", &path, &alice, "*", json!({}), StatusCode::NOT_FOUND)
             .await;
         let current = fixture
             .value("GET", library, &alice, Value::Null, StatusCode::OK)
@@ -1389,7 +1470,7 @@ async fn playthrough_validation_rejects_bad_input_before_importing() {
             )
             .await;
     }
-    for method in ["GET", "PUT", "DELETE"] {
+    for method in ["GET", "PUT", "PATCH", "DELETE"] {
         fixture
             .value(
                 method,
@@ -1411,24 +1492,29 @@ async fn playthrough_validation_rejects_bad_input_before_importing() {
         )
         .await;
     let path = format!("/api/me/playthroughs/{}", row["id"].as_str().unwrap());
-    fixture
-        .value(
-            "PUT",
-            &path,
-            &token,
-            json!({"rating":0}),
-            StatusCode::BAD_REQUEST,
-        )
-        .await;
-    fixture
-        .value(
-            "PUT",
-            &path,
-            &token,
-            json!({"igdb_id":43}),
-            StatusCode::UNPROCESSABLE_ENTITY,
-        )
-        .await;
+    for method in ["PUT", "PATCH"] {
+        fixture
+            .edit(
+                method,
+                &path,
+                &token,
+                &tag(&row),
+                json!({"rating":0}),
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+        // The game a playthrough records cannot be changed by either route.
+        fixture
+            .edit(
+                method,
+                &path,
+                &token,
+                &tag(&row),
+                json!({"igdb_id":43}),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            )
+            .await;
+    }
     let unchanged = fixture
         .value("GET", &path, &token, Value::Null, StatusCode::OK)
         .await;
@@ -1453,9 +1539,10 @@ async fn migration_preserves_legacy_reviews_without_inventing_play_dates() {
     // Restore the exact old library shape in this disposable database, then
     // exercise the real migrator, including its migration history and restart.
     sqlx::raw_sql("DROP VIEW library_entry_details; DROP TABLE playthroughs;
+        DROP FUNCTION playthrough_revision();
         ALTER TABLE library_entries ADD COLUMN rating SMALLINT CHECK (rating BETWEEN 1 AND 10),
         ADD COLUMN review TEXT CHECK (char_length(review) <= 10000);
-        DELETE FROM _sqlx_migrations WHERE version=202609080002;
+        DELETE FROM _sqlx_migrations WHERE version IN (202609080002,202609080003);
         INSERT INTO games (id,igdb_id,name,slug,source_url)
         SELECT gen_random_uuid(),n,'Legacy game','legacy-game','https://www.igdb.com' FROM generate_series(43,45) n;")
         .execute(&fixture.database.app).await.unwrap();
@@ -1502,7 +1589,23 @@ async fn migration_preserves_legacy_reviews_without_inventing_play_dates() {
         assert!(entry["platform"].is_null());
         assert_eq!(entry["created_at"], "2022-01-02T23:30:00Z");
         assert_eq!(entry["updated_at"], "2026-05-06T12:00:00Z");
+        // A converted review is a first revision, editable without a prior read.
+        assert_eq!(entry["version"], 1);
     }
+    let converted = &diary["data"][0];
+    let edited = fixture
+        .edit(
+            "PATCH",
+            &format!("/api/me/playthroughs/{}", converted["id"].as_str().unwrap()),
+            &token,
+            &tag(converted),
+            json!({"platform":"PC"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(edited["version"], 2);
+    assert_eq!(edited["review"], converted["review"]);
+    assert_ne!(edited["updated_at"], converted["updated_at"]);
     let library = fixture
         .value(
             "GET",
@@ -1519,5 +1622,368 @@ async fn migration_preserves_legacy_reviews_without_inventing_play_dates() {
         assert_eq!(row["entry"]["updated_at"], "2026-05-06T12:00:00Z");
         assert!(row["entry"].get("review").is_none());
     }
+    fixture.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn partial_playthrough_edits_reject_stale_and_unconditional_writes() {
+    let fixture = Fixture::new().await;
+    let (_, alice) = fixture.user("editing-alice").await;
+    let (_, bob) = fixture.user("editing-bob").await;
+    let collection = "/api/me/playthroughs";
+    let library = "/api/me/library/42";
+
+    let response = fixture
+        .send(
+            "POST",
+            collection,
+            Some(&alice),
+            &[],
+            json!({"igdb_id":42,"rating":9,"review":"First pass","started_on":"2026-01-01","platform":"PC"}),
+        )
+        .await;
+    assert_eq!(response.headers()["etag"], "\"1\"");
+    let created = json_body(response, StatusCode::CREATED).await;
+    assert_eq!(created["version"], 1);
+    let path = format!("{collection}/{}", created["id"].as_str().unwrap());
+    let response = fixture.call("GET", &path, Some(&alice), Value::Null).await;
+    assert_eq!(response.headers()["etag"], tag(&created));
+    json_body(response, StatusCode::OK).await;
+
+    // An edit that names no revision is refused, because allowing it is exactly
+    // the lost update the entity tag exists to prevent.
+    for method in ["PUT", "PATCH"] {
+        let error = fixture
+            .value(
+                method,
+                &path,
+                &alice,
+                json!({"review":"Sent without a precondition"}),
+                StatusCode::PRECONDITION_REQUIRED,
+            )
+            .await;
+        assert_eq!(error["error"]["code"], "precondition_required");
+    }
+    // A precondition this server cannot evaluate is a bad request, not a free pass.
+    for malformed in ["", "  ", "1", "\"1", "*, \"1\"", "\"1\","] {
+        fixture
+            .edit(
+                "PATCH",
+                &path,
+                &alice,
+                malformed,
+                json!({"review":"Sent with a malformed precondition"}),
+                StatusCode::BAD_REQUEST,
+            )
+            .await;
+    }
+    // `If-Match` compares strongly, so a weak tag can never satisfy it.
+    let error = fixture
+        .edit(
+            "PATCH",
+            &path,
+            &alice,
+            "W/\"1\"",
+            json!({"review":"Sent with a weak tag"}),
+            StatusCode::PRECONDITION_FAILED,
+        )
+        .await;
+    assert_eq!(error["error"]["code"], "precondition_failed");
+    assert_eq!(
+        fixture
+            .value("GET", &path, &alice, Value::Null, StatusCode::OK)
+            .await,
+        created,
+        "a refused edit changes nothing"
+    );
+
+    // A partial edit touches only the fields it names.
+    let response = fixture
+        .send(
+            "PATCH",
+            &path,
+            Some(&alice),
+            &[("If-Match", &tag(&created))],
+            json!({"review":"Second thoughts"}),
+        )
+        .await;
+    assert_eq!(response.headers()["etag"], "\"2\"");
+    let patched = json_body(response, StatusCode::OK).await;
+    assert_eq!(patched["review"], "Second thoughts");
+    assert_eq!(patched["rating"], 9);
+    assert_eq!(patched["platform"], "PC");
+    assert_eq!(patched["started_on"], "2026-01-01");
+    assert_eq!(patched["id"], created["id"]);
+    assert_eq!(patched["created_at"], created["created_at"]);
+    assert_eq!(patched["version"], 2);
+    for method in ["PUT", "PATCH"] {
+        fixture
+            .edit(
+                method,
+                &path,
+                &alice,
+                &tag(&created),
+                json!({"review":"Sent with the superseded tag"}),
+                StatusCode::PRECONDITION_FAILED,
+            )
+            .await;
+    }
+
+    // The review's motivating case: two tabs read one revision, and the second
+    // is told to reload rather than silently discarding the first tab's work.
+    let read_by_both = fixture
+        .value("GET", &path, &alice, Value::Null, StatusCode::OK)
+        .await;
+    let rated = fixture
+        .edit(
+            "PATCH",
+            &path,
+            &alice,
+            &tag(&read_by_both),
+            json!({"rating":7}),
+            StatusCode::OK,
+        )
+        .await;
+    fixture
+        .edit(
+            "PATCH",
+            &path,
+            &alice,
+            &tag(&read_by_both),
+            json!({"review":"Written in a stale tab"}),
+            StatusCode::PRECONDITION_FAILED,
+        )
+        .await;
+    let merged = fixture
+        .edit(
+            "PATCH",
+            &path,
+            &alice,
+            &tag(&rated),
+            json!({"review":"Written after reloading"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(merged["rating"], 7, "the other tab's rating survived");
+    assert_eq!(merged["review"], "Written after reloading");
+
+    // Explicit null is the only way a partial edit clears a field.
+    let cleared = fixture
+        .edit(
+            "PATCH",
+            &path,
+            &alice,
+            &tag(&merged),
+            json!({"platform":null,"started_on":null}),
+            StatusCode::OK,
+        )
+        .await;
+    assert!(cleared["platform"].is_null());
+    assert!(cleared["started_on"].is_null());
+    assert_eq!(cleared["rating"], 7);
+    assert_eq!(cleared["review"], "Written after reloading");
+    // A misspelled field is refused rather than quietly changing nothing.
+    for unknown in [json!({"reviews":"typo"}), json!({"igdb_id":43})] {
+        fixture
+            .edit(
+                "PATCH",
+                &path,
+                &alice,
+                &tag(&cleared),
+                unknown,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            )
+            .await;
+    }
+
+    // Cross-field rules are checked against the merged record, not the body.
+    let dated = fixture
+        .edit(
+            "PATCH",
+            &path,
+            &alice,
+            &tag(&cleared),
+            json!({"started_on":"2026-05-01","platform":" Steam Deck "}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(dated["platform"], "Steam Deck");
+    fixture
+        .edit(
+            "PATCH",
+            &path,
+            &alice,
+            &tag(&dated),
+            json!({"finished_on":"2026-04-01"}),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    let finished = fixture
+        .edit(
+            "PATCH",
+            &path,
+            &alice,
+            &tag(&dated),
+            json!({"finished_on":"2026-06-01"}),
+            StatusCode::OK,
+        )
+        .await;
+
+    // Re-saving an unchanged form is not a revision, so it neither bumps the
+    // timestamp nor invalidates a tag another tab is legitimately holding.
+    assert_eq!(
+        fixture
+            .edit(
+                "PATCH",
+                &path,
+                &alice,
+                &tag(&finished),
+                json!({}),
+                StatusCode::OK
+            )
+            .await,
+        finished
+    );
+    assert_eq!(
+        fixture
+            .edit(
+                "PUT",
+                &path,
+                &alice,
+                &tag(&finished),
+                json!({"rating":finished["rating"],"review":finished["review"],
+                       "started_on":finished["started_on"],"finished_on":finished["finished_on"],
+                       "platform":finished["platform"]}),
+                StatusCode::OK,
+            )
+            .await,
+        finished
+    );
+
+    // `*` asserts only that the playthrough still exists.
+    let starred = fixture
+        .edit(
+            "PATCH",
+            &path,
+            &alice,
+            "*",
+            json!({"rating":10}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        starred["version"].as_i64().unwrap(),
+        finished["version"].as_i64().unwrap() + 1
+    );
+
+    // Edits keep flowing through to the derived library rating.
+    fixture
+        .value(
+            "PUT",
+            library,
+            &alice,
+            json!({"status":"playing"}),
+            StatusCode::OK,
+        )
+        .await;
+    let entry = fixture
+        .value("GET", library, &alice, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(entry["rating"], 10);
+    assert_eq!(entry["rating_playthrough_id"], created["id"]);
+    let unrated = fixture
+        .edit(
+            "PATCH",
+            &path,
+            &alice,
+            &tag(&starred),
+            json!({"rating":null}),
+            StatusCode::OK,
+        )
+        .await;
+    let entry = fixture
+        .value("GET", library, &alice, Value::Null, StatusCode::OK)
+        .await;
+    assert!(entry["rating"].is_null());
+    assert!(entry["rating_playthrough_id"].is_null());
+    // Listings carry the version, so an editor never needs a second read first.
+    let listed = fixture
+        .value("GET", collection, &alice, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(listed["data"][0], unrated);
+
+    // Simultaneous edits to different fields are serialized by the row lock, so
+    // the later one merges into the committed result rather than into the value
+    // it read before the other edit landed.
+    let (review, rating) = tokio::join!(
+        fixture.send(
+            "PATCH",
+            &path,
+            Some(&alice),
+            &[("If-Match", "*")],
+            json!({"review":"Written at the same moment"}),
+        ),
+        fixture.send(
+            "PATCH",
+            &path,
+            Some(&alice),
+            &[("If-Match", "*")],
+            json!({"rating":4}),
+        ),
+    );
+    assert_eq!(review.status(), StatusCode::OK);
+    assert_eq!(rating.status(), StatusCode::OK);
+    let current = fixture
+        .value("GET", &path, &alice, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(current["review"], "Written at the same moment");
+    assert_eq!(current["rating"], 4);
+    assert_eq!(
+        current["version"].as_i64().unwrap(),
+        unrated["version"].as_i64().unwrap() + 2,
+        "both edits are revisions"
+    );
+
+    // A conditional deletion asserts a revision; only an unconditional one is
+    // idempotent.
+    for (token, etag) in [(&alice, tag(&starred)), (&bob, tag(&current))] {
+        fixture
+            .edit(
+                "DELETE",
+                &path,
+                token,
+                &etag,
+                Value::Null,
+                StatusCode::PRECONDITION_FAILED,
+            )
+            .await;
+    }
+    fixture
+        .value("GET", &path, &alice, Value::Null, StatusCode::OK)
+        .await;
+    fixture
+        .edit(
+            "DELETE",
+            &path,
+            &alice,
+            &tag(&current),
+            Value::Null,
+            StatusCode::NO_CONTENT,
+        )
+        .await;
+    fixture
+        .edit(
+            "DELETE",
+            &path,
+            &alice,
+            "*",
+            Value::Null,
+            StatusCode::PRECONDITION_FAILED,
+        )
+        .await;
+    fixture
+        .value("DELETE", &path, &alice, Value::Null, StatusCode::NO_CONTENT)
+        .await;
     fixture.finish().await;
 }

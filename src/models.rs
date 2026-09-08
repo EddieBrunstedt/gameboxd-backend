@@ -115,6 +115,10 @@ pub struct LibraryEntry {
 pub struct Playthrough {
     pub id: Uuid,
     pub igdb_id: i64,
+    /// Revision counter, incremented by the database on every real change.
+    /// Published so a client holding a listed playthrough can edit it without
+    /// re-reading the single-resource route for its `ETag`.
+    pub version: i32,
     pub rating: Option<i16>,
     pub review: Option<String>,
     pub started_on: Option<NaiveDate>,

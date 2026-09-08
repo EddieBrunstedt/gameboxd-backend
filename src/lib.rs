@@ -44,9 +44,16 @@ pub fn router(config: &Config, state: AppState, auth: &AuthService) -> Router {
             Method::PATCH,
             Method::DELETE,
         ])
-        .allow_headers([header::CONTENT_TYPE, header::AUTHORIZATION])
+        // `If-Match` carries the concurrency precondition on playthrough edits,
+        // and an `ETag` is useless to the SPA unless the browser may read it.
+        .allow_headers([
+            header::CONTENT_TYPE,
+            header::AUTHORIZATION,
+            header::IF_MATCH,
+        ])
         .expose_headers([
             header::HeaderName::from_static("x-request-id"),
+            header::ETAG,
             header::RETRY_AFTER,
         ]);
     let request_id = header::HeaderName::from_static("x-request-id");

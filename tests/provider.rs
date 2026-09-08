@@ -1,5 +1,5 @@
 use gameboxd_backend::{
-    api::{EntryInput, PageQuery, PlaythroughInput},
+    api::{EntryInput, PageQuery, PlaythroughFields, PlaythroughInput},
     config::Config,
     igdb::{Endpoints, IgdbClient, validate_search},
 };
@@ -299,7 +299,7 @@ async fn credentials_are_optional_and_invalid_inputs_do_not_call_provider() {
 fn library_and_playthrough_inputs_enforce_their_separate_contracts() {
     for rating in [0, 11, -1] {
         let input: PlaythroughInput = serde_json::from_value(json!({"rating":rating})).unwrap();
-        assert!(input.validate().is_err());
+        assert!(PlaythroughFields::from(input).validated().is_err());
     }
     for invalid in [
         json!({"review":"a".repeat(10001)}),
@@ -310,7 +310,7 @@ fn library_and_playthrough_inputs_enforce_their_separate_contracts() {
         json!({"started_on":"2026-02-02","finished_on":"2026-02-01"}),
     ] {
         let input: PlaythroughInput = serde_json::from_value(invalid).unwrap();
-        assert!(input.validate().is_err());
+        assert!(PlaythroughFields::from(input).validated().is_err());
     }
     for invalid in [
         json!({"status":"invented"}),
@@ -335,7 +335,7 @@ fn library_and_playthrough_inputs_enforce_their_separate_contracts() {
         json!({"started_on":"2026-01-01","finished_on":"2026-01-01"}),
     ] {
         let input: PlaythroughInput = serde_json::from_value(valid).unwrap();
-        assert!(input.validate().is_ok());
+        assert!(PlaythroughFields::from(input).validated().is_ok());
     }
     let page: PageQuery = serde_json::from_value(json!({"limit":0})).unwrap();
     assert!(page.validate().is_err());
