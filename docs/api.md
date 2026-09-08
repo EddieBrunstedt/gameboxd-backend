@@ -1,6 +1,6 @@
 # API contract
 
-Base URL: `http://localhost:3000`. All bodies are JSON unless a response is `204 No Content`. Timestamps use RFC 3339 UTC. Games are addressed by their IGDB integer ID everywhere, including in library routes; the local UUID in a game object is an internal primary key and never appears in a path. Request bodies are limited to 64 KiB.
+Base URL: `http://localhost:3000`. All bodies are JSON unless a response is `204 No Content`. Timestamps use RFC 3339 UTC. Games are addressed by their IGDB integer ID everywhere, including in library routes; the local UUID in a game object is an internal primary key and never appears in a path. Playthroughs have their own UUIDs, used in playthrough paths. Request bodies are limited to 64 KiB.
 
 ## Application routes
 
@@ -17,7 +17,12 @@ Base URL: `http://localhost:3000`. All bodies are JSON unless a response is `204
 | GET | `/api/me/library?status=playing&q=halo&limit=20&offset=0` | Yes | Own library with nested game details |
 | GET | `/api/me/library/{igdb_id}` | Yes | Own entry for a game |
 | PUT | `/api/me/library/{igdb_id}` | Yes | Create or replace own entry, storing the game if needed |
-| DELETE | `/api/me/library/{igdb_id}` | Yes | Remove own entry (idempotent 204) |
+| DELETE | `/api/me/library/{igdb_id}` | Yes | Remove own library entry, preserving playthroughs (idempotent 204) |
+| GET | `/api/me/playthroughs?igdb_id=42&limit=20&offset=0` | Yes | Own diary; optional game filter |
+| POST | `/api/me/playthroughs` | Yes | Record a new experience, storing the game if needed (201) |
+| GET | `/api/me/playthroughs/{id}` | Yes | Own playthrough |
+| PUT | `/api/me/playthroughs/{id}` | Yes | Replace the editable fields of an existing playthrough |
+| DELETE | `/api/me/playthroughs/{id}` | Yes | Delete own playthrough (idempotent 204) |
 
 A stored game includes `id`, `igdb_id`, `name`, `slug`, nullable `summary`, `cover_url`, `first_release_date`, arrays of `{id,name}` for `platforms`, `genres`, `developers`, nullable `game_type`, `parent_igdb_id`, `version_parent_igdb_id`, `source_url`, `imported_at` and `refreshed_at`. Taxonomy/parent IDs are upstream IGDB IDs, not local UUIDs. The `game` nested in a library listing is that same object, field for field.
 
@@ -34,26 +39,58 @@ Display name is trimmed and limited to 80 characters; bio to 1000. The response 
 `PUT /api/me/library/{igdb_id}` body:
 
 ```json
-{"status":"completed","rating":9,"review":"A memorable adventure."}
+{"status":"completed"}
 ```
 
-Allowed statuses: `backlog`, `playing`, `completed`, `on_hold`, `dropped`. `status` is required. `rating` is nullable or an integer 1–10 (divide by two to show half-stars). `review` is nullable and at most 10000 characters. PUT replaces the entry: omitting rating/review clears them, as does explicit null. Unknown fields are rejected. Each entry returns `igdb_id`, `status`, `rating`, `review`, `created_at`, `updated_at`. Use plain-text rendering for user content; never inject it as HTML.
+Allowed statuses: `backlog`, `playing`, `completed`, `on_hold`, `dropped`. `status` is required and is the only writable library field. Each entry returns `igdb_id`, `status`, derived nullable `rating`, nullable `rating_playthrough_id`, `created_at`, and `updated_at`. Ratings and reviews cannot be written through this route; obsolete payloads containing either field are rejected rather than silently discarded. The library has no review field.
 
-Saving an entry stores the game automatically, so no import call is needed first: a game already held locally is reused, and an unknown one is fetched from IGDB in the same request. That fetch is the only reason a library write can fail with an upstream error (502/503) — a game already stored stays usable while IGDB is down, including with metadata past its refresh window. An IGDB ID no game exists under returns 404.
+The displayed rating comes from the most recent **rated** playthrough, using the chronology defined below. `rating_playthrough_id` identifies that experience. An unrated replay does not hide a previous rating. Editing or deleting a playthrough recalculates the displayed rating automatically; if none remain rated, both derived fields are null. Changing library status never edits a playthrough. Library timestamps describe changes to library membership/status, not changes to the derived rating.
 
-The authenticated session determines the owner; no route accepts a user ID for library writes. This milestone has no public review/profile endpoints or review aggregation.
+Saving an entry stores an unknown game automatically, so no import call is needed first. Existing metadata older than 24 hours currently triggers a refresh attempt; provider failure falls back to that local game. An unknown game requires a successful IGDB fetch, and an IGDB ID no game exists under returns 404.
+
+## Playthroughs and diary
+
+A playthrough represents one experience with a game, not an individual gaming session. Multiple entries for the same game are allowed. Completion is never required: abandoned runs and open-ended games can be rated or reviewed. Library membership and history are independent: recording a playthrough does not create a library entry or guess its status; removing a library entry preserves history. Deleting an account removes both.
+
+`POST /api/me/playthroughs` body (`igdb_id` required, all other fields optional):
+
+```json
+{
+  "igdb_id": 42,
+  "rating": 9,
+  "review": "A memorable first playthrough.",
+  "started_on": "2022-03-01",
+  "finished_on": "2022-04-15",
+  "platform": "PC"
+}
+```
+
+`PUT /api/me/playthroughs/{id}` accepts the same editable fields **without** `igdb_id`. The owner, game, UUID and recording time cannot be changed. PUT replaces all editable fields: omitted fields and explicit null both clear them. Editing preserves the playthrough's identity and `created_at`, and updates `updated_at`. To record a replay, POST a new entry. POST always creates a new UUID, so retrying a successful POST can create a duplicate.
+
+- `rating`: null or an integer 1–10 (divide by two to show half-stars).
+- `review`: null or plain text of at most 10000 characters, without NUL. Render user content as text, never as HTML.
+- `started_on`, `finished_on`: null or calendar dates in `YYYY-MM-DD` format. If both are set, the finish must be on or after the start. These describe the experience; `finished_on` does not imply the game was completed or update library status. Either date can be provided alone.
+- `platform`: null or a label of 1–100 characters without control characters, trimmed when saved. This is free text (for example `PC` or `Steam Deck`), not an IGDB taxonomy ID.
+
+An undated rating, a review without a rating, and a record with neither are all valid. Unknown fields are rejected. Responses contain `id`, `igdb_id`, `rating`, `review`, `started_on`, `finished_on`, `platform`, `created_at`, and `updated_at`; they never expose the owner or local game key.
+
+**Chronology:** newest `finished_on`, falling back to `started_on`, then the UTC date of `created_at`. Ties use `created_at` descending, then playthrough UUID descending. Both the diary and the derived library rating use this ordering; the latter skips unrated entries. Editing text never makes an old experience newest, while changing its dates can change its position. An undated entry uses its recording date until a play date is supplied, so an undated old experience cannot be distinguished from a recent one.
+
+The migration converts each previous library rating and/or review into one undated playthrough, retaining the original recording/edit timestamps. It creates no playthrough for a status-only entry and invents no play dates or platform.
+
+All library and playthrough routes use the authenticated session as owner. Reading or updating another user's playthrough returns 404; deletion is a no-op 204. History remains private, and this milestone has no public review/profile endpoints or review aggregation. Safe partial edits and stale-update protection remain follow-up work; playthrough PUT currently has replacement semantics with last-write-wins editing.
 
 ## Pagination
 
-`limit` defaults to 20 and must be 1–50. `offset` defaults to zero and is capped at 10000. `q`, when supplied, must contain 1–100 characters without control characters. Local search matches case-insensitive name substrings, with `%` and `_` treated as ordinary characters rather than wildcards, over games stored here — those at least one member has in a library, or that were explicitly imported — while catalog search queries all of IGDB by relevance. The `status` filter applies to library listing.
+`limit` defaults to 20 and must be 1–50. `offset` defaults to zero and is capped at 10000. `q`, when supplied, must contain 1–100 characters without control characters. Local search matches case-insensitive name substrings, with `%` and `_` treated as ordinary characters rather than wildcards, over games stored here — those stored through library saves, playthrough creation, or explicit imports — while catalog search queries all of IGDB by relevance. The `status` filter applies to library listing.
 
-Local games and library listings return:
+Local games, library, and playthrough listings return:
 
 ```json
 {"data":[],"limit":20,"offset":0,"has_more":false}
 ```
 
-Local games sort by lowercase name then internal UUID. Library entries sort by most recently updated then internal game UUID, and each item is `{game,entry}`. Offset pagination can shift if entries change between requests.
+Local games sort by lowercase name then internal UUID. Library entries sort by most recently updated then internal game UUID, and each item is `{game,entry}`. Playthrough listing accepts only `limit`, `offset`, and optional positive `igdb_id`; it returns playthrough objects ordered by the chronology above. A game with no own playthroughs returns an empty page, even if it is not stored locally. Offset pagination can shift if entries change between requests.
 
 Catalog search returns `{data,limit,offset,next_offset}`. A full upstream page sets the next offset (until the offset cap); it does not guarantee another result exists. No total-count query is made. Being read-only, it is safe to retry and cache. A successful import returns a single stored game and HTTP 200 whether newly created or refreshed.
 
@@ -78,7 +115,7 @@ await fetch(`${API}/api/me/library/${game.igdb_id}`, {
   method: "PUT",
   credentials: "include",
   headers: { "Content-Type": "application/json" },
-  body: JSON.stringify({ status: "playing", rating: null, review: null }),
+  body: JSON.stringify({ status: "playing" }),
 });
 ```
 

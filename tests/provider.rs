@@ -1,5 +1,5 @@
 use gameboxd_backend::{
-    api::{EntryInput, PageQuery},
+    api::{EntryInput, PageQuery, PlaythroughInput},
     config::Config,
     igdb::{Endpoints, IgdbClient, validate_search},
 };
@@ -292,28 +292,49 @@ async fn credentials_are_optional_and_invalid_inputs_do_not_call_provider() {
 }
 
 #[test]
-fn library_input_enforces_rating_review_status_and_pagination() {
+fn library_and_playthrough_inputs_enforce_their_separate_contracts() {
     for rating in [0, 11, -1] {
-        let input: EntryInput =
-            serde_json::from_value(json!({"status":"playing","rating":rating})).unwrap();
+        let input: PlaythroughInput = serde_json::from_value(json!({"rating":rating})).unwrap();
         assert!(input.validate().is_err());
     }
-    let oversized: EntryInput =
-        serde_json::from_value(json!({"status":"completed","review":"a".repeat(10001)})).unwrap();
-    assert!(oversized.validate().is_err());
-    let nul: EntryInput =
-        serde_json::from_value(json!({"status":"backlog","review":"bad\u{0000}text"})).unwrap();
-    assert!(nul.validate().is_err());
-    assert!(serde_json::from_value::<EntryInput>(json!({"status":"invented"})).is_err());
+    for invalid in [
+        json!({"review":"a".repeat(10001)}),
+        json!({"review":"bad\u{0000}text"}),
+        json!({"platform":" "}),
+        json!({"platform":"a".repeat(101)}),
+        json!({"platform":"PC\n"}),
+        json!({"started_on":"2026-02-02","finished_on":"2026-02-01"}),
+    ] {
+        let input: PlaythroughInput = serde_json::from_value(invalid).unwrap();
+        assert!(input.validate().is_err());
+    }
+    for invalid in [
+        json!({"status":"invented"}),
+        json!({"status":"backlog","user_id":"someone-else"}),
+        json!({"status":"playing","rating":8}),
+        json!({"status":"completed","review":"Moved to playthroughs"}),
+    ] {
+        assert!(serde_json::from_value::<EntryInput>(invalid).is_err());
+    }
+    assert!(serde_json::from_value::<EntryInput>(json!({"status":"on_hold"})).is_ok());
     assert!(
-        serde_json::from_value::<EntryInput>(json!({"status":"backlog","user_id":"someone-else"}))
-            .is_err()
+        serde_json::from_value::<PlaythroughInput>(json!({"started_on":"2026-02-30"})).is_err()
     );
+    assert!(serde_json::from_value::<PlaythroughInput>(json!({"user_id":"someone-else"})).is_err());
+    for valid in [
+        json!({}),
+        json!({"rating":null,"review":null}),
+        json!({"rating":1}),
+        json!({"rating":10,"review":"é".repeat(10000)}),
+        json!({"started_on":"2026-01-01","platform":" PC "}),
+        json!({"finished_on":"2022-01-01","review":"Never finished the game"}),
+        json!({"started_on":"2026-01-01","finished_on":"2026-01-01"}),
+    ] {
+        let input: PlaythroughInput = serde_json::from_value(valid).unwrap();
+        assert!(input.validate().is_ok());
+    }
     let page: PageQuery = serde_json::from_value(json!({"limit":0})).unwrap();
     assert!(page.validate().is_err());
-    let valid: EntryInput =
-        serde_json::from_value(json!({"status":"on_hold","rating":null,"review":null})).unwrap();
-    assert!(valid.validate().is_ok());
 }
 
 #[test]

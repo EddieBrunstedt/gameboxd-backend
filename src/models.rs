@@ -1,4 +1,4 @@
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDate, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::{FromRow, PgPool, types::Json};
 use uuid::Uuid;
@@ -31,7 +31,8 @@ pub struct Game {
 /// The local row for an upstream game, importing or refreshing it as needed.
 ///
 /// Materializing a game is a side effect of an operation the user actually
-/// intends — adding it to a library, or an explicit import — never of a search.
+/// intends — adding it to a library, recording a playthrough, or an explicit
+/// import — never of a search.
 /// If upstream is unavailable but a stale local row exists, the stale row is
 /// used: an existing game stays usable while IGDB is down, and only a genuinely
 /// unknown game requires a successful upstream call.
@@ -71,7 +72,7 @@ pub async fn find_game(pool: &PgPool, igdb_id: i64, fresh_only: bool) -> ApiResu
 /// Writes one upstream game to the catalog, refreshing it if already present.
 ///
 /// `RETURNING *` yields the post-upsert row, so a refresh preserves the local
-/// UUID and every library entry that references it.
+/// UUID and every library entry and playthrough that references it.
 pub async fn upsert_game(pool: &PgPool, game: ProviderGame) -> ApiResult<Game> {
     let row = sqlx::query_as::<_, Game>(
         "INSERT INTO games (id,igdb_id,name,slug,summary,cover_url,first_release_date,platforms,genres,developers,game_type,parent_igdb_id,version_parent_igdb_id,source_url)
@@ -105,7 +106,20 @@ pub struct LibraryEntry {
     pub igdb_id: i64,
     pub status: PlayStatus,
     pub rating: Option<i16>,
+    pub rating_playthrough_id: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(Serialize, FromRow)]
+pub struct Playthrough {
+    pub id: Uuid,
+    pub igdb_id: i64,
+    pub rating: Option<i16>,
     pub review: Option<String>,
+    pub started_on: Option<NaiveDate>,
+    pub finished_on: Option<NaiveDate>,
+    pub platform: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

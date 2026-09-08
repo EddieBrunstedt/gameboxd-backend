@@ -7,16 +7,18 @@ use axum::{
     http::StatusCode,
     routing::{get, post},
 };
+use chrono::NaiveDate;
 use doorman::prelude::AuthUser;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::FromRow;
+use uuid::Uuid;
 
 use crate::{
     AppState,
     error::{ApiError, ApiResult},
     igdb::{CatalogGame, validate_search},
-    models::{Game, LibraryEntry, PlayStatus, Profile, ensure_game, find_game},
+    models::{Game, LibraryEntry, PlayStatus, Playthrough, Profile, ensure_game, find_game},
 };
 
 pub fn routes() -> Router<AppState> {
@@ -26,6 +28,16 @@ pub fn routes() -> Router<AppState> {
         .route("/api/games/{igdb_id}", get(game))
         .route("/api/catalog/search", get(search))
         .route("/api/catalog/import/{igdb_id}", post(import))
+        .route(
+            "/api/me/playthroughs",
+            get(playthroughs).post(create_playthrough),
+        )
+        .route(
+            "/api/me/playthroughs/{id}",
+            get(playthrough)
+                .put(update_playthrough)
+                .delete(remove_playthrough),
+        )
         .route("/api/me/library", get(library))
         .route(
             "/api/me/library/{igdb_id}",
@@ -87,13 +99,13 @@ struct Page<T> {
     has_more: bool,
 }
 
-fn page<T>(mut data: Vec<T>, query: &PageQuery) -> Json<Page<T>> {
-    let has_more = data.len() > query.limit as usize;
-    data.truncate(query.limit as usize);
+fn page<T>(mut data: Vec<T>, limit: u32, offset: u32) -> Json<Page<T>> {
+    let has_more = data.len() > limit as usize;
+    data.truncate(limit as usize);
     Json(Page {
         data,
-        limit: query.limit,
-        offset: query.offset,
+        limit,
+        offset,
         has_more,
     })
 }
@@ -137,7 +149,7 @@ async fn games(
     let rows = sqlx::query_as::<_, Game>("SELECT * FROM games WHERE ($1::text IS NULL OR lower(name) LIKE lower($1)) ORDER BY lower(name),id LIMIT $2 OFFSET $3")
         .bind(params.name_pattern()).bind(i64::from(params.limit) + 1).bind(i64::from(params.offset))
         .fetch_all(&state.pool).await?;
-    Ok(page(rows, &params))
+    Ok(page(rows, params.limit, params.offset))
 }
 
 async fn game(
@@ -252,8 +264,8 @@ async fn library(
         "SELECT g.id,g.igdb_id,g.name,g.slug,g.summary,g.cover_url,g.first_release_date,
             g.platforms,g.genres,g.developers,g.game_type,g.parent_igdb_id,g.version_parent_igdb_id,
             g.source_url,g.imported_at,g.refreshed_at,
-            e.status,e.rating,e.review,e.created_at,e.updated_at
-        FROM library_entries e JOIN games g ON g.id=e.game_id WHERE e.user_id=$1
+            e.status,e.rating,e.rating_playthrough_id,e.created_at,e.updated_at
+        FROM library_entry_details e JOIN games g ON g.id=e.game_id WHERE e.user_id=$1
         AND ($2::text IS NULL OR e.status=$2) AND ($3::text IS NULL OR lower(g.name) LIKE lower($3))
         ORDER BY e.updated_at DESC,e.game_id LIMIT $4 OFFSET $5",
     )
@@ -264,7 +276,7 @@ async fn library(
     .bind(i64::from(params.offset))
     .fetch_all(&state.pool)
     .await?;
-    Ok(page(data, &params))
+    Ok(page(data, params.limit, params.offset))
 }
 
 async fn entry(
@@ -273,8 +285,8 @@ async fn entry(
     igdb_id: Result<Path<i64>, PathRejection>,
 ) -> ApiResult<Json<LibraryEntry>> {
     let row = sqlx::query_as(
-        "SELECT g.igdb_id,e.status,e.rating,e.review,e.created_at,e.updated_at
-        FROM library_entries e JOIN games g ON g.id=e.game_id WHERE e.user_id=$1 AND g.igdb_id=$2",
+        "SELECT g.igdb_id,e.status,e.rating,e.rating_playthrough_id,e.created_at,e.updated_at
+        FROM library_entry_details e JOIN games g ON g.id=e.game_id WHERE e.user_id=$1 AND g.igdb_id=$2",
     )
     .bind(user.0.id.0.as_bytes().as_slice())
     .bind(igdb_path(igdb_id)?)
@@ -288,31 +300,6 @@ async fn entry(
 #[serde(deny_unknown_fields)]
 pub struct EntryInput {
     pub status: PlayStatus,
-    pub rating: Option<i16>,
-    pub review: Option<String>,
-}
-
-impl EntryInput {
-    pub fn validate(&self) -> ApiResult<()> {
-        if self
-            .rating
-            .is_some_and(|rating| !(1..=10).contains(&rating))
-        {
-            return Err(ApiError::invalid(
-                "rating must be an integer from 1 to 10, or null",
-            ));
-        }
-        if self
-            .review
-            .as_ref()
-            .is_some_and(|review| review.chars().count() > 10_000 || review.contains('\0'))
-        {
-            return Err(ApiError::invalid(
-                "review is limited to 10000 characters and may not contain NUL",
-            ));
-        }
-        Ok(())
-    }
 }
 
 async fn save_entry(
@@ -323,17 +310,29 @@ async fn save_entry(
 ) -> ApiResult<Json<LibraryEntry>> {
     let igdb_id = igdb_path(igdb_id)?;
     let input = body(payload)?;
-    input.validate()?;
     // Adding a game is the point at which it earns a local row, so this is the
-    // only library route that may import. An unknown game is fetched upstream;
-    // one already stored is reused without a network call.
+    // only library route that may import. Existing metadata follows the shared
+    // refresh policy, with stale fallback when the provider is unavailable.
     let game = ensure_game(&state.pool, &state.igdb, igdb_id).await?;
-    let row = sqlx::query_as("INSERT INTO library_entries (user_id,game_id,status,rating,review) VALUES ($1,$2,$3,$4,$5)
-        ON CONFLICT (user_id,game_id) DO UPDATE SET status=EXCLUDED.status,rating=EXCLUDED.rating,review=EXCLUDED.review,updated_at=now()
-        RETURNING $6::bigint AS igdb_id,status,rating,review,created_at,updated_at")
-        .bind(user.0.id.0.as_bytes().as_slice()).bind(game.id).bind(input.status).bind(input.rating).bind(input.review)
-        .bind(igdb_id)
-        .fetch_one(&state.pool).await?;
+    let mut transaction = state.pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO library_entries (user_id,game_id,status) VALUES ($1,$2,$3)
+        ON CONFLICT (user_id,game_id) DO UPDATE SET status=EXCLUDED.status,updated_at=now()",
+    )
+    .bind(user.0.id.0.as_bytes().as_slice())
+    .bind(game.id)
+    .bind(input.status)
+    .execute(&mut *transaction)
+    .await?;
+    let row = sqlx::query_as(
+        "SELECT igdb_id,status,rating,rating_playthrough_id,created_at,updated_at
+        FROM library_entry_details WHERE user_id=$1 AND game_id=$2",
+    )
+    .bind(user.0.id.0.as_bytes().as_slice())
+    .bind(game.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
     Ok(Json(row))
 }
 
@@ -352,5 +351,173 @@ async fn remove_entry(
     .bind(igdb_path(igdb_id)?)
     .execute(&state.pool)
     .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlaythroughInput {
+    pub rating: Option<i16>,
+    pub review: Option<String>,
+    pub started_on: Option<NaiveDate>,
+    pub finished_on: Option<NaiveDate>,
+    pub platform: Option<String>,
+}
+
+impl PlaythroughInput {
+    pub fn validate(&self) -> ApiResult<()> {
+        if self
+            .rating
+            .is_some_and(|rating| !(1..=10).contains(&rating))
+        {
+            return Err(ApiError::invalid(
+                "rating must be an integer from 1 to 10, or null",
+            ));
+        }
+        if self
+            .review
+            .as_ref()
+            .is_some_and(|review| review.chars().count() > 10_000 || review.contains('\0'))
+        {
+            return Err(ApiError::invalid(
+                "review is limited to 10000 characters and may not contain NUL",
+            ));
+        }
+        if let (Some(start), Some(finish)) = (self.started_on, self.finished_on)
+            && finish < start
+        {
+            return Err(ApiError::invalid(
+                "finished_on must be on or after started_on",
+            ));
+        }
+        if self.platform.as_ref().is_some_and(|platform| {
+            platform.trim().is_empty()
+                || platform.chars().count() > 100
+                || platform.chars().any(char::is_control)
+        }) {
+            return Err(ApiError::invalid(
+                "platform must contain 1–100 characters without control characters",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CreatePlaythroughInput {
+    igdb_id: i64,
+    #[serde(flatten)]
+    entry: PlaythroughInput,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlaythroughQuery {
+    #[serde(default = "default_limit")]
+    limit: u32,
+    #[serde(default)]
+    offset: u32,
+    igdb_id: Option<i64>,
+}
+
+async fn playthroughs(
+    user: AuthUser,
+    State(state): State<AppState>,
+    params: Result<Query<PlaythroughQuery>, QueryRejection>,
+) -> ApiResult<Json<Page<Playthrough>>> {
+    let Query(params) = params.map_err(|_| ApiError::invalid("Invalid query parameters"))?;
+    if !(1..=50).contains(&params.limit) || params.offset > 10_000 {
+        return Err(ApiError::invalid(
+            "limit must be 1–50 and offset at most 10000",
+        ));
+    }
+    if params.igdb_id.is_some_and(|id| id <= 0) {
+        return Err(ApiError::invalid("IGDB ID must be positive"));
+    }
+    let rows = sqlx::query_as(
+        "SELECT p.*,g.igdb_id FROM playthroughs p JOIN games g ON g.id=p.game_id
+         WHERE p.user_id=$1 AND ($2::bigint IS NULL OR g.igdb_id=$2)
+         ORDER BY COALESCE(p.finished_on,p.started_on,(p.created_at AT TIME ZONE 'UTC')::date) DESC,
+                  p.created_at DESC,p.id DESC LIMIT $3 OFFSET $4",
+    )
+    .bind(user.0.id.0.as_bytes().as_slice())
+    .bind(params.igdb_id)
+    .bind(i64::from(params.limit) + 1)
+    .bind(i64::from(params.offset))
+    .fetch_all(&state.pool)
+    .await?;
+    Ok(page(rows, params.limit, params.offset))
+}
+
+async fn playthrough(
+    user: AuthUser,
+    State(state): State<AppState>,
+    id: Result<Path<Uuid>, PathRejection>,
+) -> ApiResult<Json<Playthrough>> {
+    let row = sqlx::query_as(
+        "SELECT p.*,g.igdb_id FROM playthroughs p JOIN games g ON g.id=p.game_id
+         WHERE p.user_id=$1 AND p.id=$2",
+    )
+    .bind(user.0.id.0.as_bytes().as_slice())
+    .bind(path(id)?)
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+    Ok(Json(row))
+}
+
+async fn create_playthrough(
+    user: AuthUser,
+    State(state): State<AppState>,
+    payload: Result<Json<CreatePlaythroughInput>, JsonRejection>,
+) -> ApiResult<(StatusCode, Json<Playthrough>)> {
+    let input = body(payload)?;
+    if input.igdb_id <= 0 {
+        return Err(ApiError::invalid("IGDB ID must be positive"));
+    }
+    input.entry.validate()?;
+    let game = ensure_game(&state.pool, &state.igdb, input.igdb_id).await?;
+    let row = sqlx::query_as(
+        "INSERT INTO playthroughs (id,user_id,game_id,rating,review,started_on,finished_on,platform)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *, $9::bigint AS igdb_id",
+    )
+    .bind(Uuid::new_v4()).bind(user.0.id.0.as_bytes().as_slice()).bind(game.id)
+    .bind(input.entry.rating).bind(input.entry.review).bind(input.entry.started_on)
+    .bind(input.entry.finished_on).bind(input.entry.platform.as_deref().map(str::trim))
+    .bind(input.igdb_id).fetch_one(&state.pool).await?;
+    Ok((StatusCode::CREATED, Json(row)))
+}
+
+async fn update_playthrough(
+    user: AuthUser,
+    State(state): State<AppState>,
+    id: Result<Path<Uuid>, PathRejection>,
+    payload: Result<Json<PlaythroughInput>, JsonRejection>,
+) -> ApiResult<Json<Playthrough>> {
+    let id = path(id)?;
+    let input = body(payload)?;
+    input.validate()?;
+    let row = sqlx::query_as(
+        "UPDATE playthroughs p SET rating=$3,review=$4,started_on=$5,finished_on=$6,platform=$7,updated_at=now()
+         FROM games g WHERE p.user_id=$1 AND p.id=$2 AND g.id=p.game_id
+         RETURNING p.*,g.igdb_id",
+    )
+    .bind(user.0.id.0.as_bytes().as_slice()).bind(id).bind(input.rating).bind(input.review)
+    .bind(input.started_on).bind(input.finished_on).bind(input.platform.as_deref().map(str::trim))
+    .fetch_optional(&state.pool).await?.ok_or_else(ApiError::not_found)?;
+    Ok(Json(row))
+}
+
+async fn remove_playthrough(
+    user: AuthUser,
+    State(state): State<AppState>,
+    id: Result<Path<Uuid>, PathRejection>,
+) -> ApiResult<StatusCode> {
+    sqlx::query("DELETE FROM playthroughs WHERE user_id=$1 AND id=$2")
+        .bind(user.0.id.0.as_bytes().as_slice())
+        .bind(path(id)?)
+        .execute(&state.pool)
+        .await?;
     Ok(StatusCode::NO_CONTENT)
 }
