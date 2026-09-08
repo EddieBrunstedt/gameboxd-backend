@@ -18,8 +18,9 @@ const MAX_IN_FLIGHT: usize = 8;
 const MAX_ADMITTED: usize = 32;
 /// Keeps the request rate below IGDB's four per second.
 const MIN_REQUEST_INTERVAL: Duration = Duration::from_millis(275);
-/// Longer throttle waits are reported as rate limiting instead of held open.
-const MAX_THROTTLE_WAIT: Duration = Duration::from_secs(1);
+/// Longer upstream cooldowns are reported as rate limiting instead of held open.
+/// Ordinary request-spacing waits are bounded by admission capacity instead.
+const MAX_COOLDOWN_WAIT: Duration = Duration::from_secs(1);
 
 const FIELDS: &str = "name,slug,summary,cover.image_id,first_release_date,platforms.name,genres.name,involved_companies.developer,involved_companies.company.name,game_type,parent_game,version_parent,url";
 
@@ -51,11 +52,16 @@ struct ClientState {
     /// single-flight, so racing callers await one fetch instead of each
     /// starting their own.
     token: Mutex<Option<(String, Instant)>>,
-    /// Earliest instant at which the next upstream request may be sent. Locked
-    /// only long enough to reserve a slot, never across I/O.
-    next_request: Mutex<Instant>,
+    /// Request spacing and upstream cooldown share a lock so reservations see
+    /// a consistent schedule. Never held across I/O.
+    throttle: Mutex<Throttle>,
     in_flight: Semaphore,
     admitted: Semaphore,
+}
+
+struct Throttle {
+    next_request: Instant,
+    cooldown_until: Instant,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -209,7 +215,10 @@ impl IgdbClient {
             endpoints,
             state: Arc::new(ClientState {
                 token: Mutex::new(None),
-                next_request: Mutex::new(Instant::now()),
+                throttle: Mutex::new(Throttle {
+                    next_request: Instant::now(),
+                    cooldown_until: Instant::now(),
+                }),
                 in_flight: Semaphore::new(MAX_IN_FLIGHT),
                 admitted: Semaphore::new(MAX_ADMITTED),
             }),
@@ -368,28 +377,27 @@ impl IgdbClient {
     }
 
     /// Claims the next throttle slot and waits for it, holding the lock only
-    /// while reserving. A slot further out than [`MAX_THROTTLE_WAIT`] is not
-    /// claimed at all, so refused callers do not push the queue back further.
+    /// while reserving. Admitted callers may wait for normal request spacing;
+    /// only an upstream cooldown beyond [`MAX_COOLDOWN_WAIT`] rejects them.
     async fn reserve_slot(&self) -> ApiResult<()> {
         let wait = {
-            let mut next_request = self.state.next_request.lock().await;
+            let mut throttle = self.state.throttle.lock().await;
             let now = Instant::now();
-            let slot = (*next_request).max(now);
-            let wait = slot.duration_since(now);
-            if wait > MAX_THROTTLE_WAIT {
+            if throttle.cooldown_until.saturating_duration_since(now) > MAX_COOLDOWN_WAIT {
                 return Err(rate_limited());
             }
-            *next_request = slot + MIN_REQUEST_INTERVAL;
-            wait
+            let slot = throttle.next_request.max(throttle.cooldown_until).max(now);
+            throttle.next_request = slot + MIN_REQUEST_INTERVAL;
+            slot.duration_since(now)
         };
         tokio::time::sleep(wait).await;
         Ok(())
     }
 
-    /// Pushes the next allowed request out by `wait` after upstream says so.
+    /// Records upstream cooldown separately from the ordinary dispatch queue.
     async fn back_off(&self, wait: Duration) {
-        let mut next_request = self.state.next_request.lock().await;
-        *next_request = (*next_request).max(Instant::now() + wait);
+        let mut throttle = self.state.throttle.lock().await;
+        throttle.cooldown_until = throttle.cooldown_until.max(Instant::now() + wait);
     }
 }
 

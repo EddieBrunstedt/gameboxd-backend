@@ -3,9 +3,13 @@ use gameboxd_backend::{
     config::Config,
     igdb::{Endpoints, IgdbClient, validate_search},
 };
-use std::time::Duration;
+use std::{sync::Arc, time::Duration};
 
 use serde_json::json;
+use tokio::{
+    sync::{Semaphore, mpsc},
+    time::{Instant, timeout},
+};
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{body_string_contains, header, method, path},
@@ -69,7 +73,7 @@ async fn search_escapes_query_and_reuses_token() {
 #[tokio::test]
 async fn concurrent_queries_queue_instead_of_failing() {
     let server = MockServer::start().await;
-    // A single token fetch serves all four callers: refreshes are single-flight.
+    // A single token fetch serves all eight callers: refreshes are single-flight.
     token(&server, 1).await;
     Mock::given(path("/games"))
         .respond_with(
@@ -77,18 +81,113 @@ async fn concurrent_queries_queue_instead_of_failing() {
                 .set_delay(Duration::from_millis(200))
                 .set_body_json(json!([{"id":1,"name":"Halo"}])),
         )
-        .expect(4)
+        .expect(8)
         .mount(&server)
         .await;
     let client = client(&server).await;
     // Overlapping callers wait for a slot; none of them is turned away busy.
-    let results = tokio::join!(client.get(1), client.get(1), client.get(1), client.get(1));
-    for result in [results.0, results.1, results.2, results.3] {
+    let mut callers = tokio::task::JoinSet::new();
+    for _ in 0..8 {
+        let client = client.clone();
+        callers.spawn(async move { client.get(1).await });
+    }
+    while let Some(result) = callers.join_next().await {
         assert_eq!(
-            result.unwrap_or_else(|error| panic!("{}", error.code)).id,
+            result
+                .unwrap()
+                .unwrap_or_else(|error| panic!("{}", error.code))
+                .id,
             1
         );
     }
+}
+
+#[tokio::test]
+async fn catalog_queue_bounds_admission_concurrency_and_dispatch_rate() {
+    let token_server = MockServer::start().await;
+    token(&token_server, 1).await;
+    // Hold every games response until the test releases it. This makes queue
+    // saturation and the in-flight cap observable without relying on latency.
+    let responses = Arc::new(Semaphore::new(0));
+    let (dispatches, mut received) = mpsc::unbounded_channel();
+    let app = axum::Router::new().route(
+        "/games",
+        axum::routing::post({
+            let responses = responses.clone();
+            move || {
+                let responses = responses.clone();
+                let dispatches = dispatches.clone();
+                async move {
+                    dispatches.send(Instant::now()).unwrap();
+                    responses.acquire().await.unwrap().forget();
+                    axum::Json(json!([{"id":1,"name":"Halo"}]))
+                }
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let client = IgdbClient::new(
+        Some(("client-id".into(), "client-secret".into())),
+        Endpoints {
+            games: format!("http://{address}/games"),
+            token: format!("{}/token", token_server.uri()),
+        },
+    )
+    .unwrap();
+    let mut callers = tokio::task::JoinSet::new();
+    for _ in 0..33 {
+        let client = client.clone();
+        callers.spawn(async move { client.get(1).await });
+    }
+    let error = timeout(Duration::from_secs(5), callers.join_next())
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(error.status, 429);
+    assert_eq!(error.code, "catalog_busy");
+
+    let mut times = Vec::new();
+    for _ in 0..8 {
+        times.push(
+            timeout(Duration::from_secs(5), received.recv())
+                .await
+                .unwrap()
+                .unwrap(),
+        );
+    }
+    // More than one spacing interval passes with all eight responses held:
+    // the ninth request must still be waiting for an in-flight permit.
+    assert!(
+        timeout(Duration::from_millis(550), received.recv())
+            .await
+            .is_err()
+    );
+    responses.add_permits(32);
+    timeout(Duration::from_secs(15), async {
+        while let Some(result) = callers.join_next().await {
+            assert_eq!(
+                result
+                    .unwrap()
+                    .unwrap_or_else(|error| panic!("{}", error.code))
+                    .id,
+                1
+            );
+        }
+        for _ in 8..32 {
+            times.push(received.recv().await.unwrap());
+        }
+    })
+    .await
+    .unwrap();
+    for pair in times.windows(2) {
+        // Allow a little transport/timer jitter around the 275 ms schedule.
+        assert!(pair[1].duration_since(pair[0]) >= Duration::from_millis(250));
+    }
+    server.abort();
 }
 
 #[tokio::test]
@@ -116,7 +215,9 @@ async fn provider_rate_limit_stops_subsequent_upstream_requests() {
         .await;
     let client = client(&server).await;
     for _ in 0..2 {
-        assert_eq!(client.get(1).await.unwrap_err().code, "igdb_rate_limited");
+        let error = client.get(1).await.unwrap_err();
+        assert_eq!(error.status, 503);
+        assert_eq!(error.code, "igdb_rate_limited");
     }
 }
 
