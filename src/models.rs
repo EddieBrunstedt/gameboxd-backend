@@ -138,7 +138,7 @@ pub async fn upsert_game(pool: &PgPool, game: ProviderGame) -> ApiResult<Game> {
     Ok(row)
 }
 
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, sqlx::Type, TS)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, sqlx::Type, TS)]
 #[ts(export)]
 #[serde(rename_all = "snake_case")]
 #[sqlx(type_name = "text", rename_all = "snake_case")]
@@ -153,6 +153,7 @@ pub enum PlayStatus {
 #[derive(Serialize, FromRow, TS)]
 #[ts(export)]
 pub struct LibraryEntry {
+    pub current_playthrough_id: Option<Uuid>,
     pub igdb_id: i64,
     pub status: PlayStatus,
     pub rating: Option<i16>,
@@ -161,17 +162,43 @@ pub struct LibraryEntry {
     pub updated_at: DateTime<Utc>,
 }
 
+/// Explicit experience state; null on a playthrough means the outcome is unknown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, sqlx::Type, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+pub enum PlaythroughState {
+    Active,
+    Paused,
+    Completed,
+    Abandoned,
+}
+
+impl PlaythroughState {
+    pub fn library_status(self) -> PlayStatus {
+        match self {
+            Self::Active => PlayStatus::Playing,
+            Self::Paused => PlayStatus::OnHold,
+            Self::Completed => PlayStatus::Completed,
+            Self::Abandoned => PlayStatus::Dropped,
+        }
+    }
+}
+
 #[derive(Serialize, FromRow, TS)]
 #[ts(export)]
 pub struct Playthrough {
+    pub state: Option<PlaythroughState>,
+    pub is_current: bool,
     pub id: Uuid,
     pub igdb_id: i64,
-    /// Revision counter, incremented by the database on every real change.
-    /// Published so a client holding a listed playthrough can edit it without
-    /// re-reading the single-resource route for its `ETag`.
+    // Revision counter, incremented by the database on every real change.
+    // Published so a client holding a listed playthrough can edit it without
+    // re-reading the single-resource route for its `ETag`.
     pub version: i32,
     pub rating: Option<i16>,
     pub review: Option<String>,
+    pub presentation_on: Option<NaiveDate>,
     pub started_on: Option<NaiveDate>,
     pub finished_on: Option<NaiveDate>,
     pub platform: Option<String>,

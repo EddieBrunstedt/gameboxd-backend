@@ -157,3 +157,20 @@ try {
 Playthrough edits take the record, not an id, because every edit must declare
 the revision it was based on and `version` travels in the body — including
 inside listings, so an editor opened from a list needs no extra read.
+
+`presentation_on` is a nullable calendar-date string for the chosen historical
+day, independent of play dates and recording timestamps. Create/PUT omission
+means unknown; PATCH omission preserves it and null clears it. Preserve the
+string as a day, without time-zone conversion. Diary and rating selection use
+this day descending, unknown dates last, then UUID descending. See the
+[chronology and future public contract](../docs/api.md#historical-chronology-policy).
+These generated playthrough types and revision tags are for owner routes only.
+
+`startPlaythrough` creates a current run/replay and sets library status in one
+transaction. `transitionPlaythrough(current, input)` carries the revision for
+pause/resume/complete/abandon. `state` is nullable (unknown); `is_current` is
+read-only. `createPlaythrough` and historical PUT/PATCH never change present
+status. Library entries identify the current run with `current_playthrough_id`.
+Conflicting status-only writes or invalid lifecycle actions return
+`409 lifecycle_conflict`. Library removal detaches the current run without
+removing history. See [lifecycle semantics](../docs/api.md#current-playthrough-lifecycle).

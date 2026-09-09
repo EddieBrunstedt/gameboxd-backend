@@ -21,7 +21,8 @@ use crate::{
     error::{ApiError, ApiResult, ErrorCode, FieldError, FieldErrorCode},
     igdb::{CatalogGame, validate_search},
     models::{
-        Game, LibraryEntry, PlayStatus, Playthrough, Profile, attach_game, ensure_game, find_game,
+        Game, LibraryEntry, PlayStatus, Playthrough, PlaythroughState, Profile, attach_game,
+        ensure_game, find_game,
     },
 };
 
@@ -43,6 +44,11 @@ pub fn routes() -> Router<AppState> {
                 .put(replace_playthrough)
                 .patch(update_playthrough)
                 .delete(remove_playthrough),
+        )
+        .route("/api/me/playthroughs/start", post(start_playthrough))
+        .route(
+            "/api/me/playthroughs/{id}/lifecycle",
+            post(transition_playthrough),
         )
         .route("/api/me/library", get(library))
         .route(
@@ -458,7 +464,7 @@ async fn library(
         "SELECT g.id,g.igdb_id,g.name,g.slug,g.summary,g.cover_url,g.first_release_date,
             g.platforms,g.genres,g.developers,g.game_type,g.parent_igdb_id,g.version_parent_igdb_id,
             g.source_url,g.imported_at,g.refreshed_at,
-            e.status,e.rating,e.rating_playthrough_id,e.created_at,e.updated_at
+            e.status,e.rating,e.rating_playthrough_id,e.current_playthrough_id,e.created_at,e.updated_at
         FROM library_entry_details e JOIN games g ON g.id=e.game_id WHERE e.user_id=$1
         AND ($2::text IS NULL OR e.status=$2) AND ($3::text IS NULL OR lower(g.name) LIKE lower($3))
         ORDER BY e.updated_at DESC,e.game_id LIMIT $4 OFFSET $5",
@@ -479,7 +485,7 @@ async fn entry(
     igdb_id: Result<Path<i64>, PathRejection>,
 ) -> ApiResult<Json<LibraryEntry>> {
     let row = sqlx::query_as(
-        "SELECT g.igdb_id,e.status,e.rating,e.rating_playthrough_id,e.created_at,e.updated_at
+        "SELECT g.igdb_id,e.status,e.rating,e.rating_playthrough_id,e.current_playthrough_id,e.created_at,e.updated_at
         FROM library_entry_details e JOIN games g ON g.id=e.game_id WHERE e.user_id=$1 AND g.igdb_id=$2",
     )
     .bind(user.0.id.0.as_bytes().as_slice())
@@ -510,6 +516,20 @@ async fn save_entry(
     // it stands, so this save is independent of provider latency.
     let game = attach_game(&state.pool, &state.igdb, &state.refresher, igdb_id).await?;
     let mut transaction = state.pool.begin().await?;
+    let owner = user.0.id.0.as_bytes().as_slice();
+    lock_game(&mut transaction, owner, game.id).await?;
+    let current_state: Option<PlaythroughState> = sqlx::query_scalar(
+        "SELECT state FROM playthroughs WHERE user_id=$1 AND game_id=$2 AND is_current",
+    )
+    .bind(owner)
+    .bind(game.id)
+    .fetch_optional(&mut *transaction)
+    .await?;
+    if current_state.is_some_and(|current| current.library_status() != input.status) {
+        return Err(lifecycle_conflict(
+            "Use a lifecycle action while this game has a current run",
+        ));
+    }
     sqlx::query(
         "INSERT INTO library_entries (user_id,game_id,status) VALUES ($1,$2,$3)
         ON CONFLICT (user_id,game_id) DO UPDATE SET status=EXCLUDED.status,updated_at=now()",
@@ -520,7 +540,7 @@ async fn save_entry(
     .execute(&mut *transaction)
     .await?;
     let row = sqlx::query_as(
-        "SELECT igdb_id,status,rating,rating_playthrough_id,created_at,updated_at
+        "SELECT igdb_id,status,rating,rating_playthrough_id,current_playthrough_id,created_at,updated_at
         FROM library_entry_details WHERE user_id=$1 AND game_id=$2",
     )
     .bind(user.0.id.0.as_bytes().as_slice())
@@ -536,16 +556,29 @@ async fn remove_entry(
     State(state): State<AppState>,
     igdb_id: Result<Path<i64>, PathRejection>,
 ) -> ApiResult<StatusCode> {
-    // A game that was never imported has no entry to remove, so this stays a
-    // silent 204 without consulting upstream.
+    let igdb_id = igdb_path(igdb_id)?;
+    let owner = user.0.id.0.as_bytes().as_slice();
+    let mut transaction = state.pool.begin().await?;
+    // Serialize even when membership is absent. A concurrent start/import
+    // must not escape a delete merely because there was no row to lock yet.
+    lock_igdb_game(&mut transaction, owner, igdb_id).await?;
+    sqlx::query(
+        "UPDATE playthroughs SET is_current=false WHERE user_id=$1
+        AND game_id=(SELECT id FROM games WHERE igdb_id=$2) AND is_current",
+    )
+    .bind(owner)
+    .bind(igdb_id)
+    .execute(&mut *transaction)
+    .await?;
     sqlx::query(
         "DELETE FROM library_entries WHERE user_id=$1
-         AND game_id=(SELECT id FROM games WHERE igdb_id=$2)",
+        AND game_id=(SELECT id FROM games WHERE igdb_id=$2)",
     )
-    .bind(user.0.id.0.as_bytes().as_slice())
-    .bind(igdb_path(igdb_id)?)
-    .execute(&state.pool)
+    .bind(owner)
+    .bind(igdb_id)
+    .execute(&mut *transaction)
     .await?;
+    transaction.commit().await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -600,8 +633,10 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for Patch<T> {
 /// cannot drift apart in what they accept or how they normalize it.
 #[derive(Debug)]
 pub struct PlaythroughFields {
+    pub state: Option<PlaythroughState>,
     pub rating: Option<i16>,
     pub review: Option<String>,
+    pub presentation_on: Option<NaiveDate>,
     pub started_on: Option<NaiveDate>,
     pub finished_on: Option<NaiveDate>,
     pub platform: Option<String>,
@@ -618,6 +653,17 @@ impl PlaythroughFields {
     /// are pure and cheap.
     pub fn validated(mut self) -> ApiResult<Self> {
         let mut fields = Vec::new();
+        if matches!(
+            self.state,
+            Some(PlaythroughState::Active | PlaythroughState::Paused)
+        ) && self.finished_on.is_some()
+        {
+            fields.push(FieldError::new(
+                "finished_on",
+                FieldErrorCode::InvalidFormat,
+                "Active or paused playthroughs cannot have an end date",
+            ));
+        }
         if self
             .rating
             .is_some_and(|rating| !(1..=10).contains(&rating))
@@ -693,8 +739,10 @@ impl PlaythroughFields {
 impl From<&Playthrough> for PlaythroughFields {
     fn from(row: &Playthrough) -> Self {
         Self {
+            state: row.state,
             rating: row.rating,
             review: row.review.clone(),
+            presentation_on: row.presentation_on,
             started_on: row.started_on,
             finished_on: row.finished_on,
             platform: row.platform.clone(),
@@ -708,8 +756,10 @@ impl From<&Playthrough> for PlaythroughFields {
 #[ts(export)]
 #[serde(deny_unknown_fields)]
 pub struct PlaythroughInput {
+    pub state: Option<PlaythroughState>,
     pub rating: Option<i16>,
     pub review: Option<String>,
+    pub presentation_on: Option<NaiveDate>,
     pub started_on: Option<NaiveDate>,
     pub finished_on: Option<NaiveDate>,
     pub platform: Option<String>,
@@ -720,15 +770,19 @@ impl From<PlaythroughInput> for PlaythroughFields {
         // Destructured rather than field-by-field: a new editable field then
         // fails to compile here until it is actually carried across.
         let PlaythroughInput {
+            state,
             rating,
             review,
+            presentation_on,
             started_on,
             finished_on,
             platform,
         } = input;
         Self {
+            state,
             rating,
             review,
+            presentation_on,
             started_on,
             finished_on,
             platform,
@@ -751,8 +805,14 @@ pub struct PlaythroughPatch {
     #[ts(optional = nullable, as = "Option<i16>")]
     pub rating: Patch<i16>,
     #[serde(default)]
+    #[ts(optional = nullable, as = "Option<PlaythroughState>")]
+    pub state: Patch<PlaythroughState>,
+    #[serde(default)]
     #[ts(optional = nullable, as = "Option<String>")]
     pub review: Patch<String>,
+    #[serde(default)]
+    #[ts(optional = nullable, as = "Option<NaiveDate>")]
+    pub presentation_on: Patch<NaiveDate>,
     #[serde(default)]
     #[ts(optional = nullable, as = "Option<NaiveDate>")]
     pub started_on: Patch<NaiveDate>,
@@ -767,8 +827,10 @@ pub struct PlaythroughPatch {
 impl PlaythroughPatch {
     fn apply(self, current: PlaythroughFields) -> PlaythroughFields {
         PlaythroughFields {
+            state: self.state.apply(current.state),
             rating: self.rating.apply(current.rating),
             review: self.review.apply(current.review),
+            presentation_on: self.presentation_on.apply(current.presentation_on),
             started_on: self.started_on.apply(current.started_on),
             finished_on: self.finished_on.apply(current.finished_on),
             platform: self.platform.apply(current.platform),
@@ -790,8 +852,10 @@ impl PlaythroughPatch {
 #[serde(deny_unknown_fields)]
 pub struct CreatePlaythroughInput {
     pub igdb_id: i64,
+    pub state: Option<PlaythroughState>,
     pub rating: Option<i16>,
     pub review: Option<String>,
+    pub presentation_on: Option<NaiveDate>,
     pub started_on: Option<NaiveDate>,
     pub finished_on: Option<NaiveDate>,
     pub platform: Option<String>,
@@ -801,15 +865,19 @@ impl From<CreatePlaythroughInput> for PlaythroughFields {
     fn from(input: CreatePlaythroughInput) -> Self {
         let CreatePlaythroughInput {
             igdb_id: _,
+            state,
             rating,
             review,
+            presentation_on,
             started_on,
             finished_on,
             platform,
         } = input;
         Self {
+            state,
             rating,
             review,
+            presentation_on,
             started_on,
             finished_on,
             platform,
@@ -966,8 +1034,7 @@ async fn playthroughs(
     let rows = sqlx::query_as(
         "SELECT p.*,g.igdb_id FROM playthroughs p JOIN games g ON g.id=p.game_id
          WHERE p.user_id=$1 AND ($2::bigint IS NULL OR g.igdb_id=$2)
-         ORDER BY COALESCE(p.finished_on,p.started_on,(p.created_at AT TIME ZONE 'UTC')::date) DESC,
-                  p.created_at DESC,p.id DESC LIMIT $3 OFFSET $4",
+         ORDER BY p.presentation_on DESC NULLS LAST,p.id DESC LIMIT $3 OFFSET $4",
     )
     .bind(user.0.id.0.as_bytes().as_slice())
     .bind(params.igdb_id)
@@ -1008,12 +1075,12 @@ async fn create_playthrough(
     let fields = PlaythroughFields::from(input).validated()?;
     let game = attach_game(&state.pool, &state.igdb, &state.refresher, igdb_id).await?;
     let row = sqlx::query_as(
-        "INSERT INTO playthroughs (id,user_id,game_id,rating,review,started_on,finished_on,platform)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8) RETURNING *, $9::bigint AS igdb_id",
+        "INSERT INTO playthroughs (id,user_id,game_id,rating,review,started_on,finished_on,platform,presentation_on,state)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *, $11::bigint AS igdb_id",
     )
     .bind(Uuid::new_v4()).bind(user.0.id.0.as_bytes().as_slice()).bind(game.id)
     .bind(fields.rating).bind(fields.review).bind(fields.started_on)
-    .bind(fields.finished_on).bind(fields.platform)
+    .bind(fields.finished_on).bind(fields.platform).bind(fields.presentation_on).bind(fields.state)
     .bind(igdb_id).fetch_one(&state.pool).await?;
     Ok((StatusCode::CREATED, Tagged(row)))
 }
@@ -1066,6 +1133,7 @@ async fn edit_playthrough(
 ) -> ApiResult<Tagged> {
     let owner = user.0.id.0.as_bytes().as_slice();
     let mut transaction = state.pool.begin().await?;
+    lock_playthrough_game(&mut transaction, owner, id).await?;
     // Ownership is resolved before the precondition, so another user's
     // playthrough is a 404 and never reveals a revision through 412.
     let current: Playthrough = sqlx::query_as(
@@ -1081,8 +1149,13 @@ async fn edit_playthrough(
         return Err(stale());
     }
     let fields = merge(PlaythroughFields::from(&current)).validated()?;
+    if current.is_current && fields.state != current.state {
+        return Err(lifecycle_conflict(
+            "Use a lifecycle action to change the current run's state",
+        ));
+    }
     let row = sqlx::query_as(
-        "UPDATE playthroughs p SET rating=$3,review=$4,started_on=$5,finished_on=$6,platform=$7
+        "UPDATE playthroughs p SET rating=$3,review=$4,started_on=$5,finished_on=$6,platform=$7,presentation_on=$8,state=$9
          FROM games g WHERE p.user_id=$1 AND p.id=$2 AND g.id=p.game_id
          RETURNING p.*,g.igdb_id",
     )
@@ -1093,6 +1166,8 @@ async fn edit_playthrough(
     .bind(fields.started_on)
     .bind(fields.finished_on)
     .bind(fields.platform)
+    .bind(fields.presentation_on)
+    .bind(fields.state)
     .fetch_one(&mut *transaction)
     .await?;
     transaction.commit().await?;
@@ -1107,14 +1182,24 @@ async fn remove_playthrough(
 ) -> ApiResult<StatusCode> {
     let id = path(id)?;
     let owner = user.0.id.0.as_bytes().as_slice();
-    let Some(precondition) = if_match(&headers)? else {
+    let precondition = if_match(&headers)?;
+    let mut transaction = state.pool.begin().await?;
+    if !lock_playthrough_game(&mut transaction, owner, id).await? {
+        return if precondition.is_some() {
+            Err(stale())
+        } else {
+            Ok(StatusCode::NO_CONTENT)
+        };
+    }
+    let Some(precondition) = precondition else {
         // Unconditional deletion stays idempotent: asking for a playthrough to
         // be gone succeeds when it already is.
         sqlx::query("DELETE FROM playthroughs WHERE user_id=$1 AND id=$2")
             .bind(owner)
             .bind(id)
-            .execute(&state.pool)
+            .execute(&mut *transaction)
             .await?;
+        transaction.commit().await?;
         return Ok(StatusCode::NO_CONTENT);
     };
     // A conditional deletion asserts a specific revision instead, so a
@@ -1128,12 +1213,231 @@ async fn remove_playthrough(
     .bind(id)
     .bind(precondition.accepts_any())
     .bind(precondition.versions())
-    .execute(&state.pool)
+    .execute(&mut *transaction)
     .await?;
     if deleted.rows_affected() == 0 {
         return Err(stale());
     }
+    transaction.commit().await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+fn lifecycle_conflict(message: &str) -> ApiError {
+    ApiError::new(StatusCode::CONFLICT, ErrorCode::LifecycleConflict, message)
+}
+
+/// All writes that can affect the current run use the same transaction lock,
+/// before taking any playthrough row lock. It exists even without membership.
+/// Hash collisions only serialize unrelated games; they cannot weaken isolation.
+async fn lock_igdb_game(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    owner: &[u8],
+    igdb_id: i64,
+) -> ApiResult<()> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended(
+        'gameboxd:lifecycle:' || encode($1::bytea,'hex') || ':' || $2::bigint::text, 0))",
+    )
+    .bind(owner)
+    .bind(igdb_id)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
+}
+
+async fn lock_game(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    owner: &[u8],
+    game_id: Uuid,
+) -> ApiResult<()> {
+    let igdb_id = sqlx::query_scalar("SELECT igdb_id FROM games WHERE id=$1")
+        .bind(game_id)
+        .fetch_one(&mut **transaction)
+        .await?;
+    lock_igdb_game(transaction, owner, igdb_id).await
+}
+
+async fn lock_playthrough_game(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    owner: &[u8],
+    id: Uuid,
+) -> ApiResult<bool> {
+    let game_id = sqlx::query_scalar("SELECT game_id FROM playthroughs WHERE user_id=$1 AND id=$2")
+        .bind(owner)
+        .bind(id)
+        .fetch_optional(&mut **transaction)
+        .await?;
+    if let Some(game_id) = game_id {
+        lock_game(transaction, owner, game_id).await?;
+        return Ok(true);
+    }
+    Ok(false)
+}
+
+#[derive(Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct StartPlaythroughInput {
+    pub igdb_id: i64,
+    pub started_on: Option<NaiveDate>,
+    pub platform: Option<String>,
+}
+
+async fn start_playthrough(
+    user: AuthUser,
+    State(state): State<AppState>,
+    payload: Result<Body<StartPlaythroughInput>, ApiError>,
+) -> ApiResult<(StatusCode, Tagged)> {
+    let input = body(payload)?;
+    if input.igdb_id <= 0 {
+        return Err(ApiError::invalid("IGDB ID must be positive"));
+    }
+    let fields = PlaythroughFields {
+        state: Some(PlaythroughState::Active),
+        rating: None,
+        review: None,
+        presentation_on: None,
+        started_on: input.started_on,
+        finished_on: None,
+        platform: input.platform,
+    }
+    .validated()?;
+    let game = attach_game(&state.pool, &state.igdb, &state.refresher, input.igdb_id).await?;
+    let owner = user.0.id.0.as_bytes().as_slice();
+    let mut transaction = state.pool.begin().await?;
+    lock_game(&mut transaction, owner, game.id).await?;
+    let exists: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM playthroughs
+        WHERE user_id=$1 AND game_id=$2 AND is_current)",
+    )
+    .bind(owner)
+    .bind(game.id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    if exists {
+        return Err(lifecycle_conflict(
+            "This game already has a current run; finish or abandon it before starting a replay",
+        ));
+    }
+    let row = sqlx::query_as(
+        "INSERT INTO playthroughs
+        (id,user_id,game_id,state,is_current,started_on,platform)
+        VALUES ($1,$2,$3,'active',true,$4,$5) RETURNING *, $6::bigint AS igdb_id",
+    )
+    .bind(Uuid::new_v4())
+    .bind(owner)
+    .bind(game.id)
+    .bind(fields.started_on)
+    .bind(fields.platform)
+    .bind(input.igdb_id)
+    .fetch_one(&mut *transaction)
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_entries (user_id,game_id,status) VALUES ($1,$2,'playing')
+        ON CONFLICT (user_id,game_id) DO UPDATE SET status='playing',updated_at=now()",
+    )
+    .bind(owner)
+    .bind(game.id)
+    .execute(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok((StatusCode::CREATED, Tagged(row)))
+}
+
+#[derive(Deserialize, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+pub enum LifecycleAction {
+    Pause,
+    Resume,
+    Complete,
+    Abandon,
+}
+
+#[derive(Deserialize, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct LifecycleInput {
+    pub action: LifecycleAction,
+    // End date for complete/abandon. Never defaults to the recording day.
+    pub finished_on: Option<NaiveDate>,
+}
+
+async fn transition_playthrough(
+    user: AuthUser,
+    State(state): State<AppState>,
+    id: Result<Path<Uuid>, PathRejection>,
+    headers: HeaderMap,
+    payload: Result<Body<LifecycleInput>, ApiError>,
+) -> ApiResult<Tagged> {
+    let id = path(id)?;
+    let precondition = required_precondition(&headers)?;
+    let input = body(payload)?;
+    let owner = user.0.id.0.as_bytes().as_slice();
+    let mut transaction = state.pool.begin().await?;
+    lock_playthrough_game(&mut transaction, owner, id).await?;
+    let current: Playthrough = sqlx::query_as(
+        "SELECT p.*,g.igdb_id FROM playthroughs p
+        JOIN games g ON g.id=p.game_id WHERE p.user_id=$1 AND p.id=$2 FOR NO KEY UPDATE OF p",
+    )
+    .bind(owner)
+    .bind(id)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
+    if !precondition.is_met_by(current.version) {
+        return Err(stale());
+    }
+    if !current.is_current {
+        return Err(lifecycle_conflict(
+            "This is not the current run; correct historical state through PUT or PATCH",
+        ));
+    }
+    let next = match (current.state, input.action) {
+        (Some(PlaythroughState::Active), LifecycleAction::Pause) => PlaythroughState::Paused,
+        (Some(PlaythroughState::Paused), LifecycleAction::Resume) => PlaythroughState::Active,
+        (Some(PlaythroughState::Active | PlaythroughState::Paused), LifecycleAction::Complete) => {
+            PlaythroughState::Completed
+        }
+        (Some(PlaythroughState::Active | PlaythroughState::Paused), LifecycleAction::Abandon) => {
+            PlaythroughState::Abandoned
+        }
+        _ => {
+            return Err(lifecycle_conflict(
+                "The action is not valid for the current state",
+            ));
+        }
+    };
+    let mut fields = PlaythroughFields::from(&current);
+    fields.state = Some(next);
+    fields.finished_on = input.finished_on;
+    let fields = fields.validated()?;
+    let is_current = matches!(next, PlaythroughState::Active | PlaythroughState::Paused);
+    let row = sqlx::query_as(
+        "UPDATE playthroughs p SET state=$3,is_current=$4,finished_on=$5
+        FROM games g WHERE p.user_id=$1 AND p.id=$2 AND g.id=p.game_id RETURNING p.*,g.igdb_id",
+    )
+    .bind(owner)
+    .bind(id)
+    .bind(next)
+    .bind(is_current)
+    .bind(fields.finished_on)
+    .fetch_one(&mut *transaction)
+    .await?;
+    // A missing library row would indicate an invariant violation; do not
+    // commit half a transition in that case.
+    sqlx::query_scalar::<_, Uuid>(
+        "UPDATE library_entries SET status=$3,updated_at=now()
+        WHERE user_id=$1 AND game_id=(SELECT game_id FROM playthroughs WHERE id=$2)
+        RETURNING game_id",
+    )
+    .bind(owner)
+    .bind(id)
+    .bind(next.library_status())
+    .fetch_one(&mut *transaction)
+    .await?;
+    transaction.commit().await?;
+    Ok(Tagged(row))
 }
 
 #[cfg(test)]
@@ -1203,8 +1507,10 @@ mod tests {
     #[test]
     fn a_patch_keeps_clears_and_sets_each_field_independently() {
         let stored = || PlaythroughFields {
+            state: None,
             rating: Some(8),
             review: Some("Stored".into()),
+            presentation_on: None,
             started_on: NaiveDate::from_ymd_opt(2026, 1, 1),
             finished_on: NaiveDate::from_ymd_opt(2026, 2, 1),
             platform: Some("PC".into()),
@@ -1246,8 +1552,10 @@ mod tests {
     #[test]
     fn merged_fields_are_validated_and_normalized_together() {
         let stored = PlaythroughFields {
+            state: None,
             rating: None,
             review: None,
+            presentation_on: None,
             started_on: NaiveDate::from_ymd_opt(2026, 3, 1),
             finished_on: None,
             platform: None,
@@ -1357,8 +1665,10 @@ mod tests {
         // A form showing four controls should not have to discover its errors
         // one refused save at a time.
         let error = PlaythroughFields {
+            state: None,
             rating: Some(11),
             review: Some("x".repeat(10_001)),
+            presentation_on: None,
             started_on: NaiveDate::from_ymd_opt(2026, 2, 1),
             finished_on: NaiveDate::from_ymd_opt(2026, 1, 1),
             platform: Some("  ".to_owned()),
@@ -1402,8 +1712,10 @@ mod tests {
         // A single failure keeps its own message as the summary, so nothing
         // reads worse than it did before field errors existed.
         let single = PlaythroughFields {
+            state: None,
             rating: Some(0),
             review: None,
+            presentation_on: None,
             started_on: None,
             finished_on: None,
             platform: None,

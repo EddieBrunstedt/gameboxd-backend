@@ -284,6 +284,637 @@ fn tag(playthrough: &Value) -> String {
     )
 }
 
+const START_RUN: &str = "/api/me/playthroughs/start";
+
+fn run_path(run: &Value) -> String {
+    format!("/api/me/playthroughs/{}", run["id"].as_str().unwrap())
+}
+
+impl Fixture {
+    async fn lifecycle(&self, token: &str, run: &Value, body: Value, status: StatusCode) -> Value {
+        self.edit(
+            "POST",
+            &format!("{}/lifecycle", run_path(run)),
+            token,
+            &tag(run),
+            body,
+            status,
+        )
+        .await
+    }
+
+    async fn current_entry(&self, token: &str) -> Value {
+        self.value(
+            "GET",
+            "/api/me/library/42",
+            token,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn lifecycle_preserves_history_and_supports_replay_and_corrections() {
+    let f = Fixture::new().await;
+    let (_, token) = f.user("lifecycle").await;
+    let run = f
+        .value(
+            "POST",
+            START_RUN,
+            &token,
+            json!({"igdb_id":42,"started_on":"2025-01-01","platform":" PC "}),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_eq!(run["state"], "active");
+    assert_eq!(run["is_current"], true);
+    assert_eq!(run["platform"], "PC");
+    assert!(run["presentation_on"].is_null());
+    let entry = f.current_entry(&token).await;
+    assert_eq!(entry["status"], "playing");
+    assert_eq!(entry["current_playthrough_id"], run["id"]);
+    let paused = f
+        .lifecycle(&token, &run, json!({"action":"pause"}), StatusCode::OK)
+        .await;
+    assert_eq!(paused["state"], "paused");
+    assert_eq!(f.current_entry(&token).await["status"], "on_hold");
+    let active = f
+        .lifecycle(&token, &paused, json!({"action":"resume"}), StatusCode::OK)
+        .await;
+    assert_eq!(active["state"], "active");
+    // Open-ended games can be reviewed and rated without claiming completion.
+    let reviewed = f
+        .edit(
+            "PATCH",
+            &run_path(&active),
+            &token,
+            &tag(&active),
+            json!({"rating":8,"review":"Still playing","presentation_on":"2025-02-01"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(reviewed["state"], "active");
+    let ended = f
+        .lifecycle(
+            &token,
+            &reviewed,
+            json!({"action":"complete","finished_on":"2025-02-01"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(ended["state"], "completed");
+    assert_eq!(ended["is_current"], false);
+    assert_eq!(f.current_entry(&token).await["status"], "completed");
+    assert!(f.current_entry(&token).await["current_playthrough_id"].is_null());
+    let replay = f
+        .value(
+            "POST",
+            START_RUN,
+            &token,
+            json!({"igdb_id":42}),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_ne!(replay["id"], ended["id"]);
+    assert!(replay["started_on"].is_null());
+    let entry_before = f.current_entry(&token).await;
+    let corrected = f
+        .edit(
+            "PATCH",
+            &run_path(&ended),
+            &token,
+            &tag(&ended),
+            json!({"state":"abandoned","finished_on":"2025-03-01","started_on":null}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(corrected["state"], "abandoned");
+    assert_eq!(corrected["rating"], 8);
+    assert_eq!(corrected["review"], "Still playing");
+    assert_eq!(corrected["presentation_on"], ended["presentation_on"]);
+    f.value(
+        "POST",
+        "/api/me/playthroughs",
+        &token,
+        json!({"igdb_id":42,"state":"completed","finished_on":"2010-01-01"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    assert_eq!(f.current_entry(&token).await, entry_before);
+    // PUT can freely correct a historical outcome, including unknown/open states.
+    let corrected = f.edit("PUT", &run_path(&corrected), &token, &tag(&corrected),
+        json!({"state":"paused","rating":8,"review":"Still playing","presentation_on":"2025-02-01"}), StatusCode::OK).await;
+    assert_eq!(corrected["is_current"], false);
+    assert_eq!(f.current_entry(&token).await, entry_before);
+    let abandoned = f
+        .lifecycle(&token, &replay, json!({"action":"abandon"}), StatusCode::OK)
+        .await;
+    assert_eq!(abandoned["state"], "abandoned");
+    assert!(abandoned["finished_on"].is_null());
+    assert_eq!(f.current_entry(&token).await["status"], "dropped");
+    assert_eq!(f.current_entry(&token).await["rating"], 8);
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn lifecycle_enforces_ownership_preconditions_and_current_status() {
+    let f = Fixture::new().await;
+    let (_, token) = f.user("lifecycle-owner").await;
+    let (_, other) = f.user("lifecycle-other").await;
+    let run = f
+        .value(
+            "POST",
+            START_RUN,
+            &token,
+            json!({"igdb_id":42,"started_on":"2025-01-01"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let action_path = format!("{}/lifecycle", run_path(&run));
+    assert_eq!(
+        f.call("POST", START_RUN, None, json!({"igdb_id":42}))
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        f.call("POST", &action_path, None, json!({"action":"pause"}))
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    f.lifecycle(
+        &other,
+        &run,
+        json!({"action":"pause"}),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    f.edit(
+        "PATCH",
+        &run_path(&run),
+        &other,
+        &tag(&run),
+        json!({"state":"completed"}),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    f.value(
+        "POST",
+        &action_path,
+        &token,
+        json!({"action":"pause"}),
+        StatusCode::PRECONDITION_REQUIRED,
+    )
+    .await;
+    f.lifecycle(
+        &token,
+        &run,
+        json!({"action":"resume"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    f.lifecycle(
+        &token,
+        &run,
+        json!({"action":"complete","finished_on":"2024-01-01"}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    f.lifecycle(
+        &token,
+        &run,
+        json!({"action":"pause","finished_on":"2025-01-02"}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    f.value(
+        "POST",
+        START_RUN,
+        &token,
+        json!({"igdb_id":42}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    f.value(
+        "PUT",
+        "/api/me/library/42",
+        &token,
+        json!({"status":"completed"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    f.edit(
+        "PATCH",
+        &run_path(&run),
+        &token,
+        &tag(&run),
+        json!({"state":null}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    f.edit(
+        "PATCH",
+        &run_path(&run),
+        &token,
+        &tag(&run),
+        json!({"finished_on":"2025-01-02"}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    // Every refusal leaves the row and its revision unchanged.
+    assert_eq!(
+        f.value("GET", &run_path(&run), &token, Value::Null, StatusCode::OK)
+            .await,
+        run
+    );
+    let corrected = f
+        .edit(
+            "PATCH",
+            &run_path(&run),
+            &token,
+            &tag(&run),
+            json!({"started_on":"2020-01-01"}),
+            StatusCode::OK,
+        )
+        .await;
+    f.lifecycle(
+        &token,
+        &run,
+        json!({"action":"pause"}),
+        StatusCode::PRECONDITION_FAILED,
+    )
+    .await;
+    let paused = f
+        .lifecycle(
+            &token,
+            &corrected,
+            json!({"action":"pause"}),
+            StatusCode::OK,
+        )
+        .await;
+    f.value(
+        "POST",
+        START_RUN,
+        &token,
+        json!({"igdb_id":42}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    let ended = f
+        .lifecycle(
+            &token,
+            &paused,
+            json!({"action":"complete"}),
+            StatusCode::OK,
+        )
+        .await;
+    f.lifecycle(
+        &token,
+        &ended,
+        json!({"action":"resume"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    // Independent users and different games have independent current runs.
+    f.value(
+        "POST",
+        START_RUN,
+        &other,
+        json!({"igdb_id":42}),
+        StatusCode::CREATED,
+    )
+    .await;
+    sqlx::query("INSERT INTO games(id,igdb_id,name,slug,source_url) VALUES ($1,43,'Other','other','https://example.test')")
+        .bind(Uuid::new_v4()).execute(&f.database.app).await.unwrap();
+    f.value(
+        "POST",
+        START_RUN,
+        &other,
+        json!({"igdb_id":43}),
+        StatusCode::CREATED,
+    )
+    .await;
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn library_removal_detaches_current_run_and_preserves_history() {
+    let f = Fixture::new().await;
+    let (_, token) = f.user("lifecycle-remove").await;
+    f.value(
+        "PUT",
+        "/api/me/library/42",
+        &token,
+        json!({"status":"playing"}),
+        StatusCode::OK,
+    )
+    .await;
+    let history = f
+        .value(
+            "GET",
+            "/api/me/playthroughs",
+            &token,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        history["data"],
+        json!([]),
+        "lightweight status creates no history"
+    );
+    let run = f
+        .value(
+            "POST",
+            START_RUN,
+            &token,
+            json!({"igdb_id":42}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let run = f
+        .edit(
+            "PATCH",
+            &run_path(&run),
+            &token,
+            &tag(&run),
+            json!({"review":"Keep this","rating":9}),
+            StatusCode::OK,
+        )
+        .await;
+    f.value(
+        "DELETE",
+        "/api/me/library/42",
+        &token,
+        Value::Null,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    f.value(
+        "GET",
+        "/api/me/library/42",
+        &token,
+        Value::Null,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    let detached = f
+        .value("GET", &run_path(&run), &token, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(detached["state"], "active");
+    assert_eq!(detached["review"], "Keep this");
+    assert_eq!(detached["rating"], 9);
+    assert_eq!(detached["is_current"], false);
+    assert_ne!(tag(&detached), tag(&run));
+    f.lifecycle(
+        &token,
+        &run,
+        json!({"action":"pause"}),
+        StatusCode::PRECONDITION_FAILED,
+    )
+    .await;
+    f.lifecycle(
+        &token,
+        &detached,
+        json!({"action":"pause"}),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    let next = f
+        .value(
+            "POST",
+            START_RUN,
+            &token,
+            json!({"igdb_id":42}),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_eq!(f.current_entry(&token).await["rating"], 9);
+    f.edit(
+        "DELETE",
+        &run_path(&next),
+        &token,
+        &tag(&next),
+        Value::Null,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let entry = f.current_entry(&token).await;
+    assert_eq!(
+        entry["status"], "playing",
+        "deleting a run leaves lightweight status"
+    );
+    assert!(entry["current_playthrough_id"].is_null());
+    f.value(
+        "PUT",
+        "/api/me/library/42",
+        &token,
+        json!({"status":"backlog"}),
+        StatusCode::OK,
+    )
+    .await;
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn coordinated_lifecycle_writes_roll_back_on_database_failure() {
+    let f = Fixture::new().await;
+    let (_, token) = f.user("lifecycle-rollback").await;
+    f.value(
+        "PUT",
+        "/api/me/library/42",
+        &token,
+        json!({"status":"backlog"}),
+        StatusCode::OK,
+    )
+    .await;
+    let before = f.current_entry(&token).await;
+    // Fail the second half, after the playthrough INSERT/UPDATE has succeeded.
+    sqlx::raw_sql(
+        "CREATE FUNCTION reject_test_library_write() RETURNS trigger LANGUAGE plpgsql AS $$
+        BEGIN RAISE EXCEPTION 'injected library failure'; END; $$;
+        CREATE TRIGGER reject_test_library_write BEFORE INSERT OR UPDATE ON library_entries
+        FOR EACH ROW EXECUTE FUNCTION reject_test_library_write();",
+    )
+    .execute(&f.database.app)
+    .await
+    .unwrap();
+    f.value(
+        "POST",
+        START_RUN,
+        &token,
+        json!({"igdb_id":42}),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await;
+    assert_eq!(f.current_entry(&token).await, before);
+    assert_eq!(
+        f.value(
+            "GET",
+            "/api/me/playthroughs",
+            &token,
+            Value::Null,
+            StatusCode::OK
+        )
+        .await["data"],
+        json!([])
+    );
+    sqlx::query("ALTER TABLE library_entries DISABLE TRIGGER reject_test_library_write")
+        .execute(&f.database.app)
+        .await
+        .unwrap();
+    let run = f
+        .value(
+            "POST",
+            START_RUN,
+            &token,
+            json!({"igdb_id":42}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let before = f.current_entry(&token).await;
+    sqlx::query("ALTER TABLE library_entries ENABLE TRIGGER reject_test_library_write")
+        .execute(&f.database.app)
+        .await
+        .unwrap();
+    f.lifecycle(
+        &token,
+        &run,
+        json!({"action":"complete"}),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await;
+    assert_eq!(
+        f.value("GET", &run_path(&run), &token, Value::Null, StatusCode::OK)
+            .await,
+        run
+    );
+    assert_eq!(f.current_entry(&token).await, before);
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn conflicting_lifecycle_requests_cannot_split_current_state() {
+    let f = Fixture::new().await;
+    let (_, token) = f.user("lifecycle-races").await;
+    f.value(
+        "POST",
+        "/api/catalog/import/42",
+        &token,
+        Value::Null,
+        StatusCode::OK,
+    )
+    .await;
+    let (a, b) = tokio::join!(
+        f.call("POST", START_RUN, Some(&token), json!({"igdb_id":42})),
+        f.call("POST", START_RUN, Some(&token), json!({"igdb_id":42})),
+    );
+    let (success, conflict) = if a.status() == StatusCode::CREATED {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let run = json_body(success, StatusCode::CREATED).await;
+    json_body(conflict, StatusCode::CONFLICT).await;
+    let path = format!("{}/lifecycle", run_path(&run));
+    let etag = tag(&run);
+    let headers = [("If-Match", etag.as_str())];
+    let (a, b) = tokio::join!(
+        f.send(
+            "POST",
+            &path,
+            Some(&token),
+            &headers,
+            json!({"action":"pause"})
+        ),
+        f.send(
+            "POST",
+            &path,
+            Some(&token),
+            &headers,
+            json!({"action":"complete"})
+        ),
+    );
+    let (success, stale) = if a.status() == StatusCode::OK {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let winner = json_body(success, StatusCode::OK).await;
+    json_body(stale, StatusCode::PRECONDITION_FAILED).await;
+    let entry = f.current_entry(&token).await;
+    if winner["state"] == "paused" {
+        assert_eq!(entry["status"], "on_hold");
+        assert_eq!(entry["current_playthrough_id"], winner["id"]);
+        f.lifecycle(
+            &token,
+            &winner,
+            json!({"action":"complete"}),
+            StatusCode::OK,
+        )
+        .await;
+    } else {
+        assert_eq!(entry["status"], "completed");
+        assert!(entry["current_playthrough_id"].is_null());
+    }
+    // A concurrent status-only save either commits before start or conflicts.
+    let (start, status) = tokio::join!(
+        f.call("POST", START_RUN, Some(&token), json!({"igdb_id":42})),
+        f.call(
+            "PUT",
+            "/api/me/library/42",
+            Some(&token),
+            json!({"status":"backlog"})
+        ),
+    );
+    let run = json_body(start, StatusCode::CREATED).await;
+    assert!(matches!(
+        status.status(),
+        StatusCode::OK | StatusCode::CONFLICT
+    ));
+    assert_eq!(f.current_entry(&token).await["status"], "playing");
+    let path = format!("{}/lifecycle", run_path(&run));
+    let etag = tag(&run);
+    let headers = [("If-Match", etag.as_str())];
+    let (remove, action) = tokio::join!(
+        f.call("DELETE", "/api/me/library/42", Some(&token), Value::Null),
+        f.send(
+            "POST",
+            &path,
+            Some(&token),
+            &headers,
+            json!({"action":"pause"})
+        ),
+    );
+    assert_eq!(remove.status(), StatusCode::NO_CONTENT);
+    assert!(matches!(
+        action.status(),
+        StatusCode::OK | StatusCode::PRECONDITION_FAILED
+    ));
+    f.value(
+        "GET",
+        "/api/me/library/42",
+        &token,
+        Value::Null,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert_eq!(
+        f.value("GET", &run_path(&run), &token, Value::Null, StatusCode::OK)
+            .await["is_current"],
+        false
+    );
+    f.finish().await;
+}
+
 async fn json_body(response: Response, status: StatusCode) -> Value {
     let actual = response.status();
     let bytes = to_bytes(response.into_body(), 1_000_000).await.unwrap();
@@ -1165,7 +1796,7 @@ async fn repeat_playthroughs_preserve_history_and_derive_library_rating() {
     }
     // Logging does not require library membership, dates, or finishing a game.
     let original = fixture.value("POST", collection, &alice,
-        json!({"igdb_id":42,"rating":9,"review":"First experience","finished_on":"2022-04-01","platform":" PC "}),
+        json!({"igdb_id":42,"rating":9,"review":"First experience","finished_on":"2022-04-01","presentation_on":"2022-04-01","platform":" PC "}),
         StatusCode::CREATED).await;
     assert_eq!(original["platform"], "PC");
     assert!(original["started_on"].is_null());
@@ -1187,7 +1818,7 @@ async fn repeat_playthroughs_preserve_history_and_derive_library_rating() {
     assert_eq!(entry["rating_playthrough_id"], original["id"]);
 
     let replay = fixture.value("POST", collection, &alice,
-        json!({"igdb_id":42,"rating":7,"review":"Replay","started_on":"2026-01-01","finished_on":"2026-02-01"}),
+        json!({"igdb_id":42,"rating":7,"review":"Replay","started_on":"2026-01-01","finished_on":"2026-02-01","presentation_on":"2026-02-01"}),
         StatusCode::CREATED).await;
     // Backfilling an old experience must not replace the newer rating.
     let older = fixture
@@ -1195,7 +1826,7 @@ async fn repeat_playthroughs_preserve_history_and_derive_library_rating() {
             "POST",
             collection,
             &alice,
-            json!({"igdb_id":42,"rating":10,"finished_on":"2020-01-01"}),
+            json!({"igdb_id":42,"rating":10,"finished_on":"2020-01-01","presentation_on":"2020-01-01"}),
             StatusCode::CREATED,
         )
         .await;
@@ -1204,7 +1835,7 @@ async fn repeat_playthroughs_preserve_history_and_derive_library_rating() {
             "POST",
             collection,
             &alice,
-            json!({"igdb_id":42,"review":"Still playing","started_on":"2026-03-01"}),
+            json!({"igdb_id":42,"review":"Still playing","started_on":"2026-03-01","presentation_on":"2026-03-01"}),
             StatusCode::CREATED,
         )
         .await;
@@ -1337,7 +1968,7 @@ async fn repeat_playthroughs_preserve_history_and_derive_library_rating() {
             &original_path,
             &alice,
             &tag(&original),
-            json!({"rating":8,"review":"Edited first experience","finished_on":"2022-04-01"}),
+            json!({"rating":8,"review":"Edited first experience","finished_on":"2022-04-01","presentation_on":"2022-04-01"}),
             StatusCode::OK,
         )
         .await;
@@ -1362,7 +1993,7 @@ async fn repeat_playthroughs_preserve_history_and_derive_library_rating() {
             &replay_path,
             &alice,
             &tag(&replay),
-            json!({"review":"Replay without a rating","finished_on":"2026-02-01","rating":null}),
+            json!({"review":"Replay without a rating","finished_on":"2026-02-01","presentation_on":"2026-02-01","rating":null}),
             StatusCode::OK,
         )
         .await;
@@ -1376,7 +2007,7 @@ async fn repeat_playthroughs_preserve_history_and_derive_library_rating() {
             &replay_path,
             &alice,
             &tag(&unrated_replay),
-            json!({"rating":6,"finished_on":"2019-01-01"}),
+            json!({"rating":6,"finished_on":"2019-01-01","presentation_on":"2019-01-01"}),
             StatusCode::OK,
         )
         .await;
@@ -1435,7 +2066,7 @@ async fn repeat_playthroughs_preserve_history_and_derive_library_rating() {
             assert!(current["rating_playthrough_id"].is_null());
         }
     }
-    // Undated ratings use recording time; a later empty entry doesn't erase it.
+    // An undated rating remains available when no dated ratings exist; a later empty entry doesn't erase it.
     let undated = fixture
         .value(
             "POST",
@@ -1497,6 +2128,14 @@ async fn playthrough_validation_rejects_bad_input_before_importing() {
         ),
         (
             json!({"igdb_id":42,"status":"completed"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"igdb_id":42,"presentation_on":"2025-02-29"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"igdb_id":42,"presentation_on":"2025-09-09T00:00:00Z"}),
             StatusCode::UNPROCESSABLE_ENTITY,
         ),
         (json!({"rating":8}), StatusCode::UNPROCESSABLE_ENTITY),
@@ -1595,7 +2234,7 @@ async fn migration_preserves_legacy_reviews_without_inventing_play_dates() {
         DROP FUNCTION playthrough_revision();
         ALTER TABLE library_entries ADD COLUMN rating SMALLINT CHECK (rating BETWEEN 1 AND 10),
         ADD COLUMN review TEXT CHECK (char_length(review) <= 10000);
-        DELETE FROM _sqlx_migrations WHERE version IN (202609080002,202609080003);
+        DELETE FROM _sqlx_migrations WHERE version IN (202609080002,202609080003,202609090001,202609090002);
         INSERT INTO games (id,igdb_id,name,slug,source_url)
         SELECT gen_random_uuid(),n,'Legacy game','legacy-game','https://www.igdb.com' FROM generate_series(43,45) n;")
         .execute(&fixture.database.app).await.unwrap();
@@ -1637,6 +2276,7 @@ async fn migration_preserves_legacy_reviews_without_inventing_play_dates() {
                 json!("Preserved review")
             }
         );
+        assert!(entry["presentation_on"].is_null());
         assert!(entry["started_on"].is_null());
         assert!(entry["finished_on"].is_null());
         assert!(entry["platform"].is_null());
@@ -2570,5 +3210,337 @@ async fn application_routes_reject_with_doorman_authentication_codes() {
             .status(),
         200
     );
+    fixture.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn presentation_dates_control_diary_and_rating_without_recording_time_fallbacks() {
+    let fixture = Fixture::new().await;
+    let (_, token) = fixture.user("historical-dates").await;
+    let collection = "/api/me/playthroughs";
+    let library = "/api/me/library/42";
+    // Review-only and rating-only entries need no invented play dates. A chosen
+    // day can also describe a summary with neither a rating nor a review.
+    let mut rows = Vec::new();
+    for fields in [
+        json!({"igdb_id":42,"review":"Written now about last year","presentation_on":"2025-09-09"}),
+        json!({"igdb_id":42,"rating":8,"presentation_on":"2026-01-01"}),
+        json!({"igdb_id":42,"rating":9,"presentation_on":"2026-01-01"}),
+        json!({"igdb_id":42,"rating":10,"finished_on":"2026-09-09"}),
+        json!({"igdb_id":42,"rating":3}),
+        json!({"igdb_id":42,"presentation_on":"2027-01-01","started_on":"2020-01-01","finished_on":"2020-02-01"}),
+    ] {
+        rows.push(
+            fixture
+                .value("POST", collection, &token, fields, StatusCode::CREATED)
+                .await,
+        );
+    }
+    // Deliberately make recording timestamps disagree with UUID tie ordering.
+    // This catches a reintroduced timestamp tie-breaker regardless of random IDs.
+    for pair in [[1, 2], [3, 4]] {
+        let mut indices = pair;
+        indices.sort_by(|a, b| rows[*a]["id"].as_str().cmp(&rows[*b]["id"].as_str()));
+        for (index, recorded_at) in [
+            (indices[0], "2099-01-01T00:00:00Z"),
+            (indices[1], "1900-01-01T00:00:00Z"),
+        ] {
+            sqlx::query("UPDATE playthroughs SET created_at=$2::text::timestamptz WHERE id=$1")
+                .bind(Uuid::parse_str(rows[index]["id"].as_str().unwrap()).unwrap())
+                .bind(recorded_at)
+                .execute(&fixture.database.app)
+                .await
+                .unwrap();
+            rows[index] = fixture
+                .value(
+                    "GET",
+                    &format!("{collection}/{}", rows[index]["id"].as_str().unwrap()),
+                    &token,
+                    Value::Null,
+                    StatusCode::OK,
+                )
+                .await;
+        }
+    }
+    // Same-day and unknown-date ties depend only on UUID, never insertion order.
+    let mut dated = [rows[1].clone(), rows[2].clone()];
+    dated.sort_by(|a, b| b["id"].as_str().cmp(&a["id"].as_str()));
+    let mut undated = [rows[3].clone(), rows[4].clone()];
+    undated.sort_by(|a, b| b["id"].as_str().cmp(&a["id"].as_str()));
+    let expected = vec![
+        rows[5]["id"].clone(),
+        dated[0]["id"].clone(),
+        dated[1]["id"].clone(),
+        rows[0]["id"].clone(),
+        undated[0]["id"].clone(),
+        undated[1]["id"].clone(),
+    ];
+    let ids = |page: &Value| {
+        page["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].clone())
+            .collect::<Vec<_>>()
+    };
+    for query in ["", "?igdb_id=42"] {
+        let page = fixture
+            .value(
+                "GET",
+                &format!("{collection}{query}"),
+                &token,
+                Value::Null,
+                StatusCode::OK,
+            )
+            .await;
+        assert_eq!(ids(&page), expected);
+    }
+    let page = fixture
+        .value(
+            "GET",
+            &format!("{collection}?limit=2&offset=2"),
+            &token,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(ids(&page), expected[2..4]);
+    assert_eq!(page["has_more"], true);
+    let entry = fixture
+        .value(
+            "PUT",
+            library,
+            &token,
+            json!({"status":"playing"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(entry["rating_playthrough_id"], dated[0]["id"]);
+    assert_eq!(entry["rating"], dated[0]["rating"]);
+    let listed = fixture
+        .value(
+            "GET",
+            "/api/me/library",
+            &token,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(listed["data"][0]["entry"], entry);
+
+    let original = &rows[0];
+    let path = format!("{collection}/{}", original["id"].as_str().unwrap());
+    let edited = fixture
+        .edit(
+            "PATCH",
+            &path,
+            &token,
+            &tag(original),
+            json!({"review":"Corrected text"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(edited["presentation_on"], "2025-09-09");
+    assert_eq!(edited["created_at"], original["created_at"]);
+    assert_ne!(edited["updated_at"], original["updated_at"]);
+    assert_eq!(edited["version"], 2);
+    let page = fixture
+        .value("GET", collection, &token, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(ids(&page), expected);
+    let moved = fixture
+        .edit(
+            "PATCH",
+            &path,
+            &token,
+            &tag(&edited),
+            json!({"presentation_on":"2028-02-29","rating":6}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(moved["presentation_on"], "2028-02-29");
+    assert!(moved["started_on"].is_null());
+    assert!(moved["finished_on"].is_null());
+    let page = fixture
+        .value("GET", collection, &token, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(page["data"][0]["id"], original["id"]);
+    let entry = fixture
+        .value("GET", library, &token, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(entry["rating"], 6);
+    assert_eq!(entry["rating_playthrough_id"], original["id"]);
+    let unchanged = fixture
+        .edit(
+            "PATCH",
+            &path,
+            &token,
+            &tag(&moved),
+            json!({"presentation_on":"2028-02-29"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(unchanged, moved, "re-saving the date is not a revision");
+
+    // Date corrections participate in exactly the same ownership and locking
+    // rules as text: concurrent edits against one revision have one winner.
+    let (_, other) = fixture.user("historical-other").await;
+    fixture
+        .edit(
+            "PATCH",
+            &path,
+            &other,
+            &tag(&moved),
+            json!({"presentation_on":null}),
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+    fixture
+        .edit(
+            "PATCH",
+            &path,
+            &token,
+            &tag(original),
+            json!({"presentation_on":null}),
+            StatusCode::PRECONDITION_FAILED,
+        )
+        .await;
+    let revision = tag(&moved);
+    let headers = [("If-Match", revision.as_str())];
+    let (a, b) = tokio::join!(
+        fixture.send(
+            "PATCH",
+            &path,
+            Some(&token),
+            &headers,
+            json!({"presentation_on":"2000-01-01"})
+        ),
+        fixture.send(
+            "PATCH",
+            &path,
+            Some(&token),
+            &headers,
+            json!({"review":"Concurrent correction"})
+        ),
+    );
+    assert!(matches!(
+        (a.status(), b.status()),
+        (StatusCode::OK, StatusCode::PRECONDITION_FAILED)
+            | (StatusCode::PRECONDITION_FAILED, StatusCode::OK)
+    ));
+    let current = fixture
+        .value("GET", &path, &token, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(current["version"], 4);
+    let cleared = fixture
+        .edit(
+            "PATCH",
+            &path,
+            &token,
+            &tag(&current),
+            json!({"presentation_on":null}),
+            StatusCode::OK,
+        )
+        .await;
+    assert!(cleared["presentation_on"].is_null());
+    assert_eq!(cleared["review"], current["review"]);
+    // PUT can set a day, and omission in a subsequent replacement clears it.
+    let replaced = fixture
+        .edit(
+            "PUT",
+            &path,
+            &token,
+            &tag(&cleared),
+            json!({"presentation_on":"1999-12-31"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(replaced["presentation_on"], "1999-12-31");
+    let replaced = fixture
+        .edit(
+            "PUT",
+            &path,
+            &token,
+            &tag(&replaced),
+            json!({"review":"Unknown date"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert!(replaced["presentation_on"].is_null());
+    // Once all dated ratings are removed, the deterministic unknown-date
+    // representative remains available, without claiming it is the newest.
+    for row in &dated {
+        let path = format!("{collection}/{}", row["id"].as_str().unwrap());
+        fixture
+            .edit(
+                "PATCH",
+                &path,
+                &token,
+                &tag(row),
+                json!({"rating":null}),
+                StatusCode::OK,
+            )
+            .await;
+    }
+    let entry = fixture
+        .value("GET", library, &token, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(entry["rating_playthrough_id"], undated[0]["id"]);
+    assert_eq!(entry["rating"], undated[0]["rating"]);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn presentation_date_migration_preserves_existing_dates_and_revisions() {
+    let fixture = Fixture::new().await;
+    let (_, token) = fixture.user("date-migration").await;
+    let collection = "/api/me/playthroughs";
+    let row = fixture.value("POST", collection, &token,
+        json!({"igdb_id":42,"rating":7,"review":"Existing review","started_on":"2020-01-01","finished_on":"2020-02-01"}), StatusCode::CREATED).await;
+    let path = format!("{collection}/{}", row["id"].as_str().unwrap());
+    let row = fixture
+        .edit(
+            "PATCH",
+            &path,
+            &token,
+            &tag(&row),
+            json!({"platform":"PC"}),
+            StatusCode::OK,
+        )
+        .await;
+    // Reconstruct the prior schema and ordering in this disposable database.
+    sqlx::raw_sql(
+        "DROP VIEW library_entry_details;
+        DROP INDEX playthroughs_game_recent_idx; DROP INDEX playthroughs_diary_recent_idx;
+        ALTER TABLE playthroughs DROP COLUMN presentation_on, DROP COLUMN state, DROP COLUMN is_current;
+        DELETE FROM _sqlx_migrations WHERE version IN (202609090001,202609090002);",
+    )
+    .execute(&fixture.database.app)
+    .await
+    .unwrap();
+    let prior_ordering = include_str!("../migrations/202609080002_playthroughs.sql")
+        .split_once("CREATE INDEX playthroughs_game_recent_idx")
+        .unwrap()
+        .1;
+    // This string is exclusively repository-owned migration SQL, with no user input.
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE INDEX playthroughs_game_recent_idx{prior_ordering}"
+    )))
+    .execute(&fixture.database.app)
+    .await
+    .unwrap();
+    let migrator = sqlx::migrate!("./migrations");
+    migrator.run(&fixture.database.app).await.unwrap();
+    migrator.run(&fixture.database.app).await.unwrap();
+    let migrated = fixture
+        .value("GET", &path, &token, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(
+        migrated, row,
+        "migration invents no presentation day and changes no private bookkeeping or content"
+    );
+    assert!(migrated["presentation_on"].is_null());
     fixture.finish().await;
 }

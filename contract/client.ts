@@ -23,6 +23,8 @@
 import type { CatalogGame } from "./types/CatalogGame";
 import type { CatalogPage } from "./types/CatalogPage";
 import type { CreatePlaythroughInput } from "./types/CreatePlaythroughInput";
+import type { StartPlaythroughInput } from "./types/StartPlaythroughInput";
+import type { LifecycleInput } from "./types/LifecycleInput";
 import type { EntryInput } from "./types/EntryInput";
 import type { ErrorBody } from "./types/ErrorBody";
 import type { FieldError } from "./types/FieldError";
@@ -205,7 +207,8 @@ export const libraryEntry = (igdbId: number): Promise<LibraryEntry> =>
  *
  * `status` is the only writable field: the entry's `rating` is derived from
  * playthroughs and is edited there. That is also why this route carries no
- * precondition — a complete intent cannot silently discard anything.
+ * precondition. A conflicting status while a current run exists returns 409;
+ * use transitionPlaythrough to change that run and status together.
  */
 export const saveLibraryEntry = (igdbId: number, input: EntryInput): Promise<LibraryEntry> =>
   request("PUT", `/api/me/library/${igdbId}`, { body: input });
@@ -223,6 +226,21 @@ export const playthroughs = (
 export const playthrough = (id: string): Promise<Playthrough> =>
   request("GET", `/api/me/playthroughs/${id}`);
 
+/** Starts a current run (or replay), atomically setting library status to playing. */
+export const startPlaythrough = (input: StartPlaythroughInput): Promise<Playthrough> =>
+  request("POST", "/api/me/playthroughs/start", { body: input });
+
+/** Pauses, resumes, completes or abandons the current run and updates library status. */
+export const transitionPlaythrough = (
+  current: Playthrough,
+  input: LifecycleInput,
+): Promise<Playthrough> =>
+  request("POST", `/api/me/playthroughs/${current.id}/lifecycle`, {
+    body: input,
+    ifMatch: precondition(current),
+  });
+
+/** Records history without changing present-day library status or the current run. */
 export const createPlaythrough = (input: CreatePlaythroughInput): Promise<Playthrough> =>
   request("POST", "/api/me/playthroughs", { body: input });
 

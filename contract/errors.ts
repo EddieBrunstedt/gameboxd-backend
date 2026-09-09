@@ -155,6 +155,7 @@ export function isRecoveryCooldown(error: unknown): boolean {
 // (wording, localisation). The server keys are the codes doorman-axum emits;
 // the rest are the browser-side ceremony outcomes above.
 export const ERROR_GUIDANCE: Record<string, string> = {
+  lifecycle_conflict: "Reload the current run and choose an action allowed in its current state.",
   recovery_cooldown_active:
     "This action is blocked during the 24-hour recovery cool-down. You can still add a passkey and sign out of this session.",
   csrf_origin_mismatch:

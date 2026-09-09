@@ -21,6 +21,8 @@ Base URL: `http://localhost:3000`. All bodies are JSON unless a response is `204
 | DELETE | `/api/me/library/{igdb_id}` | Yes | Remove own library entry, preserving playthroughs (idempotent 204) |
 | GET | `/api/me/playthroughs?igdb_id=42&limit=20&offset=0` | Yes | Own diary; optional game filter |
 | POST | `/api/me/playthroughs` | Yes | Record a new experience, storing the game if needed (201) |
+| POST | `/api/me/playthroughs/start` | Yes | Start a current run or replay and set library status (201) |
+| POST | `/api/me/playthroughs/{id}/lifecycle` | Yes | Pause, resume, complete or abandon; requires `If-Match` |
 | GET | `/api/me/playthroughs/{id}` | Yes | Own playthrough |
 | PUT | `/api/me/playthroughs/{id}` | Yes | Replace every editable field; requires `If-Match` |
 | PATCH | `/api/me/playthroughs/{id}` | Yes | Change only the fields present; requires `If-Match` |
@@ -48,9 +50,9 @@ Display name is trimmed and limited to 80 characters; bio to 1000. The response 
 {"status":"completed"}
 ```
 
-Allowed statuses: `backlog`, `playing`, `completed`, `on_hold`, `dropped`. `status` is required and is the only writable library field. Each entry returns `igdb_id`, `status`, derived nullable `rating`, nullable `rating_playthrough_id`, `created_at`, and `updated_at`. Ratings and reviews cannot be written through this route; obsolete payloads containing either field are rejected rather than silently discarded. The library has no review field.
+Allowed statuses: `backlog`, `playing`, `completed`, `on_hold`, `dropped`. `status` is required and is the only writable library field. Each entry returns `igdb_id`, `status`, derived nullable `rating`, nullable `rating_playthrough_id`, nullable `current_playthrough_id`, `created_at`, and `updated_at`. Ratings and reviews cannot be written through this route; obsolete payloads containing either field are rejected rather than silently discarded. The library has no review field.
 
-The displayed rating comes from the most recent **rated** playthrough, using the chronology defined below. `rating_playthrough_id` identifies that experience. An unrated replay does not hide a previous rating. Editing or deleting a playthrough recalculates the displayed rating automatically; if none remain rated, both derived fields are null. Changing library status never edits a playthrough. Library timestamps describe changes to library membership/status, not changes to the derived rating.
+The displayed rating comes from the first **rated** playthrough, using the chronology defined below. `rating_playthrough_id` identifies that experience. An unrated replay does not hide a previous rating. Editing or deleting a playthrough recalculates the displayed rating automatically; if none remain rated, both derived fields are null. Status-only saves never edit a playthrough. While a current run exists, a status-only save must agree with its state (`active` → `playing`, `paused` → `on_hold`), otherwise it returns `409 lifecycle_conflict`; use a lifecycle action to change both together. Library timestamps describe changes to library membership/status, not changes to the derived rating.
 
 Saving an entry stores an unknown game automatically, so no import call is needed first. A game already stored is reused exactly as it stands, however old its metadata, so this save never waits for IGDB — not for its request spacing, its rate limit, or a timeout while it is down. Only a game never stored here requires a successful IGDB fetch; an IGDB ID no game exists under returns 404, and a provider failure returns the IGDB errors below. The same applies to recording a playthrough.
 
@@ -58,7 +60,7 @@ Stale metadata found this way is queued for a background refresh instead, so the
 
 ## Playthroughs and diary
 
-A playthrough represents one experience with a game, not an individual gaming session. Multiple entries for the same game are allowed. Completion is never required: abandoned runs and open-ended games can be rated or reviewed. Library membership and history are independent: recording a playthrough does not create a library entry or guess its status; removing a library entry preserves history. Deleting an account removes both.
+A playthrough represents one experience with a game, not an individual gaming session. Multiple entries for the same game are allowed. Completion is never required: abandoned runs and open-ended games can be rated or reviewed. Historical recording and library membership are independent: `POST /api/me/playthroughs` does not create a library entry or guess its status; removing a library entry preserves history. Deleting an account removes both.
 
 `POST /api/me/playthroughs` body (`igdb_id` required, all other fields optional):
 
@@ -67,6 +69,7 @@ A playthrough represents one experience with a game, not an individual gaming se
   "igdb_id": 42,
   "rating": 9,
   "review": "A memorable first playthrough.",
+  "presentation_on": "2022-04-15",
   "started_on": "2022-03-01",
   "finished_on": "2022-04-15",
   "platform": "PC"
@@ -78,28 +81,88 @@ A playthrough represents one experience with a game, not an individual gaming se
 - **PUT replaces.** Every editable field takes the value in the body, so an omitted field and an explicit `null` both clear it. Use it where one form owns the whole record.
 - **PATCH merges.** An omitted field keeps its stored value and an explicit `null` clears it. Use it where a control owns a single field — a rating widget, a review editor, a date picker — so it cannot erase fields it never displayed.
 
-Both preserve the playthrough's identity and `created_at`. Unknown fields are rejected by either route, so a misspelled name fails loudly instead of silently changing nothing. An edit that changes nothing is not a revision: `updated_at`, `version` and the entity tag all stay as they were. To record a replay, POST a new entry. POST always creates a new UUID, so retrying a successful POST can create a duplicate.
+Both preserve the playthrough's identity and `created_at`. Unknown fields are rejected by either route, so a misspelled name fails loudly instead of silently changing nothing. An edit that changes nothing is not a revision: `updated_at`, `version` and the entity tag all stay as they were. To start a current replay, use the start route below. To backfill a past replay, POST a new historical entry. POST always creates a new UUID, so retrying a successful POST can create a duplicate.
 
 - `rating`: null or an integer 1–10 (divide by two to show half-stars).
 - `review`: null or plain text of at most 10000 characters, without NUL. Render user content as text, never as HTML.
-- `started_on`, `finished_on`: null or calendar dates in `YYYY-MM-DD` format. If both are set, the finish must be on or after the start. These describe the experience; `finished_on` does not imply the game was completed or update library status. Either date can be provided alone.
+- `presentation_on`: null or an owner-chosen historical calendar date (`YYYY-MM-DD`) for this entry, including its rating/review. Optional on creation; omitted means unknown. Independent of start/end dates, with no requirement to fall between them. Backdates and future dates are allowed. See the chronology policy below.
+- `state`: `active`, `paused`, `completed`, `abandoned`, or null (unknown). Creation/PUT omission means unknown; PATCH omission preserves it and null clears it. State describes the experience independently of its chosen historical date. Current runs must change state through lifecycle actions; historical state is freely correctable through PUT/PATCH.
+- `is_current`: read-only boolean. Only start and lifecycle/removal operations control it. It is not inferred from state or dates.
+- `started_on`, `finished_on`: null or calendar dates in `YYYY-MM-DD` format. If both are set, the finish must be on or after the start. These describe the experience; `finished_on` does not imply the game was completed or update library status. Either date can be provided alone. Active/paused runs cannot have an end date; completed/abandoned runs may have an unknown end date. For a historical correction to active/paused, clear an existing end date in the same edit.
 - `platform`: null or a label of 1–100 characters without control characters, trimmed when saved. This is free text (for example `PC` or `Steam Deck`), not an IGDB taxonomy ID.
 
-An undated rating, a review without a rating, and a record with neither are all valid. Responses contain `id`, `igdb_id`, `version`, `rating`, `review`, `started_on`, `finished_on`, `platform`, `created_at`, and `updated_at`; they never expose the owner or local game key.
+An undated rating, a review without a rating, and a record with neither are all valid. Responses contain `id`, `igdb_id`, `version`, `rating`, `review`, `presentation_on`, `started_on`, `finished_on`, `platform`, `created_at`, and `updated_at`; they never expose the owner or local game key.
 
 ### Concurrent and partial edits
 
 Every playthrough carries an integer `version`, and single-resource responses — read, create, replace and update alike — repeat it as a strong `ETag` such as `"3"`. Listings carry `version` on each item, so an editor opened from a list needs no extra read first.
 
-`PUT` and `PATCH` **require** an `If-Match` header naming the revision the edit was based on. Without one the request is refused with `428 precondition_required` instead of being allowed to overwrite work the client never saw. A precondition that no longer holds returns `412 precondition_failed`: reload the playthrough, reapply the change, and retry. `If-Match: *` asserts only that the playthrough still exists and accepts whatever revision that is. Weak tags such as `W/"3"` parse but can never satisfy the precondition, because `If-Match` compares entity tags strongly. A header that cannot be parsed is a `400 validation_error`, never a silently absent precondition.
+`PUT`, `PATCH`, and lifecycle actions **require** an `If-Match` header naming the revision the edit was based on. Without one the request is refused with `428 precondition_required` instead of being allowed to overwrite work the client never saw. A precondition that no longer holds returns `412 precondition_failed`: reload the playthrough, reapply the change, and retry. `If-Match: *` asserts only that the playthrough still exists and accepts whatever revision that is. Weak tags such as `W/"3"` parse but can never satisfy the precondition, because `If-Match` compares entity tags strongly. A header that cannot be parsed is a `400 validation_error`, never a silently absent precondition.
 
 `DELETE` takes `If-Match` optionally. Without one it stays idempotent and answers 204 whether or not the playthrough was there. With one it asserts a revision instead, so a playthrough that is already gone or has since changed returns 412.
 
-Ownership is resolved before the precondition, so another user's playthrough answers 404 for every method and never discloses a revision through 412. Concurrent edits to one playthrough are serialized: a partial edit merges into the revision it was checked against, never into a value a competing write has already replaced. Validation that spans fields — `finished_on` against `started_on` — is applied to the merged record, so a patch cannot move one date past a stored one.
+Ownership is resolved before the precondition, so another user's playthrough answers 404 for reads, edits, and lifecycle actions and never discloses a revision through 412. Concurrent edits to one playthrough are serialized: a partial edit merges into the revision it was checked against, never into a value a competing write has already replaced. Validation that spans fields — `finished_on` against `started_on` — is applied to the merged record, so a patch cannot move one date past a stored one.
 
 Library entries carry no entity tag. `status` is the only writable field there, so each `PUT` sends a complete intent and can discard nothing; the derived `rating` in its response is owned by playthroughs, so a tag on that route would not describe the representation it returned. Ratings and reviews are edited through the playthrough routes, where the preconditions above apply.
 
-**Chronology:** newest `finished_on`, falling back to `started_on`, then the UTC date of `created_at`. Ties use `created_at` descending, then playthrough UUID descending. Both the diary and the derived library rating use this ordering; the latter skips unrated entries. Editing text never makes an old experience newest, while changing its dates can change its position. An undated entry uses its recording date until a play date is supplied, so an undated old experience cannot be distinguished from a recent one.
+### Current playthrough lifecycle
+
+A user can have **one current run per game**, either active or paused, and can play multiple different games at once. Historical entries may describe other active/paused experiences without controlling present status. A library entry may also use any status without a current run, supporting lightweight tracking with no invented history. `current_playthrough_id` is null in that case.
+
+`POST /api/me/playthroughs/start` accepts:
+
+```json
+{"igdb_id":42,"started_on":"2026-09-09","platform":"PC"}
+```
+
+Only `igdb_id` is required. Start creates a fresh UUID with `state: "active"` and `is_current: true`, and creates/updates library membership to `playing` in the same transaction. A current active **or paused** run causes `409 lifecycle_conflict`; finish or abandon it before starting a replay. Previous history, ratings, and reviews are untouched. Unknown games use the existing import path; cached games need no successful upstream call. Catalog import can persist independently if a later personal write fails, but personal history and library status always commit together.
+
+`POST /api/me/playthroughs/{id}/lifecycle` requires the current run's `If-Match` and accepts:
+
+```json
+{"action":"complete","finished_on":"2026-09-09"}
+```
+
+| Action | Allowed source state | Result state | Library status | Remains current |
+| --- | --- | --- | --- | --- |
+| `pause` | active | paused | on_hold | yes |
+| `resume` | paused | active | playing | yes |
+| `complete` | active or paused | completed | completed | no |
+| `abandon` | active or paused | abandoned | dropped | no |
+
+`finished_on` is optional/null for complete/abandon and must be absent/null for pause/resume. Dates never default to today. A run can stay active indefinitely and carry a rating/review before it ends. Lifecycle actions leave review, rating, platform, `started_on`, and `presentation_on` untouched. Edit dates through PUT/PATCH with revision protection; dating a review still requires an explicit `presentation_on`, independent of the end date.
+
+Actions on a historical/detached run or an invalid transition return `409 lifecycle_conflict`; stale revisions return `412 precondition_failed` first. Unknown action/state values and client-written `is_current` are rejected. Lifecycle responses return the updated owner playthrough and its ETag; start returns 201 and transitions return 200. Read the library entry to obtain its current projection.
+
+Backfilling or correcting historical state never changes current status, even while a replay is active. PUT/PATCH on a current run can edit dates/content but cannot change its state (including clearing it); use lifecycle actions. Removing library membership atomically detaches the current run, increments its revision, and preserves its state, dates, rating, review, and history. Re-adding membership does not adopt a historical run. Start creates a new current experience. Deleting a current playthrough leaves library status as explicit lightweight tracking and clears the derived current-run reference.
+
+All current-state mutations serialize per authenticated user/game with a transaction-scoped advisory lock, acquired before playthrough row locks. Starts, lifecycle actions, library status saves/removal, and playthrough edits/deletion follow this protocol. A database partial unique index additionally prevents two current runs; check constraints require a current run to be active/paused and prevent end dates on open runs. Competing revisions cannot silently overwrite one another. Concurrent status-only operations use last committed intent; when a current run exists, conflicting status saves fail. Removing membership and starting a run concurrently execute in lock order: the final result is either detached history without membership, or a new coherent current run with membership.
+
+Existing runs migrate with `state: null` and `is_current: false`, preserving dates, content, revisions, and private timestamps. An end date or existing library status is never treated as evidence of completion. No sharing behavior changes. Feature 12 will add retry keys: start currently has no replayable idempotency response; after an uncertain response, read the library/current run before starting again. Transition retries with an old revision return 412.
+
+### Historical chronology policy
+
+The diary sorts by `presentation_on DESC NULLS LAST, id DESC`. The library's derived rating uses that same order over the owner's rated entries only. Dates and UUIDs determine the entire order; actual creation/update times and revisions never break ties. UUIDs are random v4 identifiers, so tie order is stable but has no chronological meaning.
+
+- A review-only entry, rating-only entry, or playthrough summary uses its explicitly chosen `presentation_on`. Rating and review on the same entry share this date.
+- A backfilled playthrough appears on that chosen day even if it was recorded today. Play start/end dates do not supply or override it. A caller may explicitly send the same day as a play date when that is the owner's intent.
+- A null date means unknown. Undated entries appear after all dated entries, including when play dates exist. Display them as undated, without a guessed day or year. A date-filtered view must exclude them; an unfiltered view may show an undated group.
+- Text, rating, platform, play-date, and future visibility changes preserve position. Editing `presentation_on` moves the entry; clearing it moves the entry into the undated group. A rating change can affect rating selection by adding/removing a rated candidate, but does not change its position.
+- Dated ratings outrank undated ratings. If every rated entry is undated, the highest UUID supplies a deterministic representative rating; it must not be described as the most recently played or recorded rating. Same-day rated ties use the same UUID rule. `rating_playthrough_id` identifies the selected source so the owner can inspect or date it. An unrated entry never suppresses a rating.
+
+`presentation_on` is a PostgreSQL `DATE` / Rust `NaiveDate`, serialized as a calendar-date string, with no time or time zone. The API accepts no time-zone companion and performs no UTC conversion. Clients must preserve the chosen day rather than parse it as an instant and shift it into a local zone. Actual `created_at` and `updated_at` remain UTC instants for owner-side bookkeeping, and date edits use the existing revision and `If-Match` protection.
+
+The presentation-date migration leaves every existing `presentation_on` null, even when start/end dates are present. It changes no stored play dates, content, timestamps, UUIDs, or revisions. Owners can date existing entries in place. The change deliberately removes recording-time and play-date fallbacks from diary ordering and rating selection.
+
+### Contract for future public surfaces (feature 4 onward)
+
+Personal content remains private in this feature. The authenticated `Playthrough` DTO and its revision `ETag` are owner-only contracts. Public endpoints must define separate projections; they must not reuse this DTO or its tags.
+
+Future notes and list/summary events must store an explicit nullable historical day and use descending day, nulls last, then a stable random identifier. Profiles and feeds must use the same policy. A feed spanning resource kinds needs globally unique random item IDs (or a stable kind discriminator as a final collision tie-breaker), with one identity per underlying item. Publishing or editing an item must not manufacture a current-day event. Unknown dates remain undated in unfiltered lists and do not acquire a year in date-filtered statistics. Play/completion statistics may use explicitly supplied play/milestone dates for the metric they describe; a review date is not proof of play or completion.
+
+A public review or rating may expose its chosen `presentation_on` but must not fall back to private play dates. Playthrough dates, platform, status, other ratings, and notes require their own visibility authorization. Public rating selection must apply the same ordering **only after** filtering to eligible public ratings from enabled public profiles; a private rating must not affect the value, source, ordering, or count.
+
+Public bodies, related resources, previews, pagination metadata, ordering, counts, and headers must omit actual recording/edit/publication timestamps, revisions, edit histories and edited badges. Do not emit timestamp-based `Last-Modified`, revision `ETag`s, or cursors that encode bookkeeping. Any future public cache validator must be opaque, and revocation must invalidate or revalidate cached content. HTTP transport time is not a content historical date. Anonymous reads and owner visitor previews must share these projections and chronology rules.
 
 The migration converts each previous library rating and/or review into one undated playthrough, retaining the original recording/edit timestamps. It creates no playthrough for a status-only entry and invents no play dates or platform.
 
@@ -125,7 +188,7 @@ Catalog search returns `{data,limit,offset,next_offset}`, where `next_offset` is
 {"error":{"code":"validation_error","message":"rating must be an integer from 1 to 10, or null"}}
 ```
 
-Application error codes are exactly `validation_error`, `invalid_json`, `not_found`, `method_not_allowed`, `precondition_required`, `precondition_failed`, `request_rejected`, `internal_error`, `database_unavailable`, `igdb_not_configured`, `igdb_unavailable`, `igdb_rate_limited`, `catalog_busy` — a closed set, published as a TypeScript union and checked against this list by `tests/contract.rs`. Validation is generally 400; malformed JSON/schema/content type retains Axum's 400/422/415 status; oversized bodies return 413.
+Application error codes are exactly `validation_error`, `invalid_json`, `not_found`, `method_not_allowed`, `precondition_required`, `precondition_failed`, `lifecycle_conflict`, `request_rejected`, `internal_error`, `database_unavailable`, `igdb_not_configured`, `igdb_unavailable`, `igdb_rate_limited`, `catalog_busy` — a closed set, published as a TypeScript union and checked against this list by `tests/contract.rs`. Validation is generally 400; malformed JSON/schema/content type retains Axum's 400/422/415 status; oversized bodies return 413.
 
 ### Field-level errors
 

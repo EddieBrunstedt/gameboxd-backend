@@ -46,3 +46,8 @@ export function configureGameboxd(options: { baseUrl: string }): void {
   configureApi(options);
   configureAuth(options);
 }
+
+export type { PlaythroughState } from "./types/PlaythroughState";
+export type { StartPlaythroughInput } from "./types/StartPlaythroughInput";
+export type { LifecycleAction } from "./types/LifecycleAction";
+export type { LifecycleInput } from "./types/LifecycleInput";
