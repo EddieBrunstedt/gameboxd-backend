@@ -33,3 +33,15 @@ jobs:
       # cannot fall behind the types that actually serialize the responses.
       - name: Generated contract types are up to date
         run: git diff --exit-code -- contract/types
+      # The generated types and both hand-written clients have to be internally
+      # consistent and strict-clean before a frontend depends on them. Nothing
+      # in the Rust suite can see a TypeScript type error: the readiness review
+      # found `ApiError.code` typed as a union that could not name the codes the
+      # route actually returns, which made the sign-out branch every screen
+      # needs a comparison the compiler rejected. That was invisible to CI until
+      # this step existed.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Contract typechecks under --strict
+        run: npx -y -p typescript@7.0.2 tsc -p contract

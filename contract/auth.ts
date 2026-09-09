@@ -14,13 +14,41 @@
 //      without proof and surfaces the resulting 401 to the caller. Gameboxd
 //      runs the step-up ceremony and retries, because a 401 meaning "prove it
 //      again" must not be handled like a 401 meaning "you are signed out".
-//   3. `isSignedOut` / `isReauthRequired` — the two 401s above, told apart by
-//      code, so no call site is tempted to branch on the status alone.
+//   3. Error vocabulary — the codes, the guidance table and the predicates moved
+//      to `./errors.ts`, shared with `./client.ts`. Doorman's session layer
+//      fronts the application routes too, so its codes arrive there as well and
+//      a predicate that only understood this file's error class was wrong for
+//      every screen that called an `/api` route.
+//   4. Ceremony failures — `navigator.credentials` rejects with a
+//      `DOMException`, which upstream lets escape raw. Those rejections are
+//      translated into `AuthError`s carrying a code, because a dismissed prompt
+//      is an ordinary outcome the UI has to recognise, not an unknown crash.
 //
 // The server serializes WebAuthn options and responses as base64url JSON.
 // The browser APIs require ArrayBuffer fields, so these helpers translate
 // challenge/user/credential IDs in both directions and then call the doorman
 // endpoints for signup, sign-in, recovery, passkey management, and sessions.
+
+import {
+  type AnyErrorCode,
+  type ClientCode,
+  GameboxdError,
+  guidanceFor,
+  isReauthRequired,
+} from "./errors";
+
+// Re-exported so `auth.ts` stays the single import for authentication work,
+// even though the vocabulary is now shared with the application client.
+export {
+  ERROR_GUIDANCE,
+  guidanceFor,
+  isAccountDisabled,
+  isPasskeyCancelled,
+  isReauthRequired,
+  isRecoveryCooldown,
+  isSignedOut,
+} from "./errors";
+export type { AnyErrorCode, AuthCode, ClientCode } from "./errors";
 
 function base64UrlToBuffer(input: string): ArrayBuffer {
   const padded = input.padEnd(input.length + ((4 - (input.length % 4)) % 4), "=");
@@ -162,66 +190,15 @@ function encodeAssertion(cred: PublicKeyCredential) {
 // doorman returns a stable machine error code in `{ "error": { "code, message } }`.
 // `AuthError` carries that code so the UI can map it to product copy instead of
 // showing the raw JSON.
-export class AuthError extends Error {
+export class AuthError extends GameboxdError {
   constructor(
-    public code: string | null,
-    public status: number,
-    public guidance: string,
+    code: AnyErrorCode | null,
+    status: number,
+    readonly guidance: string,
   ) {
-    super(guidance);
+    super(status, code, guidance);
     this.name = "AuthError";
   }
-}
-
-// Jargon -> end-user guidance. This is the table a host customises per product
-// (wording, localisation). The keys are the codes doorman-axum emits.
-export const ERROR_GUIDANCE: Record<string, string> = {
-  recovery_cooldown_active:
-    "This action is blocked during the 24-hour recovery cool-down. You can still add a passkey and sign out of this session.",
-  csrf_origin_mismatch:
-    "The request was blocked by the cross-origin check. Make sure you are using the app's real address.",
-  session_not_found: "You are signed out. Sign in with a passkey to continue.",
-  session_expired: "Your session expired. Sign in with a passkey again.",
-  email_already_in_use: "That email is already linked to an account.",
-  invalid_email: "That does not look like a valid email address.",
-  invalid_verification_token: "This link is invalid or has already been used. Request a new one.",
-  invalid_passkey_challenge: "The passkey step timed out. Try again.",
-  passkey_not_found: "That passkey is no longer registered.",
-  passkey_ownership_mismatch: "That passkey does not belong to this account.",
-  passkey_possible_compromise:
-    "Sign-in was blocked because this authenticator may have been cloned. Use another passkey and review your account.",
-  rate_limited: "Too many attempts. Wait a little while and try again.",
-  resource_limit_exceeded: "You have reached the limit for this resource.",
-  webauthn_error: "The passkey step failed. Try again, or use a different authenticator.",
-  user_not_found: "No matching account.",
-  // Present so nothing falls through to the signed-out wording below: this 401
-  // means the session is still good and the action needs fresh proof.
-  reauth_required: "Confirm it is you with your passkey to continue.",
-};
-
-/**
- * True when the session is gone and signing in again is the only way forward.
- *
- * Deliberately not "the response was 401": `reauth_required` is also a 401, and
- * treating it as a sign-out would throw away whatever the user was in the
- * middle of doing.
- */
-export function isSignedOut(error: unknown): boolean {
-  return (
-    error instanceof AuthError &&
-    (error.code === "session_expired" || error.code === "session_not_found")
-  );
-}
-
-/** True when the session is valid but the action needs a fresh assertion. */
-export function isReauthRequired(error: unknown): boolean {
-  return error instanceof AuthError && error.code === "reauth_required";
-}
-
-export function guidanceFor(code: string | null, status: number): string {
-  if (code && ERROR_GUIDANCE[code]) return ERROR_GUIDANCE[code];
-  if (status === 401) return ERROR_GUIDANCE.session_not_found;
-  return "Something went wrong. Try again.";
 }
 
 let baseUrl = "";
@@ -243,9 +220,16 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
   const res = await fetch(baseUrl + path, { credentials: "include", ...init });
   const text = await res.text();
   if (!res.ok) {
-    let code: string | null = null;
+    let code: AnyErrorCode | null = null;
     try {
-      code = (JSON.parse(text) as { error?: { code?: string } }).error?.code ?? null;
+      // The wire carries a bare string. Doorman's set is pinned by
+      // `tests/contract.rs`, so a value outside `AuthCode` means the pin moved
+      // without this contract being updated — `guidanceFor` still falls back
+      // sensibly, and the drift test is what actually reports it.
+      code =
+        ((JSON.parse(text) as { error?: { code?: string } }).error?.code as
+          | AnyErrorCode
+          | undefined) ?? null;
     } catch {
       // non-JSON body (e.g. the CSRF layer); fall back to status-based guidance.
     }
@@ -274,15 +258,80 @@ async function deleteJson(path: string, body?: unknown): Promise<void> {
   });
 }
 
+/**
+ * Runs one WebAuthn ceremony and turns its failures into `AuthError`s.
+ *
+ * This is the part upstream's reference leaves to the caller. Both
+ * `navigator.credentials.create()` and `.get()` signal every outcome except
+ * success by *rejecting* with a `DOMException` — they do not resolve `null`,
+ * which is why the `if (!cred)` guard the reference carries almost never fires.
+ * Letting those reject raw means the single most common outcome of a passkey
+ * prompt, the user dismissing it, arrives at the UI as an unrecognised
+ * exception with a browser-authored message.
+ *
+ * The `null` case is still handled: it is reachable through an aborted
+ * conditional-mediation request, and it means the same thing as a dismissal.
+ *
+ * `status` is 0 on all of these. No HTTP request failed — the browser refused
+ * or the user declined before anything was sent — and inventing a status would
+ * let a caller believe it matched a response the server never produced.
+ */
+async function ceremony(run: () => Promise<Credential | null>): Promise<PublicKeyCredential> {
+  // An insecure context (plain HTTP on anything but localhost) or a browser
+  // without WebAuthn leaves this undefined, and calling through it would throw
+  // a TypeError that says nothing a user could act on.
+  if (typeof PublicKeyCredential === "undefined" || !navigator.credentials) {
+    throw ceremonyFailure("passkey_unsupported");
+  }
+  let credential: Credential | null;
+  try {
+    credential = await run();
+  } catch (error) {
+    throw ceremonyFailure(codeForCeremonyFailure(error));
+  }
+  if (!credential) throw ceremonyFailure("passkey_cancelled");
+  return credential as PublicKeyCredential;
+}
+
+function ceremonyFailure(code: ClientCode | "webauthn_error"): AuthError {
+  return new AuthError(code, 0, guidanceFor(code, 0));
+}
+
+function codeForCeremonyFailure(error: unknown): ClientCode | "webauthn_error" {
+  if (!(error instanceof DOMException)) return "webauthn_error";
+  switch (error.name) {
+    // WebAuthn reports a dismissed prompt and an expired one identically, by
+    // design: distinguishing them would tell a caller whether a credential
+    // exists on the authenticator. They are one case here for the same reason.
+    case "NotAllowedError":
+    case "AbortError":
+    case "TimeoutError":
+      return "passkey_cancelled";
+    // Registration only, and not really a failure: `excludeCredentials` matched,
+    // so this authenticator already holds a passkey for this account. The user
+    // should sign in, not enrol again.
+    case "InvalidStateError":
+      return "passkey_already_registered";
+    case "NotSupportedError":
+    case "ConstraintError":
+      return "passkey_unsupported";
+    // The page's origin does not match the relying-party ID the server issued.
+    // In practice this is a misconfiguration — `RP_ID` against `FRONTEND_ORIGIN`
+    // — and `Config::validate` in `src/config.rs` is what prevents it server
+    // side; this is the browser telling us it got through anyway.
+    case "SecurityError":
+      return "passkey_origin_mismatch";
+    default:
+      return "webauthn_error";
+  }
+}
+
 async function finishRegistration<T>(
   start: Challenge<ServerCreationOptions>,
   finishPath: string,
   name?: string,
 ): Promise<T> {
-  const cred = (await navigator.credentials.create(
-    decodeCreationOptions(start.options),
-  )) as PublicKeyCredential | null;
-  if (!cred) throw new Error("user cancelled passkey registration");
+  const cred = await ceremony(() => navigator.credentials.create(decodeCreationOptions(start.options)));
   return postJson<T>(finishPath, {
     challenge_id: start.challenge_id,
     response: encodeAttestation(cred),
@@ -315,10 +364,7 @@ export async function registerPasskey(name?: string): Promise<PasskeyDto> {
 
 export async function authenticatePasskey(): Promise<AuthResponse> {
   const start = await postJson<Challenge<ServerRequestOptions>>("/auth/passkey/authenticate/start");
-  const cred = (await navigator.credentials.get(
-    decodeRequestOptions(start.options),
-  )) as PublicKeyCredential | null;
-  if (!cred) throw new Error("user cancelled passkey authentication");
+  const cred = await ceremony(() => navigator.credentials.get(decodeRequestOptions(start.options)));
   return postJson<AuthResponse>("/auth/passkey/authenticate/finish", {
     challenge_id: start.challenge_id,
     response: encodeAssertion(cred),
@@ -339,10 +385,7 @@ type Reauthentication = { challenge_id: string; assertion: unknown };
  */
 export async function startReauth(): Promise<Reauthentication> {
   const start = await postJson<Challenge<ServerRequestOptions>>("/auth/reauth/start");
-  const cred = (await navigator.credentials.get(
-    decodeRequestOptions(start.options),
-  )) as PublicKeyCredential | null;
-  if (!cred) throw new Error("user cancelled re-authentication");
+  const cred = await ceremony(() => navigator.credentials.get(decodeRequestOptions(start.options)));
   return { challenge_id: start.challenge_id, assertion: encodeAssertion(cred) };
 }
 

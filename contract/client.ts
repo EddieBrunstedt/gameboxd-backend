@@ -12,13 +12,19 @@
 //
 // Authentication lives in `./auth.ts`; this file assumes a session cookie is
 // already present and sends `credentials: "include"` so the browser attaches it.
+//
+// It does not, however, own the authentication *errors*. Doorman's session
+// layer wraps these routes too, so any of them can reject with a Doorman code —
+// `session_not_found` on a missing cookie, `csrf_origin_mismatch` on a bad
+// Origin. Those codes and the predicates for them live in `./errors.ts`,
+// shared with `./auth.ts`, because a screen catching a 401 from `me()` needs
+// the same branch as one catching it from `logout()`.
 
 import type { CatalogGame } from "./types/CatalogGame";
 import type { CatalogPage } from "./types/CatalogPage";
 import type { CreatePlaythroughInput } from "./types/CreatePlaythroughInput";
 import type { EntryInput } from "./types/EntryInput";
 import type { ErrorBody } from "./types/ErrorBody";
-import type { ErrorCode } from "./types/ErrorCode";
 import type { FieldError } from "./types/FieldError";
 import type { Game } from "./types/Game";
 import type { LibraryEntry } from "./types/LibraryEntry";
@@ -31,6 +37,8 @@ import type { PlaythroughInput } from "./types/PlaythroughInput";
 import type { PlaythroughPatch } from "./types/PlaythroughPatch";
 import type { Profile } from "./types/Profile";
 import type { ProfileInput } from "./types/ProfileInput";
+
+import { type AnyErrorCode, GameboxdError } from "./errors";
 
 let baseUrl = "";
 
@@ -45,19 +53,25 @@ export function configureApi(options: { baseUrl: string }): void {
 /**
  * A non-2xx response from an application route.
  *
- * `code` is the closed union the backend publishes, so a caller can switch on
- * it exhaustively. `fields` is present exactly when individual fields were
- * rejected — by our own validation or by the JSON schema — and is the thing a
- * form should branch on, since both kinds arrive the same way.
+ * `code` spans two vocabularies, because these routes really do answer with
+ * both: `ErrorCode` for anything the application decided, and Doorman's codes
+ * for anything its session or CSRF layer decided before the handler ran. Typing
+ * it as `ErrorCode` alone made the sign-out branch — the single most common
+ * thing a screen does with an error — a comparison TypeScript rejected.
+ *
+ * `fields` is present exactly when individual fields were rejected — by our own
+ * validation or by the JSON schema — and is the thing a form should branch on,
+ * since both kinds arrive the same way. Only application validation produces
+ * it, so it is always empty on an error that came from the auth layers.
  */
-export class ApiError extends Error {
+export class ApiError extends GameboxdError {
   constructor(
-    readonly status: number,
-    readonly code: ErrorCode | null,
+    status: number,
+    code: AnyErrorCode | null,
     message: string,
     readonly fields: readonly FieldError[] = [],
   ) {
-    super(message);
+    super(status, code, message);
     this.name = "ApiError";
   }
 
@@ -74,6 +88,17 @@ export class ApiError extends Error {
 export function isStale(error: unknown): boolean {
   return error instanceof ApiError && error.code === "precondition_failed";
 }
+
+// Re-exported so a screen that only imports the application client still gets
+// the auth branches it cannot avoid needing.
+export {
+  GameboxdError,
+  isAccountDisabled,
+  isReauthRequired,
+  isRecoveryCooldown,
+  isSignedOut,
+} from "./errors";
+export type { AnyErrorCode, AuthCode, ClientCode } from "./errors";
 
 type Query = Record<string, string | number | undefined | null>;
 
@@ -108,6 +133,10 @@ async function request<T>(
 
 function toError(status: number, text: string): ApiError {
   try {
+    // `ErrorBody` is generated from the application's envelope, so it types
+    // `code` as `ErrorCode`. Doorman reuses the envelope's shape but not its
+    // code list, so the runtime value is wider than that type admits; widening
+    // it into `AnyErrorCode` here is what makes the auth branches expressible.
     const { error } = JSON.parse(text) as ErrorBody;
     return new ApiError(status, error.code, error.message, error.fields ?? []);
   } catch {

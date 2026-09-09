@@ -142,7 +142,28 @@ When a request body is rejected because of specific fields, the error carries a 
 
 Field codes are `required`, `out_of_range`, `too_long`, `invalid_format`, `before_start`, and `unknown_field`. `field` is the JSON name as sent. Every failing field of one submission is reported together, so a form marks everything it got wrong in a single round trip; `message` at the top level summarizes for a client that renders no per-field detail.
 
-Cross-field rules are attributed to the constrained field: a finish date before its start is reported against `finished_on`, which is the control a date picker can mark. Body routes report fields; query parameters and path segments do not, because no control owns them. A playthrough edit without `If-Match` returns 428 and one whose precondition no longer holds returns 412. Upstream failures return 502, unavailable/configuration/rate-limited upstreams return 503, and local catalog contention returns 429 with `Retry-After: 1`. Doorman auth errors retain Doorman's own codes, including `csrf_origin_mismatch` and `reauth_required`.
+Cross-field rules are attributed to the constrained field: a finish date before its start is reported against `finished_on`, which is the control a date picker can mark. Body routes report fields; query parameters and path segments do not, because no control owns them. A playthrough edit without `If-Match` returns 428 and one whose precondition no longer holds returns 412. Upstream failures return 502, unavailable/configuration/rate-limited upstreams return 503, and local catalog contention returns 429 with `Retry-After: 1`.
+
+### Authentication codes on application routes
+
+The list above is what the *application* emits. It is not everything an `/api` route can return. Doorman's session and CSRF layers wrap the whole router, so they reject before a handler runs and answer with their own codes in the same envelope:
+
+| Status | Code | When |
+| --- | --- | --- |
+| 401 | `session_not_found` | No session cookie or bearer token, or one that no longer validates |
+| 401 | `reauth_required` | The session is valid; this action needs a fresh passkey assertion |
+| 403 | `csrf_origin_mismatch` | A cookie-authenticated write with a missing or foreign `Origin`/`Referer` |
+| 403 | `account_disabled` | The account exists but is not active |
+
+**An expired session reports `session_not_found`, not `session_expired`.** The session layer attaches no context for a session it could not validate, so the extractor behind every authenticated route cannot tell "expired" from "never existed". `session_expired` exists, but only `/auth` routes that consult the session manager directly can produce it. A client that branches only on `session_expired` will never fire; branch on both, or use `isSignedOut` from the contract, which does.
+
+These codes are published as the `AuthCode` union in `contract/errors.ts`, checked against Doorman's own `classify` at the pinned revision by `tests/contract.rs`. `ApiError.code` and `AuthError.code` are both typed `AnyErrorCode`, the union of that set with this application's `ErrorCode` and the browser-side ceremony codes below, because all three genuinely arrive at the same `catch`.
+
+**Never branch on the status alone.** `session_not_found` and `reauth_required` are both 401 and mean opposite things: one requires sending the user to sign in, the other requires keeping them exactly where they are and asking for a passkey. Treating the second as the first discards the user's work at the moment the server asked them to confirm their identity.
+
+### Browser-side passkey codes
+
+`navigator.credentials.create()` and `.get()` reject with a `DOMException`; they do not resolve `null`. These never come from the server, and `contract/auth.ts` translates them so a caller handles them in the same place as everything else: `passkey_cancelled` (dismissed or timed out — WebAuthn reports those identically), `passkey_already_registered` (this authenticator already holds a credential for the account), `passkey_unsupported` (no WebAuthn, or an insecure context), and `passkey_origin_mismatch` (the page's origin does not match the relying-party ID). A cancelled prompt is an ordinary outcome and usually deserves no error message at all.
 
 `ETag` and `Retry-After` are exposed to the browser through CORS, and `If-Match` is an allowed request header, so a `fetch` may both read a tag and send one back. Every response carries an `x-request-id` for correlation. App/auth responses use `Cache-Control: no-store` to avoid leaking private or auth data through shared browser caches. No database details, upstream response bodies or credentials are returned in app errors.
 

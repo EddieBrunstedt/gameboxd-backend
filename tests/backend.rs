@@ -2484,3 +2484,91 @@ async fn a_save_queues_the_refresh_it_no_longer_waits_for() {
     );
     fixture.finish().await;
 }
+
+/// Application routes reject with Doorman's codes, not the application's.
+///
+/// This is the contract the SPA's sign-out branch is written against, and until
+/// now nothing pinned it: the existing tests assert `401` and stop, so the
+/// published `ErrorCode` union could — and did — omit every code these routes
+/// actually return when a session is missing. `contract/errors.ts` names them in
+/// `AuthCode`, and `tests/contract.rs` holds that union to Doorman's own
+/// `classify`; this test is the other half, fixing which of those codes an
+/// `/api` route really produces.
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn application_routes_reject_with_doorman_authentication_codes() {
+    let fixture = Fixture::new().await;
+    let (_, token) = fixture.user("codes").await;
+
+    // Every authenticated application route, with no credentials at all.
+    for (method, path) in [
+        ("GET", "/api/me"),
+        ("PUT", "/api/me"),
+        ("GET", "/api/me/library"),
+        ("PUT", "/api/me/library/42"),
+        ("GET", "/api/me/playthroughs"),
+        ("POST", "/api/me/playthroughs"),
+        ("POST", "/api/catalog/import/42"),
+    ] {
+        let body = json_body(
+            fixture.call(method, path, None, json!({})).await,
+            StatusCode::UNAUTHORIZED,
+        )
+        .await;
+        assert_eq!(
+            body["error"]["code"], "session_not_found",
+            "{method} {path} should reject with Doorman's session code"
+        );
+        // The auth layers share the error envelope but never populate `fields`;
+        // a client branching on its presence must not see one here.
+        assert!(
+            body["error"].get("fields").is_none(),
+            "{method} {path} should carry no field errors"
+        );
+    }
+
+    // A token that never existed is not distinguishable from an expired one.
+    let unknown = json_body(
+        fixture
+            .call("GET", "/api/me", Some("not-a-real-token"), Value::Null)
+            .await,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    assert_eq!(unknown["error"]["code"], "session_not_found");
+
+    // A revoked session reads the same way. This is why `isSignedOut` in the
+    // contract accepts `session_not_found` as well as `session_expired`: the
+    // session layer attaches no context for a session it could not validate, so
+    // the `AuthUser` extractor cannot tell "expired" from "never existed", and
+    // an SPA branching only on `session_expired` would never fire.
+    assert_eq!(
+        fixture
+            .call("POST", "/auth/logout", Some(&token), json!({}))
+            .await
+            .status(),
+        204
+    );
+    let revoked = json_body(
+        fixture
+            .call("GET", "/api/me", Some(&token), Value::Null)
+            .await,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    assert_eq!(
+        revoked["error"]["code"], "session_not_found",
+        "a revoked session must not report itself as expired"
+    );
+
+    // Public routes stay public: the session layer must not turn a missing
+    // cookie into a rejection on a route that never required one.
+    assert_eq!(
+        fixture
+            .call("GET", "/api/games", None, Value::Null)
+            .await
+            .status(),
+        200
+    );
+    fixture.finish().await;
+}

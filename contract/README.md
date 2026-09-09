@@ -12,10 +12,12 @@ package, whichever it turns out to want.
 ```
 contract/
   types/                     generated from the Rust structs; never edit
+  errors.ts                  the code vocabulary and predicates both clients share
   client.ts                  typed client for /api routes
   auth.ts                    browser adapter for /auth routes
   doorman/passkey.upstream.ts  pristine copy of Doorman's reference client
   index.ts                   what a consumer imports
+  tsconfig.json              type-check settings; no build, `noEmit` is set
 ```
 
 ## What is generated, and what is not
@@ -47,9 +49,40 @@ hand what fails loudly.
 
 `tests/contract.rs` checks the parts that are hand-written: that `client.ts`
 only imports types that were actually generated, that every `ErrorCode` variant
-appears in `docs/api.md`, and the two Doorman checks below.
+appears in `docs/api.md`, that every published code a user can act on has
+guidance copy, and the two Doorman checks below.
 
 ## Errors
+
+`errors.ts` holds the vocabulary, because errors are the one thing that does not
+split cleanly along the `/api` and `/auth` line. Doorman's session layer fronts
+the whole router, so an application route rejects with *Doorman's* codes when
+there is no session — `GET /api/me` without a cookie is `401 session_not_found`.
+
+That is what the readiness review found: `ApiError.code` was typed as the
+generated `ErrorCode` union, which deliberately excludes Doorman's codes, so
+`error.code === "session_not_found"` was a comparison TypeScript rejected as
+impossible. The sign-out branch every screen needs could not be written. Both
+clients now throw errors extending one `GameboxdError` base, `code` is typed
+`AnyErrorCode` — the application's codes, Doorman's, and the browser-side
+ceremony codes — and the predicates work on either class:
+
+- `isSignedOut` — the session is gone; sign-in is the only way forward. Accepts
+  `session_not_found` **and** `session_expired`, because an expired cookie on an
+  application route reads as the former: the session layer attaches no context
+  for a session it could not validate, and the extractor cannot tell "expired"
+  from "never existed".
+- `isReauthRequired` — the session is fine and the action needs fresh proof.
+  Also a 401. **Never branch on the status alone.**
+- `isPasskeyCancelled` — the user dismissed the prompt. Usually deserves no
+  message at all.
+- `isAccountDisabled`, `isRecoveryCooldown`, and `isStale` in `client.ts`.
+
+`AuthCode` is hand-written and drift-checked against Doorman's own `classify` at
+the pinned revision by `tests/contract.rs`, in both directions, so a moved pin
+that adds or renames a code fails the build rather than leaving a union quietly
+behind. `ERROR_GUIDANCE` maps every code a user can act on to product copy; a
+missing entry is a test failure too.
 
 `ApiError` in `client.ts` carries the `code` union, the message, and `fields`.
 
@@ -72,7 +105,7 @@ by `tests/contract.rs`. When the pin moves and that file changed, the test
 fails: copy the new upstream over it and re-derive the adapter from the diff.
 Nothing about the auth surface is inherited silently.
 
-Gameboxd changes three things, all of which the diff shows:
+Gameboxd changes four things, all of which the diff shows:
 
 - **A base URL.** The SPA and the API are separate origins; the upstream
   reference assumes it is served from the backend's origin.
@@ -80,10 +113,26 @@ Gameboxd changes three things, all of which the diff shows:
   hands the resulting 401 to the caller. `withReauth` runs the step-up ceremony
   and retries once, so removing a passkey, changing an email or deleting an
   account works without the UI reimplementing it three times.
-- **`isSignedOut` / `isReauthRequired`.** Both are 401. Redirecting to sign-in
-  on every 401 would throw away whatever the user was in the middle of doing at
-  the exact moment the server asked them to confirm it was them. **Never branch
-  on the status alone.**
+- **The error vocabulary**, moved to `errors.ts` and shared with `client.ts`.
+  Upstream's predicates only understood upstream's error class, which is wrong
+  for every screen that calls an `/api` route.
+- **Ceremony failures.** `navigator.credentials.create()` and `.get()` *reject*
+  with a `DOMException` rather than resolving `null`, so upstream's `if (!cred)`
+  guard almost never fires and a dismissed prompt — the most common outcome of
+  all — escapes as an unrecognised exception carrying browser-authored text.
+  They are translated into `AuthError`s with the `ClientCode` codes instead.
+
+## Type-checking
+
+There is still no build step and no `package.json`. `tsconfig.json` sets
+`noEmit` and exists so the files can be proven strict-clean:
+
+```sh
+tsc -p contract     # or: npx -y -p typescript@7.0.2 tsc -p contract
+```
+
+CI runs this. It has to: the bug above was a type error and nothing in the Rust
+suite could see it.
 
 ## Using it
 

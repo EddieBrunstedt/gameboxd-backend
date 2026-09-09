@@ -4,6 +4,9 @@
 // See ./README.md for what is generated, what is hand-written, and how each
 // half is kept from drifting away from the server.
 
+// `errors` first: both clients re-export parts of it, and a single source for
+// the shared names keeps the star exports from colliding.
+export * from "./errors";
 export * from "./client";
 export * from "./auth";
 
