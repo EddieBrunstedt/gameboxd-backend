@@ -27,6 +27,13 @@ Base URL: `http://localhost:3000`. All bodies are JSON unless a response is `204
 | PUT | `/api/me/playthroughs/{id}` | Yes | Replace every editable field; requires `If-Match` |
 | PATCH | `/api/me/playthroughs/{id}` | Yes | Change only the fields present; requires `If-Match` |
 | DELETE | `/api/me/playthroughs/{id}` | Yes | Delete own playthrough (idempotent 204; `If-Match` optional) |
+| GET | `/api/me/diary?limit=20&offset=0` | Yes | Own diary notes across all playthroughs, with game context |
+| GET | `/api/me/playthroughs/{id}/notes?limit=20&offset=0` | Yes | Own notes for one playthrough |
+| POST | `/api/me/playthroughs/{id}/notes` | Yes | Create a private note (201) |
+| GET | `/api/me/notes/{id}` | Yes | Own note, with revision ETag |
+| PUT | `/api/me/notes/{id}` | Yes | Replace note text/date; requires `If-Match` |
+| PATCH | `/api/me/notes/{id}` | Yes | Edit note text/date; requires `If-Match` |
+| DELETE | `/api/me/notes/{id}` | Yes | Delete note (204); requires `If-Match` |
 
 A stored game includes `id`, `igdb_id`, `name`, `slug`, nullable `summary`, `cover_url`, `first_release_date`, arrays of `{id,name}` for `platforms`, `genres`, `developers`, nullable `game_type`, `parent_igdb_id`, `version_parent_igdb_id`, `source_url`, `imported_at` and `refreshed_at`. Taxonomy/parent IDs are upstream IGDB IDs, not local UUIDs. The `game` nested in a library listing is that same object, field for field.
 
@@ -105,6 +112,32 @@ Ownership is resolved before the precondition, so another user's playthrough ans
 
 Library entries carry no entity tag. `status` is the only writable field there, so each `PUT` sends a complete intent and can discard nothing; the derived `rating` in its response is owned by playthroughs, so a tag on that route would not describe the representation it returned. Ratings and reviews are edited through the playthrough routes, where the preconditions above apply.
 
+### Dated diary notes
+
+Each playthrough can have multiple independent plain-text notes alongside its overall rating/review. Notes can be recorded on any run, including completed, abandoned, detached, or undated runs. All note routes are authenticated and owner-only. There is no visibility input or public note endpoint in this feature.
+
+`POST /api/me/playthroughs/{id}/notes` and `PUT /api/me/notes/{id}` accept:
+
+```json
+{"text":"Reached the mountain village.\nThe soundtrack is excellent.","presentation_on":"2020-06-15"}
+```
+
+`text` is required, non-null, nonblank, and limited to 10,000 Unicode characters. NUL is rejected. Text is stored verbatim, preserving line breaks and surrounding whitespace; render it as plain text. `presentation_on` is an optional nullable calendar day. Omission on POST/PUT means unknown. `PATCH` preserves omitted fields; an explicit null clears only the date, never text. An empty PATCH is a no-op. Unknown fields, including owner, parent, revision, and visibility, are rejected. Neither parent nor game can be reassigned.
+
+A `DiaryNote` returns `id`, `playthrough_id`, `igdb_id`, `game_name`, `game_slug`, nullable `cover_url`, `text`, nullable `presentation_on`, `version`, `created_at`, and `updated_at`. All game context comes from the local catalog without IGDB requests or refresh dependencies. Single-note GET and successful POST/PUT/PATCH include an ETag containing the quoted decimal note version. Lists include the same body shape and version.
+
+PUT, PATCH, and DELETE require `If-Match`: missing is `428 precondition_required`, malformed is `400 validation_error`, and a stale or weak-only tag is `412 precondition_failed`. Lists of strong tags and `*` follow the playthrough precondition rules; `*` explicitly accepts whichever version exists. Missing/other-owner notes and playthroughs return `404 not_found`, including nested note lists, without revealing revisions. A deleted note returns 404 on a subsequent conditional deletion. Schema failures return `422 invalid_json`; invalid text returns field-specific `400 validation_error`.
+
+`GET /api/me/diary` lists notes across all of the owner's playthroughs. `GET /api/me/playthroughs/{id}/notes` lists that owner's notes for one run; an existing run without notes returns an empty page. Both return `{data,limit,offset,has_more}`. They accept only `limit` (1–50, default 20) and `offset` (0–10000, default 0), and fetch one extra owner-scoped row to determine `has_more`. The diary is a note collection; overall experiences/reviews remain in `/api/me/playthroughs`.
+
+Both lists use `presentation_on DESC NULLS LAST, id DESC`, exactly the [historical chronology policy](#historical-chronology-policy). Note dates are independent of parent presentation/start/end dates, with no inferred dates, range restrictions, or timezone conversion. Backdates and future dates are allowed. Text edits preserve historical position; date edits reposition the note. Unknown dates remain at the end with deterministic random-UUID ties. Actual write/edit timestamps never order notes. Offset pages reflect current data on each read, so intervening inserts, deletes, or date corrections can shift boundaries; restart paging after such changes. Text-only edits do not shift boundaries. Rich filtering/pagination belongs to feature 6.
+
+Notes have independent revisions: changing a note does not change the parent's revision, review, rating, lifecycle, or library status. No-op writes preserve the note's timestamps and revision. Note writes lock the parent against deletion before locking the note, so simultaneous edits merge/check against the locked revision and parent deletion cannot leave orphaned rows. They do not participate in current-run state changes.
+
+Removing library membership or starting a replay preserves all previous notes on their original playthrough IDs. Deleting a playthrough deliberately cascades to **all its notes** in the same transaction; deleting the account removes them too. The playthrough's own revision does not cover its notes: deleting that aggregate removes even independently revised notes. Note-only deletion checks the note's own revision and preserves the parent/review/siblings. Creation always uses a new UUID; uncertain POST retries can duplicate notes until feature 12 adds idempotency keys.
+
+Migration `202609090003_diary_notes.sql` adds an empty note table without deriving notes from reviews, inventing historical dates, changing existing playthrough content/revisions, or publishing data. Feature 4 must give notes independent visibility and separate public-safe projections; these owner DTOs and revision ETags must remain private.
+
 ### Current playthrough lifecycle
 
 A user can have **one current run per game**, either active or paused, and can play multiple different games at once. Historical entries may describe other active/paused experiences without controlling present status. A library entry may also use any status without a current run, supporting lightweight tracking with no invented history. `current_playthrough_id` is null in that case.
@@ -158,7 +191,7 @@ The presentation-date migration leaves every existing `presentation_on` null, ev
 
 Personal content remains private in this feature. The authenticated `Playthrough` DTO and its revision `ETag` are owner-only contracts. Public endpoints must define separate projections; they must not reuse this DTO or its tags.
 
-Future notes and list/summary events must store an explicit nullable historical day and use descending day, nulls last, then a stable random identifier. Profiles and feeds must use the same policy. A feed spanning resource kinds needs globally unique random item IDs (or a stable kind discriminator as a final collision tie-breaker), with one identity per underlying item. Publishing or editing an item must not manufacture a current-day event. Unknown dates remain undated in unfiltered lists and do not acquire a year in date-filtered statistics. Play/completion statistics may use explicitly supplied play/milestone dates for the metric they describe; a review date is not proof of play or completion.
+Notes use an explicit nullable historical day, ordered descending with nulls last, then a stable random identifier. Future list/summary events must follow the same policy. Profiles and feeds must use the same policy. A feed spanning resource kinds needs globally unique random item IDs (or a stable kind discriminator as a final collision tie-breaker), with one identity per underlying item. Publishing or editing an item must not manufacture a current-day event. Unknown dates remain undated in unfiltered lists and do not acquire a year in date-filtered statistics. Play/completion statistics may use explicitly supplied play/milestone dates for the metric they describe; a review date is not proof of play or completion.
 
 A public review or rating may expose its chosen `presentation_on` but must not fall back to private play dates. Playthrough dates, platform, status, other ratings, and notes require their own visibility authorization. Public rating selection must apply the same ordering **only after** filtering to eligible public ratings from enabled public profiles; a private rating must not affect the value, source, ordering, or count.
 

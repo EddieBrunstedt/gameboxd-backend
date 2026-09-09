@@ -16,6 +16,8 @@ use sqlx::FromRow;
 use ts_rs::TS;
 use uuid::Uuid;
 
+mod notes;
+
 use crate::{
     AppState,
     error::{ApiError, ApiResult, ErrorCode, FieldError, FieldErrorCode},
@@ -28,6 +30,7 @@ use crate::{
 
 pub fn routes() -> Router<AppState> {
     Router::new()
+        .merge(notes::routes())
         .route("/api/me", get(me).put(update_profile))
         .route("/api/games", get(games))
         .route("/api/games/{igdb_id}", get(game))
@@ -991,7 +994,7 @@ fn stale() -> ApiError {
     ApiError::new(
         StatusCode::PRECONDITION_FAILED,
         ErrorCode::PreconditionFailed,
-        "The playthrough changed since it was read; reload it and reapply the edit",
+        "The record changed since it was read; reload it and reapply the edit",
     )
 }
 

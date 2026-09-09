@@ -174,3 +174,15 @@ status. Library entries identify the current run with `current_playthrough_id`.
 Conflicting status-only writes or invalid lifecycle actions return
 `409 lifecycle_conflict`. Library removal detaches the current run without
 removing history. See [lifecycle semantics](../docs/api.md#current-playthrough-lifecycle).
+
+`diary()` lists the owner's notes across all playthroughs; `playthroughNotes(id)`
+limits them to one run. Both return paginated `DiaryNote` values with local game
+context. `createNote(id, input)` attaches a private note to that run.
+`replaceNote`, `updateNote`, and `deleteNote` require the current note object and
+send its independent revision through `If-Match`; `isStale` handles conflicts.
+Text is required and nonblank. PUT requires text and clears an omitted date;
+PATCH preserves omitted fields and permits null only for `presentation_on`.
+Dates and ordering follow the same historical policy as playthroughs. Removing
+library membership or replaying preserves notes; deleting a playthrough deletes
+all its notes. These types contain owner-only bookkeeping and are not public
+sharing representations. See [note semantics](../docs/api.md#dated-diary-notes).

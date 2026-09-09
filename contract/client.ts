@@ -20,6 +20,9 @@
 // shared with `./auth.ts`, because a screen catching a 401 from `me()` needs
 // the same branch as one catching it from `logout()`.
 
+import type { DiaryNote } from "./types/DiaryNote";
+import type { NoteInput } from "./types/NoteInput";
+import type { NotePatch } from "./types/NotePatch";
 import type { CatalogGame } from "./types/CatalogGame";
 import type { CatalogPage } from "./types/CatalogPage";
 import type { CreatePlaythroughInput } from "./types/CreatePlaythroughInput";
@@ -84,7 +87,7 @@ export class ApiError extends GameboxdError {
 }
 
 /**
- * True when a playthrough edit lost a race and must be reloaded and reapplied.
+ * True when a playthrough or note edit lost a race and must be reloaded and reapplied.
  * See `edit` below for why every edit carries a precondition in the first place.
  */
 export function isStale(error: unknown): boolean {
@@ -285,3 +288,34 @@ export const deletePlaythrough = (target: Playthrough | string): Promise<void> =
     : request("DELETE", `/api/me/playthroughs/${target.id}`, {
         ifMatch: precondition(target),
       });
+
+// --- Private diary notes --------------------------------------------------
+
+/** All of the owner's notes, ordered by chosen day, unknown dates last. */
+export const diary = (
+  query: { limit?: number; offset?: number } = {},
+): Promise<Page<DiaryNote>> => request("GET", "/api/me/diary", { query });
+
+export const playthroughNotes = (
+  playthroughId: string,
+  query: { limit?: number; offset?: number } = {},
+): Promise<Page<DiaryNote>> =>
+  request("GET", `/api/me/playthroughs/${playthroughId}/notes`, { query });
+
+export const note = (id: string): Promise<DiaryNote> =>
+  request("GET", `/api/me/notes/${id}`);
+
+export const createNote = (playthroughId: string, input: NoteInput): Promise<DiaryNote> =>
+  request("POST", `/api/me/playthroughs/${playthroughId}/notes`, { body: input });
+
+/** Replaces text and chosen day; omission of the day clears it. */
+export const replaceNote = (current: DiaryNote, input: NoteInput): Promise<DiaryNote> =>
+  request("PUT", `/api/me/notes/${current.id}`, { body: input, ifMatch: precondition(current) });
+
+/** Omitted fields are preserved; only presentation_on accepts null. */
+export const updateNote = (current: DiaryNote, patch: NotePatch): Promise<DiaryNote> =>
+  request("PATCH", `/api/me/notes/${current.id}`, { body: patch, ifMatch: precondition(current) });
+
+/** Deletion requires the note's revision, just like an edit. */
+export const deleteNote = (current: DiaryNote): Promise<void> =>
+  request("DELETE", `/api/me/notes/${current.id}`, { ifMatch: precondition(current) });

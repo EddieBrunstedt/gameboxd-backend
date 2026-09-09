@@ -51,3 +51,7 @@ export type { PlaythroughState } from "./types/PlaythroughState";
 export type { StartPlaythroughInput } from "./types/StartPlaythroughInput";
 export type { LifecycleAction } from "./types/LifecycleAction";
 export type { LifecycleInput } from "./types/LifecycleInput";
+
+export type { DiaryNote } from "./types/DiaryNote";
+export type { NoteInput } from "./types/NoteInput";
+export type { NotePatch } from "./types/NotePatch";

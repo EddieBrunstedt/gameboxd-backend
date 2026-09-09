@@ -2230,11 +2230,12 @@ async fn migration_preserves_legacy_reviews_without_inventing_play_dates() {
         .await;
     // Restore the exact old library shape in this disposable database, then
     // exercise the real migrator, including its migration history and restart.
-    sqlx::raw_sql("DROP VIEW library_entry_details; DROP TABLE playthroughs;
+    sqlx::raw_sql("DROP VIEW diary_note_details; DROP TABLE diary_notes; DROP FUNCTION diary_note_revision();
+        DROP VIEW library_entry_details; DROP TABLE playthroughs;
         DROP FUNCTION playthrough_revision();
         ALTER TABLE library_entries ADD COLUMN rating SMALLINT CHECK (rating BETWEEN 1 AND 10),
         ADD COLUMN review TEXT CHECK (char_length(review) <= 10000);
-        DELETE FROM _sqlx_migrations WHERE version IN (202609080002,202609080003,202609090001,202609090002);
+        DELETE FROM _sqlx_migrations WHERE version IN (202609080002,202609080003,202609090001,202609090002,202609090003);
         INSERT INTO games (id,igdb_id,name,slug,source_url)
         SELECT gen_random_uuid(),n,'Legacy game','legacy-game','https://www.igdb.com' FROM generate_series(43,45) n;")
         .execute(&fixture.database.app).await.unwrap();
@@ -3543,4 +3544,585 @@ async fn presentation_date_migration_preserves_existing_dates_and_revisions() {
     );
     assert!(migrated["presentation_on"].is_null());
     fixture.finish().await;
+}
+
+impl Fixture {
+    async fn note(&self, token: &str, parent: &Value, text: &str, day: Option<&str>) -> Value {
+        self.value(
+            "POST",
+            &format!(
+                "/api/me/playthroughs/{}/notes",
+                parent["id"].as_str().unwrap()
+            ),
+            token,
+            json!({"text":text,"presentation_on":day}),
+            StatusCode::CREATED,
+        )
+        .await
+    }
+}
+
+fn note_path(note: &Value) -> String {
+    format!("/api/me/notes/{}", note["id"].as_str().unwrap())
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn diary_notes_keep_independent_history_and_local_game_context() {
+    let f = Fixture::new().await;
+    let (_, token) = f.user("notes-history").await;
+    let parent = f.value("POST", "/api/me/playthroughs", &token,
+        json!({"igdb_id":42,"review":"Overall review","rating":8,"presentation_on":"2025-01-01"}), StatusCode::CREATED).await;
+    let old = f
+        .note(
+            &token,
+            &parent,
+            "First session\n  With formatting",
+            Some("2020-01-01"),
+        )
+        .await;
+    let recent = f
+        .note(&token, &parent, "Last session", Some("2021-01-01"))
+        .await;
+    let unknown = f.note(&token, &parent, "Unknown day", None).await;
+    let tied = f.note(&token, &parent, "Another unknown", None).await;
+    // Opposing recording times cannot influence ordering or historical dates.
+    sqlx::query("UPDATE diary_notes SET created_at=CASE WHEN id=$1 THEN '2099-01-01'::timestamptz ELSE '1900-01-01'::timestamptz END")
+        .bind(Uuid::parse_str(old["id"].as_str().unwrap()).unwrap()).execute(&f.database.app).await.unwrap();
+    let old = f
+        .value("GET", &note_path(&old), &token, Value::Null, StatusCode::OK)
+        .await;
+    // No note route may require IGDB, even if all stored metadata is stale.
+    sqlx::query("UPDATE games SET refreshed_at='2000-01-01'::timestamptz")
+        .execute(&f.database.app)
+        .await
+        .unwrap();
+    let lookups = provider_lookups(&f).await;
+    let edited = f
+        .edit(
+            "PATCH",
+            &note_path(&old),
+            &token,
+            &tag(&old),
+            json!({"text":"Revised old session"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(edited["presentation_on"], "2020-01-01");
+    assert_eq!(edited["created_at"], old["created_at"]);
+    assert_eq!(
+        edited["version"].as_i64().unwrap(),
+        old["version"].as_i64().unwrap() + 1
+    );
+    assert_ne!(edited["updated_at"], old["updated_at"]);
+    let noop = f
+        .edit(
+            "PATCH",
+            &note_path(&edited),
+            &token,
+            &tag(&edited),
+            json!({}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(noop, edited);
+    let nested = format!(
+        "/api/me/playthroughs/{}/notes",
+        parent["id"].as_str().unwrap()
+    );
+    let page = f
+        .value(
+            "GET",
+            "/api/me/diary?limit=2",
+            &token,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(page["has_more"], true);
+    assert_eq!(page["data"][0]["id"], recent["id"]);
+    assert_eq!(page["data"][1], edited);
+    let last = f
+        .value(
+            "GET",
+            "/api/me/diary?limit=2&offset=2",
+            &token,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    let mut ids = [
+        unknown["id"].as_str().unwrap(),
+        tied["id"].as_str().unwrap(),
+    ];
+    ids.sort_by(|a, b| b.cmp(a));
+    assert_eq!(last["has_more"], false);
+    assert_eq!(last["data"][0]["id"], ids[0]);
+    assert_eq!(last["data"][1]["id"], ids[1]);
+    let all = f
+        .value("GET", &nested, &token, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(all["data"].as_array().unwrap().len(), 4);
+    for row in all["data"].as_array().unwrap() {
+        assert_eq!(row["igdb_id"], 42);
+        assert_eq!(row["game_name"], "Test Game");
+        assert_eq!(row["game_slug"], "test-game");
+        assert!(row.get("cover_url").is_some());
+        assert_eq!(row["playthrough_id"], parent["id"]);
+    }
+    let backdated = f
+        .edit(
+            "PATCH",
+            &note_path(&recent),
+            &token,
+            "*",
+            json!({"presentation_on":"2019-12-31"}),
+            StatusCode::OK,
+        )
+        .await;
+    let reordered = f
+        .value("GET", "/api/me/diary", &token, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(reordered["data"][0], edited);
+    assert_eq!(reordered["data"][1], backdated);
+    let replaced = f
+        .edit(
+            "PUT",
+            &note_path(&backdated),
+            &token,
+            &tag(&backdated),
+            json!({"text":"Replacement"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert!(replaced["presentation_on"].is_null());
+    let dated = f
+        .edit(
+            "PATCH",
+            &note_path(&replaced),
+            &token,
+            &tag(&replaced),
+            json!({"presentation_on":"2030-02-01"}),
+            StatusCode::OK,
+        )
+        .await;
+    let cleared = f
+        .edit(
+            "PATCH",
+            &note_path(&dated),
+            &token,
+            &tag(&dated),
+            json!({"presentation_on":null}),
+            StatusCode::OK,
+        )
+        .await;
+    assert!(cleared["presentation_on"].is_null());
+    let unchanged = f
+        .value(
+            "GET",
+            &format!("/api/me/playthroughs/{}", parent["id"].as_str().unwrap()),
+            &token,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        unchanged, parent,
+        "notes never replace reviews or revise their parent"
+    );
+    assert_eq!(provider_lookups(&f).await, lookups);
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn diary_notes_enforce_ownership_validation_and_revision_preconditions() {
+    let f = Fixture::new().await;
+    let (alice_id, alice) = f.user("note-owner").await;
+    let (_, bob) = f.user("note-other").await;
+    let parent = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &alice,
+            json!({"igdb_id":42}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let nested = format!(
+        "/api/me/playthroughs/{}/notes",
+        parent["id"].as_str().unwrap()
+    );
+    let note = f
+        .note(&alice, &parent, "Private note", Some("2020-01-01"))
+        .await;
+    let path = note_path(&note);
+    let read = f.call("GET", &path, Some(&alice), Value::Null).await;
+    assert_eq!(read.headers()["etag"], tag(&note));
+    for (method, url, body) in [
+        ("GET", path.as_str(), Value::Null),
+        ("GET", nested.as_str(), Value::Null),
+        ("GET", "/api/me/diary", Value::Null),
+        ("POST", nested.as_str(), json!({"text":"Unauthorized"})),
+        ("PUT", path.as_str(), json!({"text":"Unauthorized"})),
+        ("PATCH", path.as_str(), json!({"text":"Unauthorized"})),
+        ("DELETE", path.as_str(), Value::Null),
+    ] {
+        assert_eq!(
+            f.send(method, url, None, &[("If-Match", "\"1\"")], body.clone())
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        if url == "/api/me/diary" {
+            continue;
+        }
+        let rejected = json_body(
+            f.send(method, url, Some(&bob), &[("If-Match", "\"999\"")], body)
+                .await,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+        assert_eq!(rejected["error"]["code"], "not_found");
+    }
+    let bob_diary = f
+        .value(
+            "GET",
+            "/api/me/diary?limit=1",
+            &bob,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(bob_diary["data"], json!([]));
+    assert_eq!(bob_diary["has_more"], false);
+    for method in ["PUT", "PATCH", "DELETE"] {
+        f.value(
+            method,
+            &path,
+            &alice,
+            json!({"text":"Missing revision"}),
+            StatusCode::PRECONDITION_REQUIRED,
+        )
+        .await;
+        for (etag, status) in [
+            ("1", StatusCode::BAD_REQUEST),
+            ("W/\"1\"", StatusCode::PRECONDITION_FAILED),
+            ("\"999\"", StatusCode::PRECONDITION_FAILED),
+        ] {
+            f.edit(method, &path, &alice, etag, json!({"text":"Stale"}), status)
+                .await;
+        }
+    }
+    for payload in [
+        json!({}),
+        json!({"text":null}),
+        json!({"text":12}),
+        json!({"text":"a","presentation_on":"2020-02-30"}),
+        json!({"text":"a","user_id":alice_id.0.to_string()}),
+        json!({"text":"a","playthrough_id":parent["id"]}),
+        json!({"text":"a","visibility":"public"}),
+    ] {
+        f.value(
+            "POST",
+            &nested,
+            &alice,
+            payload,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+    }
+    for text in [
+        "".to_owned(),
+        " \n\t\u{2003}".to_owned(),
+        "x".repeat(10_001),
+        "a\0b".to_owned(),
+    ] {
+        for method in ["POST", "PUT", "PATCH"] {
+            let url = if method == "POST" { &nested } else { &path };
+            let error = f
+                .edit(
+                    method,
+                    url,
+                    &alice,
+                    &tag(&note),
+                    json!({"text":text}),
+                    StatusCode::BAD_REQUEST,
+                )
+                .await;
+            assert_eq!(error["error"]["fields"][0]["field"], "text");
+        }
+    }
+    f.edit(
+        "PATCH",
+        &path,
+        &alice,
+        &tag(&note),
+        json!({"text":null}),
+        StatusCode::UNPROCESSABLE_ENTITY,
+    )
+    .await;
+    let unicode = "🎮".repeat(10_000);
+    let saved = f
+        .edit(
+            "PUT",
+            &path,
+            &alice,
+            &tag(&note),
+            json!({"text":unicode}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(saved["text"], unicode);
+    for query in ["limit=0", "limit=51", "offset=10001", "offset=-1", "q=test"] {
+        for url in [
+            format!("/api/me/diary?{query}"),
+            format!("{nested}?{query}"),
+        ] {
+            f.value("GET", &url, &alice, Value::Null, StatusCode::BAD_REQUEST)
+                .await;
+        }
+    }
+    f.edit(
+        "DELETE",
+        &path,
+        &alice,
+        &tag(&note),
+        Value::Null,
+        StatusCode::PRECONDITION_FAILED,
+    )
+    .await;
+    f.edit(
+        "DELETE",
+        &path,
+        &alice,
+        &tag(&saved),
+        Value::Null,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    f.edit(
+        "DELETE",
+        &path,
+        &alice,
+        &tag(&saved),
+        Value::Null,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    f.value("GET", &path, &alice, Value::Null, StatusCode::NOT_FOUND)
+        .await;
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn diary_notes_survive_membership_removal_and_replay_but_follow_parent_and_account_deletion()
+{
+    let f = Fixture::new().await;
+    let (id, token) = f.user("note-retention").await;
+    let run = f
+        .value(
+            "POST",
+            "/api/me/playthroughs/start",
+            &token,
+            json!({"igdb_id":42}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let note = f.note(&token, &run, "First run", Some("2020-01-01")).await;
+    f.lifecycle(&token, &run, json!({"action":"complete"}), StatusCode::OK)
+        .await;
+    let replay = f
+        .value(
+            "POST",
+            "/api/me/playthroughs/start",
+            &token,
+            json!({"igdb_id":42}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let replay_note = f.note(&token, &replay, "Replay note", None).await;
+    f.value(
+        "DELETE",
+        "/api/me/library/42",
+        &token,
+        Value::Null,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    for expected in [&note, &replay_note] {
+        let stored = f
+            .value(
+                "GET",
+                &note_path(expected),
+                &token,
+                Value::Null,
+                StatusCode::OK,
+            )
+            .await;
+        assert_eq!(stored, *expected);
+    }
+    f.value(
+        "DELETE",
+        &format!("/api/me/playthroughs/{}", run["id"].as_str().unwrap()),
+        &token,
+        Value::Null,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    f.value(
+        "GET",
+        &note_path(&note),
+        &token,
+        Value::Null,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    let diary = f
+        .value("GET", "/api/me/diary", &token, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(diary["data"], json!([replay_note]));
+    let gone = format!("/api/me/playthroughs/{}/notes", run["id"].as_str().unwrap());
+    f.value("GET", &gone, &token, Value::Null, StatusCode::NOT_FOUND)
+        .await;
+    f.value(
+        "POST",
+        &gone,
+        &token,
+        json!({"text":"Too late"}),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    f.auth
+        .state()
+        .operator()
+        .delete_account(
+            id,
+            OperatorActor::new("integration-test", None, None, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM diary_notes")
+        .fetch_one(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn concurrent_note_writes_and_parent_deletion_are_consistent() {
+    let f = Fixture::new().await;
+    let (_, token) = f.user("note-races").await;
+    let parent = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &token,
+            json!({"igdb_id":42}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let note = f.note(&token, &parent, "Original", None).await;
+    let path = note_path(&note);
+    let headers = [("If-Match", "\"1\"")];
+    let (a, b) = tokio::join!(
+        f.send(
+            "PATCH",
+            &path,
+            Some(&token),
+            &headers,
+            json!({"text":"First editor"})
+        ),
+        f.send(
+            "PATCH",
+            &path,
+            Some(&token),
+            &headers,
+            json!({"text":"Second editor"})
+        ),
+    );
+    let mut statuses = [a.status().as_u16(), b.status().as_u16()];
+    statuses.sort();
+    assert_eq!(statuses, [200, 412]);
+    // Wildcard opts into merging against the latest version, under the lock.
+    let headers = [("If-Match", "*")];
+    let (a, b) = tokio::join!(
+        f.send(
+            "PATCH",
+            &path,
+            Some(&token),
+            &headers,
+            json!({"text":"Merged editor"})
+        ),
+        f.send(
+            "PATCH",
+            &path,
+            Some(&token),
+            &headers,
+            json!({"presentation_on":"2022-01-01"})
+        ),
+    );
+    assert_eq!(a.status(), StatusCode::OK);
+    assert_eq!(b.status(), StatusCode::OK);
+    let current = f
+        .value("GET", &path, &token, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(current["text"], "Merged editor");
+    assert_eq!(current["presentation_on"], "2022-01-01");
+    assert_eq!(current["version"], 4);
+    let etag = tag(&current);
+    let headers = [("If-Match", etag.as_str())];
+    let (edit, delete) = tokio::join!(
+        f.send(
+            "PATCH",
+            &path,
+            Some(&token),
+            &headers,
+            json!({"text":"Racing deletion"})
+        ),
+        f.send("DELETE", &path, Some(&token), &headers, Value::Null),
+    );
+    assert!(matches!(
+        (edit.status().as_u16(), delete.status().as_u16()),
+        (200, 412) | (404, 204)
+    ));
+    // Race create/edit against cascading parent deletion: no FK error, orphan,
+    // or deadlock is an acceptable result, whichever request wins.
+    let note = f.note(&token, &parent, "Before parent removal", None).await;
+    let note_url = note_path(&note);
+    let parent_url = format!("/api/me/playthroughs/{}", parent["id"].as_str().unwrap());
+    let nested = format!("{parent_url}/notes");
+    let headers = [("If-Match", "*")];
+    let (create, edit, delete) = timeout(Duration::from_secs(10), async {
+        tokio::join!(
+            f.call(
+                "POST",
+                &nested,
+                Some(&token),
+                json!({"text":"Racing parent removal"})
+            ),
+            f.send(
+                "PATCH",
+                &note_url,
+                Some(&token),
+                &headers,
+                json!({"text":"Racing parent removal"})
+            ),
+            f.call("DELETE", &parent_url, Some(&token), Value::Null),
+        )
+    })
+    .await
+    .expect("note/parent locking must not deadlock");
+    assert!(matches!(create.status().as_u16(), 201 | 404));
+    assert!(matches!(edit.status().as_u16(), 200 | 404));
+    assert_eq!(delete.status(), StatusCode::NO_CONTENT);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM diary_notes")
+        .fetch_one(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    f.finish().await;
 }
