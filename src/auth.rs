@@ -75,6 +75,11 @@ pub fn build(
             }
             .into(),
             secure: config.frontend_origin.scheme() == "https",
+            // See `Config::cookie_same_site`: `Lax` is right whenever the API
+            // and the SPA are same-site, and wrong — silently — when they are
+            // not, so it is a deployment decision rather than a default to
+            // inherit.
+            same_site: config.cookie_same_site,
             ..Default::default()
         })
         .build()?)

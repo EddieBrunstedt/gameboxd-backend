@@ -353,6 +353,7 @@ fn configuration_rejects_unsafe_browser_origins() {
         database_url: "unused".into(),
         frontend_origin: "http://localhost:5173".parse().unwrap(),
         rp_id: "localhost".into(),
+        cookie_same_site: cookie::SameSite::Lax,
         production: false,
         igdb_credentials: None,
         smtp: None,
@@ -370,4 +371,38 @@ fn configuration_rejects_unsafe_browser_origins() {
     config.frontend_origin = "http://localhost:5173".parse().unwrap();
     config.production = true;
     assert!(config.validate().is_err());
+}
+
+/// `SameSite=None` is only meaningful on a cookie a browser will keep.
+///
+/// The pair matters because it is the escape hatch for a cross-site API, and an
+/// operator reaching for it is already dealing with a login that does not work.
+/// Accepting `none` over plain HTTP would hand them a second silent failure —
+/// the browser discards a `SameSite=None` cookie that is not `Secure` — on top
+/// of the one they were trying to fix.
+#[test]
+fn a_cross_site_cookie_must_also_be_secure() {
+    let mut config = Config {
+        bind_addr: "127.0.0.1:3000".parse().unwrap(),
+        database_url: "unused".into(),
+        frontend_origin: "http://localhost:5173".parse().unwrap(),
+        rp_id: "localhost".into(),
+        cookie_same_site: cookie::SameSite::None,
+        production: false,
+        igdb_credentials: None,
+        smtp: None,
+    };
+    assert!(
+        config.validate().is_err(),
+        "SameSite=None over http must be refused"
+    );
+    // The same setting is fine once the origin is one a Secure cookie can reach.
+    config.frontend_origin = "https://gameboxd.example".parse().unwrap();
+    config.rp_id = "gameboxd.example".into();
+    assert!(config.validate().is_ok());
+    // And the default stays valid on localhost, where it is also correct.
+    config.frontend_origin = "http://localhost:5173".parse().unwrap();
+    config.rp_id = "localhost".into();
+    config.cookie_same_site = cookie::SameSite::Lax;
+    assert!(config.validate().is_ok());
 }

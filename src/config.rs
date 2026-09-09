@@ -1,6 +1,7 @@
 use std::{env, net::SocketAddr};
 
 use anyhow::{Context, bail};
+use cookie::SameSite;
 use url::Url;
 
 #[derive(Clone)]
@@ -9,6 +10,18 @@ pub struct Config {
     pub database_url: String,
     pub frontend_origin: Url,
     pub rp_id: String,
+    /// `SameSite` on the session cookie.
+    ///
+    /// Configurable because the default silently constrains where the API may
+    /// be deployed. The cookie is set by the API and has to be attached to
+    /// `fetch` calls the SPA makes from `FRONTEND_ORIGIN`; under `Lax` the
+    /// browser only does that when the two are *same-site*, which is a
+    /// comparison of registrable domains, not origins. Ports and schemes do not
+    /// enter into it, which is why local development never reveals the problem:
+    /// `localhost:5173` and `localhost:3000` are same-site, so `Lax` works, and
+    /// then an API deployed on an unrelated domain drops every session cookie
+    /// in production with nothing in the logs to say why.
+    pub cookie_same_site: SameSite,
     pub production: bool,
     pub igdb_credentials: Option<(String, String)>,
     pub smtp: Option<SmtpConfig>,
@@ -57,6 +70,14 @@ impl Config {
                 .unwrap_or("http://localhost:5173".into())
                 .parse()?,
             rp_id: env::var("RP_ID").unwrap_or("localhost".into()),
+            cookie_same_site: match env::var("COOKIE_SAME_SITE").as_deref().unwrap_or("lax") {
+                "lax" => SameSite::Lax,
+                "none" => SameSite::None,
+                other => bail!(
+                    "COOKIE_SAME_SITE must be lax or none, got {other:?}; \
+                     use none only when the API is not same-site with FRONTEND_ORIGIN"
+                ),
+            },
             production,
             igdb_credentials: credentials,
             smtp,
@@ -86,6 +107,15 @@ impl Config {
             || !(host == self.rp_id || host.ends_with(&format!(".{}", self.rp_id)))
         {
             bail!("RP_ID must equal the frontend hostname or a parent domain");
+        }
+        // Browsers reject `SameSite=None` outright unless the cookie is also
+        // `Secure`, and `Secure` is derived from this scheme in `auth::build`.
+        // Without this check the pair would be accepted here and the cookie
+        // discarded by the browser, which looks exactly like a broken login.
+        if self.cookie_same_site == SameSite::None && origin.scheme() != "https" {
+            bail!(
+                "COOKIE_SAME_SITE=none requires an https FRONTEND_ORIGIN, because a browser ignores a SameSite=None cookie that is not Secure"
+            );
         }
         if self.production && self.smtp.is_none() {
             bail!("Production requires SMTP configuration");

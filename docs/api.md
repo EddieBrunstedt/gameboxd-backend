@@ -181,6 +181,14 @@ if (saved.status === 412) {
 
 The browser must run at `FRONTEND_ORIGIN`. Cookie writes require a matching Origin or Referer; the browser sends Origin automatically for these fetch requests. Cookie-based curl requests must include an equivalent header. Authenticated curl/tool requests can alternatively send `Authorization: Bearer <doorman-session-token>`; this is an opaque session token, not a JWT.
 
+### Where the API may be deployed
+
+The session cookie is `HttpOnly`, `Path=/`, carries no `Domain`, and is `SameSite=Lax` by default. `Lax` is what constrains the deployment: the cookie is set by the API and has to be attached to `fetch` calls the SPA makes from `FRONTEND_ORIGIN`, and under `Lax` a browser only does that when the two are **same-site** — a comparison of registrable domains, ignoring scheme and port.
+
+Local development never shows the problem. `localhost:5173` and `localhost:3000` differ only by port, so they are same-site and the cookie flows. `gameboxd.example` with an API on `api.gameboxd.example` is also same-site and equally fine. An API on an unrelated domain is **not**, and the browser will silently drop the session cookie on every request — a login that appears to succeed and then behaves as though it never happened, with nothing in the server logs.
+
+Set `COOKIE_SAME_SITE=none` for that topology. It requires an HTTPS `FRONTEND_ORIGIN`, because a browser ignores a `SameSite=None` cookie that is not also `Secure`; startup refuses the combination rather than letting it fail in the browser. Cross-site cookies are still protected against forgery by the Origin/Referer check above, which is independent of `SameSite`. Prefer putting the API on a subdomain of the frontend and leaving this alone.
+
 ## Doorman routes and passkey flows
 
 Mounted unchanged at `/auth`; authoritative DTOs and flow behavior come from the [pinned Doorman source](https://codeberg.org/EddieBrunstedt/Doorman/src/commit/17bb0dcd509de6ca3bfd2742d3c9e422c92b4597/crates/axum/src/dto.rs).

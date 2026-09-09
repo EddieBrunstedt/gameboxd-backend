@@ -88,6 +88,7 @@ impl Fixture {
             database_url: test_url.to_string(),
             frontend_origin: "http://localhost:5173".parse().unwrap(),
             rp_id: "localhost".into(),
+            cookie_same_site: cookie::SameSite::Lax,
             production: false,
             igdb_credentials: None,
             smtp: None,
