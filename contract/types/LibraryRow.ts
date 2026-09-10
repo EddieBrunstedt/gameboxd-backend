@@ -4,9 +4,8 @@ import type { LibraryEntry } from "./LibraryEntry";
 
 /**
  * One row of a library listing: the stored game, plus this user's entry for
- * it. Both halves are the same types `GET /api/games/{igdb_id}` and
- * `GET /api/me/library/{igdb_id}` return, so a column added to either table
- * is published only once it is added to a struct — never implicitly, and
- * never by one route without the other.
+ * it. The game matches the authenticated import response; the entry matches
+ * `GET /api/me/library/{igdb_id}`. Public game routes deliberately use the
+ * descriptive catalog type instead, omitting local bookkeeping.
  */
 export type LibraryRow = { game: Game, entry: LibraryEntry, };

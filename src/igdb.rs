@@ -159,7 +159,7 @@ impl ProviderGame {
     }
 }
 
-/// One upstream game as the API exposes it. Distinct from [`crate::models::Game`]:
+/// A public game description from IGDB or local storage. Distinct from [`crate::models::Game`]:
 /// this carries no local identity and no import timestamps, because a viewed
 /// game need not exist in the database at all. Games are named publicly by
 /// `igdb_id`; the local UUID is an internal primary key and never appears in
@@ -425,6 +425,26 @@ pub fn validate_search(query: &str) -> ApiResult<&str> {
         ))
     } else {
         Ok(query)
+    }
+}
+
+impl From<crate::models::Game> for CatalogGame {
+    fn from(game: crate::models::Game) -> Self {
+        Self {
+            igdb_id: game.igdb_id,
+            name: game.name,
+            slug: game.slug,
+            summary: game.summary,
+            cover_url: game.cover_url,
+            first_release_date: game.first_release_date,
+            platforms: game.platforms.0,
+            genres: game.genres.0,
+            developers: game.developers.0,
+            game_type: game.game_type,
+            parent_igdb_id: game.parent_igdb_id,
+            version_parent_igdb_id: game.version_parent_igdb_id,
+            source_url: game.source_url,
+        }
     }
 }
 

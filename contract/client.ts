@@ -1,3 +1,11 @@
+import type { PublicationInput } from "./types/PublicationInput";
+import type { VisibilityInput } from "./types/VisibilityInput";
+import type { PlaythroughVisibilityInput } from "./types/PlaythroughVisibilityInput";
+import type { PublicLibraryEntry } from "./types/PublicLibraryEntry";
+import type { PublicPlaythrough } from "./types/PublicPlaythrough";
+import type { PublicRating } from "./types/PublicRating";
+import type { PublicReview } from "./types/PublicReview";
+import type { PublicNote } from "./types/PublicNote";
 // Typed client for the Gameboxd application routes.
 //
 // Every request and response type here is imported from `./types`, which is
@@ -189,9 +197,9 @@ export const catalogGame = (igdbId: number): Promise<CatalogGame> =>
 /** Games already stored locally. Does not contact IGDB. */
 export const games = (
   query: { q?: string; limit?: number; offset?: number } = {},
-): Promise<Page<Game>> => request("GET", "/api/games", { query });
+): Promise<Page<CatalogGame>> => request("GET", "/api/games", { query });
 
-export const game = (igdbId: number): Promise<Game> => request("GET", `/api/games/${igdbId}`);
+export const game = (igdbId: number): Promise<CatalogGame> => request("GET", `/api/games/${igdbId}`);
 
 export const importGame = (igdbId: number): Promise<Game> =>
   request("POST", `/api/catalog/import/${igdbId}`);
@@ -319,3 +327,31 @@ export const updateNote = (current: DiaryNote, patch: NotePatch): Promise<DiaryN
 /** Deletion requires the note's revision, just like an edit. */
 export const deleteNote = (current: DiaryNote): Promise<void> =>
   request("DELETE", `/api/me/notes/${current.id}`, { ifMatch: precondition(current) });
+
+
+// --- Publication controls and public projections --------------------------
+
+/** Profile publication gates every public item without changing item choices. */
+export const setPublication = (current: Profile, input: PublicationInput): Promise<Profile> =>
+  request("PUT", "/api/me/publication", { body: input, ifMatch: precondition(current) });
+
+export const setLibraryVisibility = (current: LibraryEntry, input: VisibilityInput): Promise<LibraryEntry> =>
+  request("PUT", `/api/me/library/${current.igdb_id}/visibility`, { body: input, ifMatch: precondition(current) });
+
+export const setPlaythroughVisibility = (current: Playthrough, input: PlaythroughVisibilityInput): Promise<Playthrough> =>
+  request("PUT", `/api/me/playthroughs/${current.id}/visibility`, { body: input, ifMatch: precondition(current) });
+
+export const setNoteVisibility = (current: DiaryNote, input: VisibilityInput): Promise<DiaryNote> =>
+  request("PUT", `/api/me/notes/${current.id}/visibility`, { body: input, ifMatch: precondition(current) });
+
+/** These reads apply identical visibility rules with or without a session. */
+export const publicLibraryEntry = (id: string): Promise<PublicLibraryEntry> =>
+  request("GET", `/api/public/library/${encodeURIComponent(id)}`);
+export const publicPlaythrough = (id: string): Promise<PublicPlaythrough> =>
+  request("GET", `/api/public/playthroughs/${encodeURIComponent(id)}`);
+export const publicRating = (id: string): Promise<PublicRating> =>
+  request("GET", `/api/public/ratings/${encodeURIComponent(id)}`);
+export const publicReview = (id: string): Promise<PublicReview> =>
+  request("GET", `/api/public/reviews/${encodeURIComponent(id)}`);
+export const publicNote = (id: string): Promise<PublicNote> =>
+  request("GET", `/api/public/notes/${encodeURIComponent(id)}`);

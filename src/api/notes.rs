@@ -15,6 +15,7 @@ pub(super) fn routes() -> Router<AppState> {
 #[derive(Serialize, FromRow, TS)]
 #[ts(export)]
 pub struct DiaryNote {
+    pub visibility: crate::models::Visibility,
     pub id: Uuid,
     pub playthrough_id: Uuid,
     pub igdb_id: i64,
@@ -81,7 +82,7 @@ impl<'de> Deserialize<'de> for NoteTextPatch {
     }
 }
 
-struct TaggedNote(DiaryNote);
+pub(super) struct TaggedNote(pub(super) DiaryNote);
 
 impl IntoResponse for TaggedNote {
     fn into_response(self) -> Response {
@@ -215,7 +216,7 @@ async fn create(
     Ok((StatusCode::CREATED, TaggedNote(row)))
 }
 
-async fn saved(
+pub(super) async fn saved(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     owner: &[u8],
     id: Uuid,
@@ -229,7 +230,7 @@ async fn saved(
     )
 }
 
-async fn locked_note(
+pub(super) async fn locked_note(
     tx: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     owner: &[u8],
     id: Uuid,

@@ -1424,9 +1424,15 @@ async fn authenticated_catalog_and_library_flow_with_ownership_and_logout() {
     .await;
     assert_eq!(listed["data"][0]["game"]["igdb_id"], igdb_id);
     assert_eq!(listed["data"][0]["entry"]["igdb_id"], igdb_id);
-    // Both routes publish a game through the same struct over an explicit
-    // column list, so neither can start exposing a column the other does not.
-    assert_eq!(listed["data"][0]["game"], found["data"][0]);
+    // Owner game bookkeeping stays available, but related public catalog reads
+    // must use only the descriptive projection.
+    assert_eq!(listed["data"][0]["game"], imported);
+    let mut description = imported.clone();
+    for field in ["id", "imported_at", "refreshed_at"] {
+        assert!(found["data"][0].get(field).is_none());
+        description.as_object_mut().unwrap().remove(field);
+    }
+    assert_eq!(description, found["data"][0]);
     assert_eq!(listed["has_more"], false);
     assert!(listed["data"][0]["entry"].get("user_id").is_none());
     // Entries name their game the way every route does; the local UUID is internal.
@@ -2228,6 +2234,7 @@ async fn migration_preserves_legacy_reviews_without_inventing_play_dates() {
             StatusCode::OK,
         )
         .await;
+    undo_visibility(&fixture.database.app).await;
     // Restore the exact old library shape in this disposable database, then
     // exercise the real migrator, including its migration history and restart.
     sqlx::raw_sql("DROP VIEW diary_note_details; DROP TABLE diary_notes; DROP FUNCTION diary_note_revision();
@@ -3098,7 +3105,12 @@ async fn a_save_queues_the_refresh_it_no_longer_waits_for() {
         StatusCode::OK,
     )
     .await;
-    assert_eq!(game["id"], local_id);
+    assert!(game.get("id").is_none());
+    let stored_id: Uuid = sqlx::query_scalar("SELECT id FROM games WHERE igdb_id=42")
+        .fetch_one(&fixture.database.app)
+        .await
+        .unwrap();
+    assert_eq!(json!(stored_id), local_id);
     assert_eq!(
         fixture
             .call("GET", "/api/me/library/42", Some(&token), Value::Null)
@@ -3511,6 +3523,7 @@ async fn presentation_date_migration_preserves_existing_dates_and_revisions() {
             StatusCode::OK,
         )
         .await;
+    undo_visibility(&fixture.database.app).await;
     // Reconstruct the prior schema and ordering in this disposable database.
     sqlx::raw_sql(
         "DROP VIEW library_entry_details;
@@ -4125,4 +4138,1054 @@ async fn concurrent_note_writes_and_parent_deletion_are_consistent() {
         .unwrap();
     assert_eq!(count, 0);
     f.finish().await;
+}
+
+// Reconstruct the schema before feature 4 in disposable migration fixtures.
+async fn undo_visibility(pool: &PgPool) {
+    sqlx::raw_sql("DROP VIEW public_library_entries,public_reviews,public_ratings,public_playthroughs,public_notes;
+        DROP VIEW library_entry_details,diary_note_details;
+        DROP TRIGGER profiles_revision ON profiles;
+        DROP TRIGGER library_entries_revision ON library_entries;
+        DROP TRIGGER playthroughs_clear_publication ON playthroughs;
+        DROP FUNCTION clear_missing_publication();
+        ALTER TABLE profiles DROP COLUMN public_enabled,DROP COLUMN version;
+        ALTER TABLE library_entries DROP COLUMN public_id,DROP COLUMN visibility,DROP COLUMN version;
+        ALTER TABLE playthroughs DROP COLUMN summary_visibility,DROP COLUMN rating_visibility,DROP COLUMN review_visibility;
+        ALTER TABLE diary_notes DROP COLUMN visibility;
+        DELETE FROM _sqlx_migrations WHERE version=202609100001;")
+        .execute(pool).await.unwrap();
+    let library = include_str!("../migrations/202609090002_playthrough_lifecycle.sql")
+        .split_once("CREATE OR REPLACE VIEW library_entry_details")
+        .unwrap()
+        .1;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE VIEW library_entry_details{library}"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+    let notes = include_str!("../migrations/202609090003_diary_notes.sql")
+        .split_once("CREATE VIEW diary_note_details")
+        .unwrap()
+        .1;
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE VIEW diary_note_details{notes}"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+fn private_parts() -> Value {
+    json!({
+        "summary_visibility":"private","rating_visibility":"private","review_visibility":"private"
+    })
+}
+
+async fn publication(fixture: &Fixture, token: &str, enabled: bool) -> Value {
+    let me = fixture
+        .value("GET", "/api/me", token, Value::Null, StatusCode::OK)
+        .await;
+    fixture
+        .edit(
+            "PUT",
+            "/api/me/publication",
+            token,
+            &tag(&me["profile"]),
+            json!({"public_enabled":enabled}),
+            StatusCode::OK,
+        )
+        .await
+}
+
+async fn share_run(fixture: &Fixture, token: &str, run: &Value, parts: Value) -> Value {
+    fixture
+        .edit(
+            "PUT",
+            &format!("{}/visibility", run_path(run)),
+            token,
+            &tag(run),
+            parts,
+            StatusCode::OK,
+        )
+        .await
+}
+
+async fn public_body(
+    fixture: &Fixture,
+    path: &str,
+    token: Option<&str>,
+    status: StatusCode,
+) -> Value {
+    let response = fixture
+        .send(
+            "GET",
+            path,
+            token,
+            &[
+                ("If-None-Match", "*"),
+                ("If-Modified-Since", "Wed, 09 Sep 2099 00:00:00 GMT"),
+            ],
+            Value::Null,
+        )
+        .await;
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert!(!response.headers().contains_key("etag"));
+    assert!(!response.headers().contains_key("last-modified"));
+    let body = json_body(response, status).await;
+    fn safe(value: &Value) {
+        match value {
+            Value::Object(fields) => {
+                for (key, value) in fields {
+                    assert!(
+                        ![
+                            "created_at",
+                            "updated_at",
+                            "version",
+                            "imported_at",
+                            "refreshed_at",
+                            "user_id",
+                            "email",
+                            "is_current",
+                            "current_playthrough_id",
+                            "playthrough_id",
+                            "rating_playthrough_id",
+                            "visibility",
+                            "summary_visibility",
+                            "rating_visibility",
+                            "review_visibility"
+                        ]
+                        .contains(&key.as_str()),
+                        "leaked {key}"
+                    );
+                    safe(value);
+                }
+            }
+            Value::Array(items) => {
+                for item in items {
+                    safe(item);
+                }
+            }
+            _ => (),
+        }
+    }
+    safe(&body);
+    body
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn visibility_is_independent_and_public_projections_do_not_expand_private_relations() {
+    let fixture = Fixture::new().await;
+    let (_, owner) = fixture.user("sharing-owner").await;
+    let (_, other) = fixture.user("sharing-other").await;
+    fixture
+        .value(
+            "PUT",
+            "/api/me",
+            &owner,
+            json!({"display_name":"Author","bio":"Private bio"}),
+            StatusCode::OK,
+        )
+        .await;
+    let entry = fixture
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &owner,
+            json!({"status":"dropped"}),
+            StatusCode::OK,
+        )
+        .await;
+    let run = fixture
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &owner,
+            json!({"igdb_id":42,
+        "rating":9,"review":"Public review","presentation_on":"2020-02-02","state":"abandoned",
+        "started_on":"2019-01-01","finished_on":"2020-01-01","platform":"Secret platform"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let note = fixture
+        .note(&owner, &run, "Secret note", Some("2019-08-01"))
+        .await;
+    let run_id = run["id"].as_str().unwrap();
+    let note_id = note["id"].as_str().unwrap();
+    let urls = [
+        format!(
+            "/api/public/library/{}",
+            entry["public_id"].as_str().unwrap()
+        ),
+        format!("/api/public/playthroughs/{run_id}"),
+        format!("/api/public/ratings/{run_id}"),
+        format!("/api/public/reviews/{run_id}"),
+        format!("/api/public/notes/{note_id}"),
+    ];
+    assert_eq!(entry["visibility"], "private");
+    assert_eq!(note["visibility"], "private");
+    for field in [
+        "summary_visibility",
+        "rating_visibility",
+        "review_visibility",
+    ] {
+        assert_eq!(run[field], "private");
+    }
+    for token in [None, Some(owner.as_str()), Some(other.as_str())] {
+        for url in &urls {
+            public_body(&fixture, url, token, StatusCode::NOT_FOUND).await;
+        }
+    }
+    // A public review does not grant access to the owner's full record or children.
+    let run = share_run(
+        &fixture,
+        &owner,
+        &run,
+        json!({"summary_visibility":"private",
+        "rating_visibility":"private","review_visibility":"public"}),
+    )
+    .await;
+    public_body(&fixture, &urls[3], None, StatusCode::NOT_FOUND).await;
+    publication(&fixture, &owner, true).await;
+    let expected = json!({"id":run["id"],"author_name":"Author","game":{
+        "igdb_id":42,"game_name":"Test Game","game_slug":"test-game","cover_url":null},
+        "presentation_on":"2020-02-02","review":"Public review"});
+    for token in [None, Some(owner.as_str()), Some(other.as_str())] {
+        for (i, url) in urls.iter().enumerate() {
+            let body = public_body(
+                &fixture,
+                url,
+                token,
+                if i == 3 {
+                    StatusCode::OK
+                } else {
+                    StatusCode::NOT_FOUND
+                },
+            )
+            .await;
+            if i == 3 {
+                assert_eq!(body, expected);
+            }
+        }
+    }
+    for path in [
+        run_path(&run),
+        format!("{}/notes", run_path(&run)),
+        format!("/api/me/notes/{note_id}"),
+        "/api/me/library/42".into(),
+    ] {
+        fixture
+            .value("GET", &path, &owner, Value::Null, StatusCode::OK)
+            .await;
+        fixture
+            .value("GET", &path, &other, Value::Null, StatusCode::NOT_FOUND)
+            .await;
+        assert_eq!(
+            fixture.call("GET", &path, None, Value::Null).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    // Publish a note with every parent aspect private, then test each other part alone.
+    let mut run = share_run(&fixture, &owner, &run, private_parts()).await;
+    let note = fixture
+        .edit(
+            "PUT",
+            &format!("/api/me/notes/{note_id}/visibility"),
+            &owner,
+            &tag(&note),
+            json!({"visibility":"public"}),
+            StatusCode::OK,
+        )
+        .await;
+    for token in [None, Some(owner.as_str()), Some(other.as_str())] {
+        let body = public_body(&fixture, &urls[4], token, StatusCode::OK).await;
+        assert_eq!(
+            body,
+            json!({"id":note["id"],"author_name":"Author","game":expected["game"],
+            "presentation_on":"2019-08-01","text":"Secret note"})
+        );
+        public_body(&fixture, &urls[1], token, StatusCode::NOT_FOUND).await;
+    }
+    fixture
+        .edit(
+            "PUT",
+            &format!("/api/me/notes/{note_id}/visibility"),
+            &owner,
+            &tag(&note),
+            json!({"visibility":"private"}),
+            StatusCode::OK,
+        )
+        .await;
+    for (part, index) in [("summary_visibility", 1), ("rating_visibility", 2)] {
+        let mut choices = private_parts();
+        choices[part] = json!("public");
+        run = share_run(&fixture, &owner, &run, choices).await;
+        for token in [None, Some(owner.as_str()), Some(other.as_str())] {
+            for (i, url) in urls.iter().enumerate() {
+                let body = public_body(
+                    &fixture,
+                    url,
+                    token,
+                    if i == index {
+                        StatusCode::OK
+                    } else {
+                        StatusCode::NOT_FOUND
+                    },
+                )
+                .await;
+                if i == 1 && i == index {
+                    assert_eq!(
+                        body,
+                        json!({"id":run["id"],"author_name":"Author","game":expected["game"],
+                        "presentation_on":"2020-02-02","state":"abandoned","started_on":"2019-01-01",
+                        "finished_on":"2020-01-01","platform":"Secret platform"})
+                    );
+                } else if i == 2 && i == index {
+                    assert_eq!(
+                        body,
+                        json!({"id":run["id"],"author_name":"Author","game":expected["game"],
+                        "presentation_on":"2020-02-02","rating":9})
+                    );
+                }
+            }
+        }
+    }
+    share_run(&fixture, &owner, &run, private_parts()).await;
+    fixture
+        .edit(
+            "PUT",
+            "/api/me/library/42/visibility",
+            &owner,
+            &tag(&entry),
+            json!({"visibility":"public"}),
+            StatusCode::OK,
+        )
+        .await;
+    for token in [None, Some(owner.as_str()), Some(other.as_str())] {
+        let body = public_body(&fixture, &urls[0], token, StatusCode::OK).await;
+        assert_eq!(
+            body,
+            json!({"id":entry["public_id"],"author_name":"Author","game":expected["game"],
+            "status":"dropped","rating":null,"rating_id":null})
+        );
+    }
+    fixture.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn profile_revocation_deletion_and_new_content_obey_the_same_public_boundary() {
+    let fixture = Fixture::new().await;
+    let (_, owner) = fixture.user("revocation-owner").await;
+    let (_, other) = fixture.user("revocation-other").await;
+    publication(&fixture, &owner, true).await;
+    let entry = fixture
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &owner,
+            json!({"status":"backlog"}),
+            StatusCode::OK,
+        )
+        .await;
+    fixture
+        .edit(
+            "PUT",
+            "/api/me/library/42/visibility",
+            &owner,
+            &tag(&entry),
+            json!({"visibility":"public"}),
+            StatusCode::OK,
+        )
+        .await;
+    let run = fixture
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &owner,
+            json!({"igdb_id":42,"rating":7,"review":"Shared"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let run = share_run(&fixture,&owner,&run,json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"public"})).await;
+    let note = fixture.note(&owner, &run, "Shared note", None).await;
+    let note_path = format!("/api/me/notes/{}", note["id"].as_str().unwrap());
+    let note = fixture
+        .edit(
+            "PUT",
+            &format!("{note_path}/visibility"),
+            &owner,
+            &tag(&note),
+            json!({"visibility":"public"}),
+            StatusCode::OK,
+        )
+        .await;
+    let new_note = fixture
+        .note(&owner, &run, "Later private addition", None)
+        .await;
+    assert_eq!(new_note["visibility"], "private");
+    let entry = fixture
+        .value(
+            "GET",
+            "/api/me/library/42",
+            &owner,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    let urls = [
+        format!(
+            "/api/public/library/{}",
+            entry["public_id"].as_str().unwrap()
+        ),
+        format!("/api/public/playthroughs/{}", run["id"].as_str().unwrap()),
+        format!("/api/public/ratings/{}", run["id"].as_str().unwrap()),
+        format!("/api/public/reviews/{}", run["id"].as_str().unwrap()),
+        format!("/api/public/notes/{}", note["id"].as_str().unwrap()),
+    ];
+    let mut before = Vec::new();
+    for url in &urls {
+        before.push(public_body(&fixture, url, None, StatusCode::OK).await);
+    }
+    let disabled = publication(&fixture, &owner, false).await;
+    for token in [None, Some(owner.as_str()), Some(other.as_str())] {
+        for url in &urls {
+            public_body(&fixture, url, token, StatusCode::NOT_FOUND).await;
+        }
+    }
+    assert_eq!(
+        fixture
+            .value("GET", &run_path(&run), &owner, Value::Null, StatusCode::OK)
+            .await,
+        run
+    );
+    assert_eq!(
+        fixture
+            .value("GET", &note_path, &owner, Value::Null, StatusCode::OK)
+            .await,
+        note
+    );
+    assert_eq!(
+        fixture
+            .value(
+                "GET",
+                "/api/me/library/42",
+                &owner,
+                Value::Null,
+                StatusCode::OK
+            )
+            .await,
+        entry
+    );
+    let unchanged = fixture
+        .edit(
+            "PUT",
+            "/api/me/publication",
+            &owner,
+            &tag(&disabled),
+            json!({"public_enabled":false}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(unchanged, disabled);
+    publication(&fixture, &owner, true).await;
+    for (url, expected) in urls.iter().zip(&before) {
+        assert_eq!(
+            &public_body(&fixture, url, None, StatusCode::OK).await,
+            expected
+        );
+    }
+    let head = fixture.call("HEAD", &urls[3], None, Value::Null).await;
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(head.headers()["cache-control"], "no-store");
+    assert!(!head.headers().contains_key("etag"));
+    assert!(!head.headers().contains_key("last-modified"));
+    // Starts keep existing library permission, but new runs never inherit it.
+    let replay = fixture
+        .value(
+            "POST",
+            START_RUN,
+            &owner,
+            json!({"igdb_id":42}),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_eq!(replay["summary_visibility"], "private");
+    public_body(
+        &fixture,
+        &format!(
+            "/api/public/playthroughs/{}",
+            replay["id"].as_str().unwrap()
+        ),
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert_eq!(
+        fixture
+            .call("DELETE", "/api/me/library/42", Some(&owner), Value::Null)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    public_body(&fixture, &urls[0], None, StatusCode::NOT_FOUND).await;
+    public_body(&fixture, &urls[4], None, StatusCode::OK).await;
+    let replaced_entry = fixture
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &owner,
+            json!({"status":"backlog"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(replaced_entry["visibility"], "private");
+    assert_ne!(replaced_entry["public_id"], entry["public_id"]);
+    fixture
+        .edit(
+            "DELETE",
+            &run_path(&run),
+            &owner,
+            &tag(&run),
+            Value::Null,
+            StatusCode::NO_CONTENT,
+        )
+        .await;
+    for url in &urls {
+        public_body(&fixture, url, None, StatusCode::NOT_FOUND).await;
+    }
+    fixture.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn publication_writes_enforce_ownership_preconditions_validation_and_concurrency() {
+    let fixture = Fixture::new().await;
+    let (_, owner) = fixture.user("permission-owner").await;
+    let (_, other) = fixture.user("permission-other").await;
+    let profile = fixture
+        .value("GET", "/api/me", &owner, Value::Null, StatusCode::OK)
+        .await["profile"]
+        .clone();
+    let entry = fixture
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &owner,
+            json!({"status":"backlog"}),
+            StatusCode::OK,
+        )
+        .await;
+    let run = fixture
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &owner,
+            json!({"igdb_id":42,"review":"Review"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let note = fixture.note(&owner, &run, "Note", None).await;
+    let rows = [
+        (
+            "/api/me/publication".into(),
+            profile,
+            json!({"public_enabled":true}),
+        ),
+        (
+            "/api/me/library/42/visibility".into(),
+            entry,
+            json!({"visibility":"public"}),
+        ),
+        (
+            format!("{}/visibility", run_path(&run)),
+            run.clone(),
+            json!({"summary_visibility":"private","rating_visibility":"private","review_visibility":"public"}),
+        ),
+        (
+            format!("/api/me/notes/{}/visibility", note["id"].as_str().unwrap()),
+            note.clone(),
+            json!({"visibility":"public"}),
+        ),
+    ];
+    for (url, current, input) in &rows {
+        assert_eq!(
+            fixture.call("PUT", url, None, input.clone()).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+        fixture
+            .edit(
+                "PUT",
+                url,
+                &other,
+                &tag(current),
+                input.clone(),
+                StatusCode::NOT_FOUND,
+            )
+            .await;
+        fixture
+            .value(
+                "PUT",
+                url,
+                &owner,
+                input.clone(),
+                StatusCode::PRECONDITION_REQUIRED,
+            )
+            .await;
+        for invalid in [
+            json!({}),
+            json!({"visibility":"friends"}),
+            json!({"visibility":{"public":null}}),
+            json!({"visibility":null}),
+            json!({"public_enabled":null}),
+            json!({"unknown":true}),
+        ] {
+            let response = fixture
+                .send(
+                    "PUT",
+                    url,
+                    Some(&owner),
+                    &[("If-Match", tag(current).as_str())],
+                    invalid.clone(),
+                )
+                .await;
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{url}: {invalid}"
+            );
+            json_body(response, StatusCode::UNPROCESSABLE_ENTITY).await;
+        }
+        let etag = tag(current);
+        let headers = [("If-Match", etag.as_str())];
+        let (a, b) = tokio::join!(
+            fixture.send("PUT", url, Some(&owner), &headers, input.clone()),
+            fixture.send("PUT", url, Some(&owner), &headers, input.clone())
+        );
+        let mut statuses = [a.status().as_u16(), b.status().as_u16()];
+        statuses.sort();
+        assert_eq!(statuses, [200, 412], "{url}");
+        let saved = json_body(
+            if a.status() == StatusCode::OK { a } else { b },
+            StatusCode::OK,
+        )
+        .await;
+        // Publication is an independent edit; no-op saves keep the same revision.
+        let noop = fixture
+            .edit(
+                "PUT",
+                url,
+                &owner,
+                &tag(&saved),
+                input.clone(),
+                StatusCode::OK,
+            )
+            .await;
+        assert_eq!(noop, saved);
+        fixture
+            .edit(
+                "PUT",
+                url,
+                &owner,
+                &etag,
+                input.clone(),
+                StatusCode::PRECONDITION_FAILED,
+            )
+            .await;
+    }
+    let mut current = fixture
+        .value("GET", &run_path(&run), &owner, Value::Null, StatusCode::OK)
+        .await;
+    let invalid = json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"public"});
+    fixture
+        .edit(
+            "PUT",
+            &rows[2].0,
+            &owner,
+            &tag(&current),
+            invalid,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    assert_eq!(
+        fixture
+            .value("GET", &run_path(&run), &owner, Value::Null, StatusCode::OK)
+            .await,
+        current
+    );
+    // Publication versus content edits share a revision and cannot both commit.
+    let etag = tag(&current);
+    let url = run_path(&current);
+    let visibility_url = format!("{url}/visibility");
+    let headers = [("If-Match", etag.as_str())];
+    let (a, b) = tokio::join!(
+        fixture.send(
+            "PATCH",
+            &url,
+            Some(&owner),
+            &headers,
+            json!({"review":"Revised"})
+        ),
+        fixture.send(
+            "PUT",
+            &visibility_url,
+            Some(&owner),
+            &headers,
+            private_parts()
+        )
+    );
+    let mut statuses = [a.status().as_u16(), b.status().as_u16()];
+    statuses.sort();
+    assert_eq!(statuses, [200, 412]);
+    current = fixture
+        .value("GET", &url, &owner, Value::Null, StatusCode::OK)
+        .await;
+    let current = share_run(&fixture,&owner,&current,json!({"summary_visibility":"private","rating_visibility":"private","review_visibility":"public"})).await;
+    let current = fixture
+        .edit(
+            "PATCH",
+            &url,
+            &owner,
+            &tag(&current),
+            json!({"review":null,"rating":8}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(current["review_visibility"], "private");
+    assert_eq!(current["rating_visibility"], "private");
+    let current = share_run(&fixture,&owner,&current,json!({"summary_visibility":"private","rating_visibility":"public","review_visibility":"private"})).await;
+    let current = fixture
+        .edit(
+            "PATCH",
+            &url,
+            &owner,
+            &tag(&current),
+            json!({"rating":null,"review":"Replacement review"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(current["rating_visibility"], "private");
+    assert_eq!(current["review_visibility"], "private");
+    let current = fixture
+        .edit(
+            "PATCH",
+            &url,
+            &owner,
+            &tag(&current),
+            json!({"rating":6}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(current["rating_visibility"], "private");
+    public_body(
+        &fixture,
+        &format!("/api/public/reviews/{}", current["id"].as_str().unwrap()),
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    public_body(
+        &fixture,
+        &format!("/api/public/ratings/{}", current["id"].as_str().unwrap()),
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    // A content editor with the note's pre-publication revision is stale too.
+    fixture
+        .edit(
+            "PATCH",
+            &format!("/api/me/notes/{}", note["id"].as_str().unwrap()),
+            &owner,
+            &tag(&note),
+            json!({"text":"Stale edit"}),
+            StatusCode::PRECONDITION_FAILED,
+        )
+        .await;
+    fixture.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn public_rating_ordering_and_aggregates_ignore_private_history_and_bookkeeping() {
+    let fixture = Fixture::new().await;
+    let (owner_id, owner) = fixture.user("public-order").await;
+    publication(&fixture, &owner, true).await;
+    let entry = fixture
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &owner,
+            json!({"status":"backlog"}),
+            StatusCode::OK,
+        )
+        .await;
+    let entry = fixture
+        .edit(
+            "PUT",
+            "/api/me/library/42/visibility",
+            &owner,
+            &tag(&entry),
+            json!({"visibility":"public"}),
+            StatusCode::OK,
+        )
+        .await;
+    let public_url = format!(
+        "/api/public/library/{}",
+        entry["public_id"].as_str().unwrap()
+    );
+    let mut public_runs = Vec::new();
+    for (rating, day) in [
+        (7, Some("2020-01-01")),
+        (8, Some("2020-01-01")),
+        (2, None),
+        (3, None),
+    ] {
+        let run = fixture
+            .value(
+                "POST",
+                "/api/me/playthroughs",
+                &owner,
+                json!({"igdb_id":42,"rating":rating,
+            "presentation_on":day,"review":"A dated or unknown review"}),
+                StatusCode::CREATED,
+            )
+            .await;
+        public_runs.push(share_run(&fixture,&owner,&run,json!({"summary_visibility":"private","rating_visibility":"public","review_visibility":"public"})).await);
+    }
+    public_runs.sort_by(|a, b| b["id"].as_str().cmp(&a["id"].as_str()));
+    public_runs.sort_by_key(|r| r["presentation_on"].is_null());
+    let latest = &public_runs[0];
+    let private = fixture
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &owner,
+            json!({"igdb_id":42,"rating":10,
+        "presentation_on":"2030-01-01","review":"Private newest"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let before = public_body(&fixture, &public_url, None, StatusCode::OK).await;
+    assert_eq!(before["rating"], latest["rating"]);
+    assert_eq!(before["rating_id"], latest["id"]);
+    assert_eq!(
+        fixture
+            .value(
+                "GET",
+                "/api/me/library/42",
+                &owner,
+                Value::Null,
+                StatusCode::OK
+            )
+            .await["rating"],
+        10
+    );
+    // The same filtered views power future sections, pagination and aggregates.
+    let rows: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM public_reviews WHERE user_id=$1 ORDER BY presentation_on DESC NULLS LAST,id DESC")
+        .bind(owner_id.0.as_bytes().as_slice()).fetch_all(&fixture.database.app).await.unwrap();
+    assert_eq!(
+        json!(rows),
+        Value::Array(public_runs.iter().map(|r| r["id"].clone()).collect())
+    );
+    let page: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM public_reviews WHERE user_id=$1 ORDER BY presentation_on DESC NULLS LAST,id DESC LIMIT 1 OFFSET 1")
+        .bind(owner_id.0.as_bytes().as_slice()).fetch_all(&fixture.database.app).await.unwrap();
+    assert_eq!(json!(page), json!([public_runs[1]["id"]]));
+    let counts: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT (SELECT count(*) FROM public_reviews),
+        (SELECT count(*) FROM public_ratings),(SELECT count(*) FROM public_playthroughs),
+        (SELECT count(*) FROM public_notes),(SELECT count(*) FROM public_library_entries)",
+    )
+    .fetch_one(&fixture.database.app)
+    .await
+    .unwrap();
+    assert_eq!(counts, (4, 4, 0, 0, 1));
+    fixture
+        .edit(
+            "PATCH",
+            &run_path(&private),
+            &owner,
+            &tag(&private),
+            json!({"rating":1,"presentation_on":"1900-01-01"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        public_body(&fixture, &public_url, None, StatusCode::OK).await,
+        before
+    );
+    let review_url = format!("/api/public/reviews/{}", latest["id"].as_str().unwrap());
+    let review = public_body(&fixture, &review_url, None, StatusCode::OK).await;
+    let edited = fixture
+        .edit(
+            "PATCH",
+            &run_path(latest),
+            &owner,
+            &tag(latest),
+            json!({"review":"Edited old text"}),
+            StatusCode::OK,
+        )
+        .await;
+    let mut expected = review.clone();
+    expected["review"] = json!("Edited old text");
+    assert_eq!(
+        public_body(&fixture, &review_url, None, StatusCode::OK).await,
+        expected
+    );
+    assert_eq!(
+        public_body(&fixture, &public_url, None, StatusCode::OK).await,
+        before
+    );
+    // Actual timestamps and revisions never contribute to a public projection.
+    sqlx::query(
+        "UPDATE playthroughs SET created_at='2090-01-01',updated_at='2090-01-02' WHERE user_id=$1",
+    )
+    .bind(owner_id.0.as_bytes().as_slice())
+    .execute(&fixture.database.app)
+    .await
+    .unwrap();
+    assert_eq!(
+        public_body(&fixture, &review_url, None, StatusCode::OK).await,
+        expected
+    );
+    assert_eq!(
+        public_body(&fixture, &public_url, None, StatusCode::OK).await,
+        before
+    );
+    let edited = fixture
+        .value(
+            "GET",
+            &run_path(&edited),
+            &owner,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    let edited = fixture
+        .edit(
+            "PATCH",
+            &run_path(&edited),
+            &owner,
+            &tag(&edited),
+            json!({"presentation_on":"1990-01-01"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        public_body(&fixture, &public_url, None, StatusCode::OK).await["rating_id"],
+        public_runs[1]["id"]
+    );
+    share_run(&fixture, &owner, &edited, private_parts()).await;
+    public_body(&fixture, &review_url, None, StatusCode::NOT_FOUND).await;
+    publication(&fixture, &owner, false).await;
+    let remaining: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM public_reviews)+(SELECT count(*) FROM public_ratings)+
+        (SELECT count(*) FROM public_playthroughs)+(SELECT count(*) FROM public_notes)+(SELECT count(*) FROM public_library_entries)")
+        .fetch_one(&fixture.database.app).await.unwrap();
+    assert_eq!(remaining, 0);
+    fixture.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn visibility_migration_keeps_existing_content_private_without_changing_history() {
+    let fixture = Fixture::new().await;
+    let (_, owner) = fixture.user("visibility-migration").await;
+    let profile = fixture
+        .value(
+            "PUT",
+            "/api/me",
+            &owner,
+            json!({"display_name":"Legacy","bio":"Original bio"}),
+            StatusCode::OK,
+        )
+        .await;
+    let _entry = fixture
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &owner,
+            json!({"status":"completed"}),
+            StatusCode::OK,
+        )
+        .await;
+    let run = fixture
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &owner,
+            json!({"igdb_id":42,"rating":9,
+        "review":"Legacy review","presentation_on":"2001-02-03","state":"completed"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let run = fixture
+        .edit(
+            "PATCH",
+            &run_path(&run),
+            &owner,
+            &tag(&run),
+            json!({"platform":"PC"}),
+            StatusCode::OK,
+        )
+        .await;
+    let note = fixture.note(&owner, &run, "Legacy note", None).await;
+    let entry = fixture
+        .value(
+            "GET",
+            "/api/me/library/42",
+            &owner,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    undo_visibility(&fixture.database.app).await;
+    sqlx::migrate!("./migrations")
+        .run(&fixture.database.app)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations")
+        .run(&fixture.database.app)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .value("GET", "/api/me", &owner, Value::Null, StatusCode::OK)
+            .await["profile"],
+        profile
+    );
+    assert_eq!(
+        fixture
+            .value("GET", &run_path(&run), &owner, Value::Null, StatusCode::OK)
+            .await,
+        run
+    );
+    assert_eq!(
+        fixture
+            .value(
+                "GET",
+                &format!("/api/me/notes/{}", note["id"].as_str().unwrap()),
+                &owner,
+                Value::Null,
+                StatusCode::OK
+            )
+            .await,
+        note
+    );
+    let mut migrated = fixture
+        .value(
+            "GET",
+            "/api/me/library/42",
+            &owner,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    migrated["public_id"] = entry["public_id"].clone(); // New identity has no historical meaning.
+    assert_eq!(migrated, entry);
+    let count: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM public_reviews)+(SELECT count(*) FROM public_ratings)+
+        (SELECT count(*) FROM public_playthroughs)+(SELECT count(*) FROM public_notes)+(SELECT count(*) FROM public_library_entries)")
+        .fetch_one(&fixture.database.app).await.unwrap();
+    assert_eq!(count, 0);
+    fixture.finish().await;
 }

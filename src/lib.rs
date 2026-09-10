@@ -100,6 +100,7 @@ async fn ready(State(state): State<AppState>) -> Response {
 }
 
 async fn response_policy(request: Request, next: Next) -> Response {
+    let public_content = request.uri().path().starts_with("/api/public/");
     let mut response = next.run(request).await;
     // Normalize Axum's text rejections (including those inside Doorman) without
     // rewriting Doorman's existing JSON machine-readable error codes.
@@ -115,6 +116,12 @@ async fn response_policy(request: Request, next: Next) -> Response {
             status.canonical_reason().unwrap_or("Request rejected"),
         )
         .into_response();
+    }
+    // Public content is always read live. Never let an owner revision tag or
+    // write timestamp become a public validator, including on errors/HEAD.
+    if public_content {
+        response.headers_mut().remove(header::ETAG);
+        response.headers_mut().remove(header::LAST_MODIFIED);
     }
     response
         .headers_mut()

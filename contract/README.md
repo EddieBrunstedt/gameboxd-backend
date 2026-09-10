@@ -186,3 +186,22 @@ Dates and ordering follow the same historical policy as playthroughs. Removing
 library membership or replaying preserves notes; deleting a playthrough deletes
 all its notes. These types contain owner-only bookkeeping and are not public
 sharing representations. See [note semantics](../docs/api.md#dated-diary-notes).
+
+
+`setPublication(profile, input)` controls the profile gate. `setLibraryVisibility`,
+`setPlaythroughVisibility`, and `setNoteVisibility` take the current owner resource
+and send its revision. Ordinary create/edit inputs do not set permissions. Runs
+have independent `summary_visibility`, `rating_visibility`, and `review_visibility`;
+notes/library entries have `visibility`. All default private. Clearing a rating or
+review clears its publication choice. Profile disabling preserves item choices.
+
+`publicLibraryEntry`, `publicPlaythrough`, `publicRating`, `publicReview`, and
+`publicNote` return dedicated `Public*` types. Library public reads take the entry's
+`public_id`; other reads take the run/note UUID. These responses contain no owner
+bookkeeping or implicit parent details. The public library rating uses only public
+ratings. Public routes give owners the same result as anonymous visitors and return
+404 when unavailable. Refetch public views: all responses are `no-store`, with no
+public revision validators. Profile pages/handles/visitor preview remain feature 5.
+Public local `games`/`game` now return `CatalogGame` descriptions, while authenticated
+imports and owner library game objects retain `Game` bookkeeping. See the
+[sharing contract](../docs/api.md#per-item-visibility-and-public-representations).

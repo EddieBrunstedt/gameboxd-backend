@@ -34,8 +34,17 @@ Base URL: `http://localhost:3000`. All bodies are JSON unless a response is `204
 | PUT | `/api/me/notes/{id}` | Yes | Replace note text/date; requires `If-Match` |
 | PATCH | `/api/me/notes/{id}` | Yes | Edit note text/date; requires `If-Match` |
 | DELETE | `/api/me/notes/{id}` | Yes | Delete note (204); requires `If-Match` |
+| PUT | `/api/me/publication` | Yes | Enable/disable public profile; requires profile `If-Match` |
+| PUT | `/api/me/library/{igdb_id}/visibility` | Yes | Set library entry visibility; requires entry `If-Match` |
+| PUT | `/api/me/playthroughs/{id}/visibility` | Yes | Set independent summary/rating/review visibility; requires playthrough `If-Match` |
+| PUT | `/api/me/notes/{id}/visibility` | Yes | Set note visibility; requires note `If-Match` |
+| GET | `/api/public/library/{id}` | No | Public library entry, addressed by its `public_id` |
+| GET | `/api/public/playthroughs/{id}` | No | Public playthrough summary |
+| GET | `/api/public/ratings/{id}` | No | Public rating, addressed by playthrough UUID |
+| GET | `/api/public/reviews/{id}` | No | Public review, addressed by playthrough UUID |
+| GET | `/api/public/notes/{id}` | No | Public diary note |
 
-A stored game includes `id`, `igdb_id`, `name`, `slug`, nullable `summary`, `cover_url`, `first_release_date`, arrays of `{id,name}` for `platforms`, `genres`, `developers`, nullable `game_type`, `parent_igdb_id`, `version_parent_igdb_id`, `source_url`, `imported_at` and `refreshed_at`. Taxonomy/parent IDs are upstream IGDB IDs, not local UUIDs. The `game` nested in a library listing is that same object, field for field.
+The owner-only stored game shape (authenticated import response and nested owner library game) includes `id`, `igdb_id`, `name`, `slug`, nullable `summary`, `cover_url`, `first_release_date`, arrays of `{id,name}` for `platforms`, `genres`, `developers`, nullable `game_type`, `parent_igdb_id`, `version_parent_igdb_id`, `source_url`, `imported_at` and `refreshed_at`. Taxonomy/parent IDs are upstream IGDB IDs, not local UUIDs. The `game` nested in an owner library listing is that same object, field for field. Public local game reads (`GET /api/games` and `/api/games/{igdb_id}`) instead return the descriptive catalog shape below, without local identity or import/refresh bookkeeping.
 
 Catalog search results and catalog lookup share one descriptive shape: `igdb_id`, `name`, `slug`, nullable `summary`, `cover_url`, `first_release_date`, arrays of `{id,name}` for `platforms`, `genres`, `developers`, nullable `game_type`, `parent_igdb_id`, `version_parent_igdb_id`, and `source_url`. They carry no `id`, `imported_at` or `refreshed_at`, because a viewed game need not exist locally. Address them by `igdb_id`.
 
@@ -49,7 +58,7 @@ Catalog lookup accepts a positive signed 64-bit integer ID; malformed, overflowi
 {"display_name":"Eddie","bio":"I like RPGs."}
 ```
 
-Display name is trimmed and limited to 80 characters; bio to 1000. The response is the profile object with those fields plus `created_at` and `updated_at`. `GET /api/me` returns `{id,email,profile}`, where `id` is the Doorman user UUID and `email` may be null.
+Display name is trimmed and limited to 80 characters; bio to 1000. The response is the profile object with those fields plus `created_at`, `updated_at`, `version`, and `public_enabled` (initially false). `GET /api/me` returns `{id,email,profile}`, where `id` is the Doorman user UUID and `email` may be null.
 
 `PUT /api/me/library/{igdb_id}` body:
 
@@ -57,9 +66,9 @@ Display name is trimmed and limited to 80 characters; bio to 1000. The response 
 {"status":"completed"}
 ```
 
-Allowed statuses: `backlog`, `playing`, `completed`, `on_hold`, `dropped`. `status` is required and is the only writable library field. Each entry returns `igdb_id`, `status`, derived nullable `rating`, nullable `rating_playthrough_id`, nullable `current_playthrough_id`, `created_at`, and `updated_at`. Ratings and reviews cannot be written through this route; obsolete payloads containing either field are rejected rather than silently discarded. The library has no review field.
+Allowed statuses: `backlog`, `playing`, `completed`, `on_hold`, `dropped`. `status` is required and is the only field accepted by the status endpoint. Visibility is edited through its separate endpoint. Each entry returns `igdb_id`, `status`, derived nullable `rating`, nullable `rating_playthrough_id`, nullable `current_playthrough_id`, `created_at`, `updated_at`, `public_id`, `visibility`, and `version`. Ratings and reviews cannot be written through this route; obsolete payloads containing either field are rejected rather than silently discarded. The library has no review field.
 
-The displayed rating comes from the first **rated** playthrough, using the chronology defined below. `rating_playthrough_id` identifies that experience. An unrated replay does not hide a previous rating. Editing or deleting a playthrough recalculates the displayed rating automatically; if none remain rated, both derived fields are null. Status-only saves never edit a playthrough. While a current run exists, a status-only save must agree with its state (`active` → `playing`, `paused` → `on_hold`), otherwise it returns `409 lifecycle_conflict`; use a lifecycle action to change both together. Library timestamps describe changes to library membership/status, not changes to the derived rating.
+The displayed rating comes from the first **rated** playthrough, using the chronology defined below. `rating_playthrough_id` identifies that experience. An unrated replay does not hide a previous rating. Editing or deleting a playthrough recalculates the displayed rating automatically; if none remain rated, both derived fields are null. Status-only saves never edit a playthrough. While a current run exists, a status-only save must agree with its state (`active` → `playing`, `paused` → `on_hold`), otherwise it returns `409 lifecycle_conflict`; use a lifecycle action to change both together. Library timestamps and revisions describe membership/status/visibility writes, not changes to the derived rating.
 
 Saving an entry stores an unknown game automatically, so no import call is needed first. A game already stored is reused exactly as it stands, however old its metadata, so this save never waits for IGDB — not for its request spacing, its rate limit, or a timeout while it is down. Only a game never stored here requires a successful IGDB fetch; an IGDB ID no game exists under returns 404, and a provider failure returns the IGDB errors below. The same applies to recording a playthrough.
 
@@ -114,7 +123,7 @@ Library entries carry no entity tag. `status` is the only writable field there, 
 
 ### Dated diary notes
 
-Each playthrough can have multiple independent plain-text notes alongside its overall rating/review. Notes can be recorded on any run, including completed, abandoned, detached, or undated runs. All note routes are authenticated and owner-only. There is no visibility input or public note endpoint in this feature.
+Each playthrough can have multiple independent plain-text notes alongside its overall rating/review. Notes can be recorded on any run, including completed, abandoned, detached, or undated runs. The `/api/me` note routes are authenticated and owner-only. Notes start private and have separate visibility controls and public projections described below.
 
 `POST /api/me/playthroughs/{id}/notes` and `PUT /api/me/notes/{id}` accept:
 
@@ -136,7 +145,7 @@ Notes have independent revisions: changing a note does not change the parent's r
 
 Removing library membership or starting a replay preserves all previous notes on their original playthrough IDs. Deleting a playthrough deliberately cascades to **all its notes** in the same transaction; deleting the account removes them too. The playthrough's own revision does not cover its notes: deleting that aggregate removes even independently revised notes. Note-only deletion checks the note's own revision and preserves the parent/review/siblings. Creation always uses a new UUID; uncertain POST retries can duplicate notes until feature 12 adds idempotency keys.
 
-Migration `202609090003_diary_notes.sql` adds an empty note table without deriving notes from reviews, inventing historical dates, changing existing playthrough content/revisions, or publishing data. Feature 4 must give notes independent visibility and separate public-safe projections; these owner DTOs and revision ETags must remain private.
+Migration `202609090003_diary_notes.sql` adds an empty note table without deriving notes from reviews, inventing historical dates, changing existing playthrough content/revisions, or publishing data. Independent note visibility and separate public projections are described below; these owner DTOs and revision ETags remain private.
 
 ### Current playthrough lifecycle
 
@@ -180,7 +189,7 @@ The diary sorts by `presentation_on DESC NULLS LAST, id DESC`. The library's der
 - A review-only entry, rating-only entry, or playthrough summary uses its explicitly chosen `presentation_on`. Rating and review on the same entry share this date.
 - A backfilled playthrough appears on that chosen day even if it was recorded today. Play start/end dates do not supply or override it. A caller may explicitly send the same day as a play date when that is the owner's intent.
 - A null date means unknown. Undated entries appear after all dated entries, including when play dates exist. Display them as undated, without a guessed day or year. A date-filtered view must exclude them; an unfiltered view may show an undated group.
-- Text, rating, platform, play-date, and future visibility changes preserve position. Editing `presentation_on` moves the entry; clearing it moves the entry into the undated group. A rating change can affect rating selection by adding/removing a rated candidate, but does not change its position.
+- Text, rating, platform, play-date, and visibility changes preserve position. Editing `presentation_on` moves the entry; clearing it moves the entry into the undated group. A rating change can affect rating selection by adding/removing a rated candidate, but does not change its position.
 - Dated ratings outrank undated ratings. If every rated entry is undated, the highest UUID supplies a deterministic representative rating; it must not be described as the most recently played or recorded rating. Same-day rated ties use the same UUID rule. `rating_playthrough_id` identifies the selected source so the owner can inspect or date it. An unrated entry never suppresses a rating.
 
 `presentation_on` is a PostgreSQL `DATE` / Rust `NaiveDate`, serialized as a calendar-date string, with no time or time zone. The API accepts no time-zone companion and performs no UTC conversion. Clients must preserve the chosen day rather than parse it as an instant and shift it into a local zone. Actual `created_at` and `updated_at` remain UTC instants for owner-side bookkeeping, and date edits use the existing revision and `If-Match` protection.
@@ -189,7 +198,7 @@ The presentation-date migration leaves every existing `presentation_on` null, ev
 
 ### Contract for future public surfaces (feature 4 onward)
 
-Personal content remains private in this feature. The authenticated `Playthrough` DTO and its revision `ETag` are owner-only contracts. Public endpoints must define separate projections; they must not reuse this DTO or its tags.
+Personal content starts private. The authenticated `Playthrough` DTO and its revision `ETag` are owner-only contracts. Public item endpoints use separate projections; future sections and feeds must also use these safe projections, never owner DTOs or tags.
 
 Notes use an explicit nullable historical day, ordered descending with nulls last, then a stable random identifier. Future list/summary events must follow the same policy. Profiles and feeds must use the same policy. A feed spanning resource kinds needs globally unique random item IDs (or a stable kind discriminator as a final collision tie-breaker), with one identity per underlying item. Publishing or editing an item must not manufacture a current-day event. Unknown dates remain undated in unfiltered lists and do not acquire a year in date-filtered statistics. Play/completion statistics may use explicitly supplied play/milestone dates for the metric they describe; a review date is not proof of play or completion.
 
@@ -199,7 +208,7 @@ Public bodies, related resources, previews, pagination metadata, ordering, count
 
 The migration converts each previous library rating and/or review into one undated playthrough, retaining the original recording/edit timestamps. It creates no playthrough for a status-only entry and invents no play dates or platform.
 
-All library and playthrough routes use the authenticated session as owner. Reading or updating another user's playthrough returns 404; unconditional deletion is a no-op 204. History remains private, and this milestone has no public review/profile endpoints or review aggregation.
+All `/api/me` library and playthrough routes use the authenticated session as owner. Reading or updating another user's playthrough returns 404; unconditional deletion is a no-op 204. History starts private. Explicitly published items are served separately under `/api/public`; profile pages and review aggregation are not implemented.
 
 ## Pagination
 
@@ -319,3 +328,136 @@ Mounted unchanged at `/auth`; authoritative DTOs and flow behavior come from the
 - Re-authentication: `POST /auth/reauth/start`; provide the resulting fresh assertion in the protected action's `reauthentication` field according to Doorman's DTOs.
 
 Email links only start signup/recovery; they do not create sessions on their own. Successful passkey finish sets the HttpOnly session cookie. Email changes, passkey removal and account deletion require re-authentication; recovery cooldowns also apply. Render frontend screens for `/signup`, `/recovery` and `/account/email`, consume their tokens once, and remove tokens from browser history after reading them. Use the [Doorman browser helper reference](https://codeberg.org/EddieBrunstedt/Doorman/src/commit/17bb0dcd509de6ca3bfd2742d3c9e422c92b4597/examples/web-client) to serialize WebAuthn ArrayBuffers correctly.
+
+
+## Per-item visibility and public representations
+
+All personal content starts private, including existing records after migration,
+new runs/replays, new notes under public runs, and newly re-added library entries.
+Creation and ordinary content endpoints do not accept visibility fields. Publish
+with a separate explicit visibility write after reading the saved resource.
+Changing display name/bio, library status, lifecycle state, note text, or review
+text preserves that resource's existing choice. New children never inherit it.
+Clearing a rating or review to null resets that component's visibility to private;
+adding its replacement later requires a new publication choice. Changing an
+existing published rating/review is an edit to that public item.
+
+The profile's `public_enabled` switch is a separate gate. Initialize/read the
+profile with `GET /api/me`, then send:
+
+```http
+PUT /api/me/publication
+If-Match: "1"
+Content-Type: application/json
+
+{"public_enabled":true}
+```
+
+Disabling it suppresses **all** public items, even direct links, without changing
+stored item choices, content, or item revisions. Re-enabling restores the selected
+presentation. The display name is public author attribution when enabled; neither
+email nor the Doorman user ID is public identity. Handles, profile sections and
+owner visitor preview remain feature 5. Lists receive visibility in feature 7.
+
+Visibility bodies:
+
+- Library entry and note: `{"visibility":"public"}` or `{"visibility":"private"}`.
+- Playthrough: `{"summary_visibility":"private","rating_visibility":"private","review_visibility":"public"}`.
+  All three fields are required, independently `private` or `public`. A public
+  rating/review requires existing non-null content; otherwise `400 validation_error`
+  names the offending visibility field. Validation is atomic.
+
+All four control endpoints require `If-Match` using the resource's owner `version`.
+They return 200 and the updated owner profile, library entry, playthrough, or note.
+Playthrough/note responses also carry their owner revision ETag. Missing
+preconditions return 428; stale revisions return 412. Existing strong tag/list/`*`
+syntax applies; clients should send an exact revision to detect concurrent edits.
+Malformed enum values, null, missing fields, and unknown fields are rejected.
+Foreign resources return the same 404 as absent resources before checking their
+revision; anonymous owner operations require authentication. Profile publication
+always targets the caller's own profile. No-op publication writes preserve revision
+and timestamps. Content and visibility writes share the playthrough/note revision;
+library and profile rows now also have database-maintained revisions. Existing
+status/profile-text operations preserve publication choices and advance those
+revisions when they write. Library publication follows the lifecycle owner/game
+lock protocol; note publication follows parent-before-note locking.
+
+Public routes have dedicated types, with this explicit field allowlist:
+
+| Type | Fields besides `id`, `author_name`, and `game` |
+| --- | --- |
+| `PublicLibraryEntry` | `status`, nullable `rating`, nullable `rating_id` |
+| `PublicPlaythrough` | nullable `presentation_on`, `state`, `started_on`, `finished_on`, `platform` |
+| `PublicRating` | nullable `presentation_on`, non-null `rating` |
+| `PublicReview` | nullable `presentation_on`, non-null `review` |
+| `PublicNote` | nullable `presentation_on`, non-null `text` |
+
+`game` is `PublicGame`: `igdb_id`, `game_name`, `game_slug`, nullable `cover_url`,
+read entirely from local storage without contacting or refreshing IGDB. The
+library public UUID is independent of authentication identity and game identity;
+it remains stable until membership is deleted. Re-adding membership creates a new
+private entry with a different UUID. Other item IDs are their existing random UUIDs.
+Rating and review IDs coincide with the underlying run, but the resource kind is
+part of the URL/identity; knowledge of that UUID never grants another projection.
+
+Publishing a summary explicitly shares its state, platform and chosen play dates;
+it shares no rating, review, notes, or current-run/library relationship. Publishing
+only a review shares its text, game and chosen author/day attribution. Notes share
+no parent ID or parent details. A public note remains available with a private
+summary; deleting the parent removes the note. Library removal preserves public
+history and notes. Independently public components remain available when another
+component is made private. Account deletion removes all personal public items.
+
+### Reusable visibility-aware reads
+
+The PostgreSQL views `public_library_entries`, `public_playthroughs`,
+`public_ratings`, `public_reviews`, and `public_notes` are the common eligibility
+boundary. Each includes the profile gate and only its explicit item choice.
+Direct handlers read these views into dedicated public DTOs, never owner DTOs.
+Future profile sections, related resources, search, counts and feeds must use
+these same views, applying filtering, ordering, pagination and aggregation **after**
+visibility. Their `user_id` and `game_id` columns are server-only join keys and
+must never be serialized. Views contain no write/edit timestamps or revisions.
+These are application query boundaries, not database role isolation/RLS.
+
+Dated collections use `presentation_on DESC NULLS LAST, id DESC`, with no
+recording/edit/publication-time fallback. The same-day and unknown-day tie break is
+a random UUID, not chronological evidence. Example section read:
+
+```sql
+SELECT id,author_name,igdb_id,game_name,game_slug,cover_url,presentation_on,review
+FROM public_reviews WHERE user_id=$1
+ORDER BY presentation_on DESC NULLS LAST,id DESC LIMIT $2 OFFSET $3;
+```
+
+Counts use the identical filtered view and scope. The public library rating is
+derived **only** from `public_ratings` for the same owner/game, using that historical
+ordering. Private ratings cannot change its value, source ID, ordering, counts or
+page boundaries. A public rating does not require library membership or a public
+summary. If all eligible ratings are undated, the highest UUID provides the
+representative without claiming recency. With none eligible, both public library
+rating fields are null. Library sections must not sort using owner timestamps;
+title ordering is available until feature 6 defines additional public sorts.
+
+### Revocation and caching
+
+Every public-content read checks current database visibility in one statement.
+There is no stored public response, materialized feed, or positive/negative item
+cache to invalidate. The application sends `Cache-Control: no-store` on successes,
+404s, errors and HEAD responses. Public-content middleware strips ETag and
+Last-Modified, and these routes do not return 304 or process conditional GETs from
+owner revisions. Generic HTTP Date/request IDs describe the request, not content
+history. Public DTOs carry no creation/edit/publication timestamps, revisions,
+visibility flags or edit badges; public local catalog reads also omit import and
+refresh timestamps.
+
+After a privacy change or deletion commits, subsequent reads return the same
+`404 not_found` as an unknown item, including for an authenticated owner on a
+public URL. Already delivered content and reads whose database snapshot preceded
+the change cannot be recalled. Reverse proxies/CDNs must honor `no-store` and must
+not override it with stale serving. Clients must refetch public content for a new
+view and evict displayed/cached results on a known revocation; an owner's stored
+choices are separate from visitor data. Any future response/feed cache requires
+synchronous visibility revalidation before serving, including profile disabling,
+item revocation, deletion, and later moderation restrictions. Do not introduce
+TTL-only revocation or validators derived from private bookkeeping.

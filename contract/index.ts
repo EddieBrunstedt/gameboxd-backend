@@ -55,3 +55,14 @@ export type { LifecycleInput } from "./types/LifecycleInput";
 export type { DiaryNote } from "./types/DiaryNote";
 export type { NoteInput } from "./types/NoteInput";
 export type { NotePatch } from "./types/NotePatch";
+
+export type { PublicationInput } from "./types/PublicationInput";
+export type { VisibilityInput } from "./types/VisibilityInput";
+export type { PlaythroughVisibilityInput } from "./types/PlaythroughVisibilityInput";
+export type { PublicLibraryEntry } from "./types/PublicLibraryEntry";
+export type { PublicPlaythrough } from "./types/PublicPlaythrough";
+export type { PublicRating } from "./types/PublicRating";
+export type { PublicReview } from "./types/PublicReview";
+export type { PublicNote } from "./types/PublicNote";
+export type { Visibility } from "./types/Visibility";
+export type { PublicGame } from "./types/PublicGame";

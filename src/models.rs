@@ -153,6 +153,9 @@ pub enum PlayStatus {
 #[derive(Serialize, FromRow, TS)]
 #[ts(export)]
 pub struct LibraryEntry {
+    pub public_id: Uuid,
+    pub visibility: Visibility,
+    pub version: i32,
     pub current_playthrough_id: Option<Uuid>,
     pub igdb_id: i64,
     pub status: PlayStatus,
@@ -188,6 +191,9 @@ impl PlaythroughState {
 #[derive(Serialize, FromRow, TS)]
 #[ts(export)]
 pub struct Playthrough {
+    pub summary_visibility: Visibility,
+    pub rating_visibility: Visibility,
+    pub review_visibility: Visibility,
     pub state: Option<PlaythroughState>,
     pub is_current: bool,
     pub id: Uuid,
@@ -209,8 +215,35 @@ pub struct Playthrough {
 #[derive(Serialize, FromRow, TS)]
 #[ts(export)]
 pub struct Profile {
+    pub public_enabled: bool,
+    pub version: i32,
     pub display_name: String,
     pub bio: String,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Owner-controlled permission; creation always uses the database's private default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, sqlx::Type, TS)]
+#[ts(export)]
+#[serde(rename_all = "snake_case")]
+#[sqlx(type_name = "text", rename_all = "snake_case")]
+pub enum Visibility {
+    Private,
+    Public,
+}
+
+// Accept only the documented string form. Serde's derived enum decoder also
+// accepts externally tagged objects and classifies null as a syntax error.
+impl<'de> Deserialize<'de> for Visibility {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        match String::deserialize(deserializer)?.as_str() {
+            "private" => Ok(Self::Private),
+            "public" => Ok(Self::Public),
+            value => Err(serde::de::Error::unknown_variant(
+                value,
+                &["private", "public"],
+            )),
+        }
+    }
 }

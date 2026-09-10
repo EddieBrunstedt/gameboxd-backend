@@ -17,6 +17,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 mod notes;
+mod sharing;
 
 use crate::{
     AppState,
@@ -31,6 +32,7 @@ use crate::{
 pub fn routes() -> Router<AppState> {
     Router::new()
         .merge(notes::routes())
+        .merge(sharing::routes())
         .route("/api/me", get(me).put(update_profile))
         .route("/api/games", get(games))
         .route("/api/games/{igdb_id}", get(game))
@@ -290,22 +292,26 @@ fn body<T>(value: Result<Body<T>, ApiError>) -> ApiResult<T> {
 async fn games(
     State(state): State<AppState>,
     params: Result<Query<PageQuery>, QueryRejection>,
-) -> ApiResult<Json<Page<Game>>> {
+) -> ApiResult<Json<Page<CatalogGame>>> {
     let params = query(params)?;
     let rows = sqlx::query_as::<_, Game>("SELECT * FROM games WHERE ($1::text IS NULL OR lower(name) LIKE lower($1)) ORDER BY lower(name),id LIMIT $2 OFFSET $3")
         .bind(params.name_pattern()).bind(i64::from(params.limit) + 1).bind(i64::from(params.offset))
         .fetch_all(&state.pool).await?;
-    Ok(page(rows, params.limit, params.offset))
+    Ok(page(
+        rows.into_iter().map(CatalogGame::from).collect(),
+        params.limit,
+        params.offset,
+    ))
 }
 
 async fn game(
     State(state): State<AppState>,
     igdb_id: Result<Path<i64>, PathRejection>,
-) -> ApiResult<Json<Game>> {
+) -> ApiResult<Json<CatalogGame>> {
     let row = find_game(&state.pool, igdb_path(igdb_id)?)
         .await?
         .ok_or_else(ApiError::not_found)?;
-    Ok(Json(row))
+    Ok(Json(CatalogGame::from(row)))
 }
 
 async fn search(
@@ -367,12 +373,10 @@ async fn me(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Me>
         .bind(user.0.id.0.as_bytes().as_slice())
         .execute(&state.pool)
         .await?;
-    let profile: Profile = sqlx::query_as(
-        "SELECT display_name,bio,created_at,updated_at FROM profiles WHERE user_id=$1",
-    )
-    .bind(user.0.id.0.as_bytes().as_slice())
-    .fetch_one(&state.pool)
-    .await?;
+    let profile: Profile = sqlx::query_as("SELECT * FROM profiles WHERE user_id=$1")
+        .bind(user.0.id.0.as_bytes().as_slice())
+        .fetch_one(&state.pool)
+        .await?;
     Ok(Json(Me {
         id: user.0.id.0,
         email: user.0.email.clone(),
@@ -436,17 +440,16 @@ async fn update_profile(
     input.validated()?;
     let profile = sqlx::query_as("INSERT INTO profiles (user_id,display_name,bio) VALUES ($1,$2,$3)
         ON CONFLICT (user_id) DO UPDATE SET display_name=EXCLUDED.display_name,bio=EXCLUDED.bio,updated_at=now()
-        RETURNING display_name,bio,created_at,updated_at")
+        RETURNING *")
         .bind(user.0.id.0.as_bytes().as_slice()).bind(input.display_name.trim()).bind(&input.bio)
         .fetch_one(&state.pool).await?;
     Ok(Json(profile))
 }
 
 /// One row of a library listing: the stored game, plus this user's entry for
-/// it. Both halves are the same types `GET /api/games/{igdb_id}` and
-/// `GET /api/me/library/{igdb_id}` return, so a column added to either table
-/// is published only once it is added to a struct — never implicitly, and
-/// never by one route without the other.
+/// it. The game matches the authenticated import response; the entry matches
+/// `GET /api/me/library/{igdb_id}`. Public game routes deliberately use the
+/// descriptive catalog type instead, omitting local bookkeeping.
 #[derive(Serialize, FromRow, TS)]
 #[ts(export)]
 pub struct LibraryRow {
@@ -467,7 +470,7 @@ async fn library(
         "SELECT g.id,g.igdb_id,g.name,g.slug,g.summary,g.cover_url,g.first_release_date,
             g.platforms,g.genres,g.developers,g.game_type,g.parent_igdb_id,g.version_parent_igdb_id,
             g.source_url,g.imported_at,g.refreshed_at,
-            e.status,e.rating,e.rating_playthrough_id,e.current_playthrough_id,e.created_at,e.updated_at
+            e.status,e.rating,e.rating_playthrough_id,e.current_playthrough_id,e.created_at,e.updated_at,e.public_id,e.visibility,e.version
         FROM library_entry_details e JOIN games g ON g.id=e.game_id WHERE e.user_id=$1
         AND ($2::text IS NULL OR e.status=$2) AND ($3::text IS NULL OR lower(g.name) LIKE lower($3))
         ORDER BY e.updated_at DESC,e.game_id LIMIT $4 OFFSET $5",
@@ -488,7 +491,7 @@ async fn entry(
     igdb_id: Result<Path<i64>, PathRejection>,
 ) -> ApiResult<Json<LibraryEntry>> {
     let row = sqlx::query_as(
-        "SELECT g.igdb_id,e.status,e.rating,e.rating_playthrough_id,e.current_playthrough_id,e.created_at,e.updated_at
+        "SELECT g.igdb_id,e.status,e.rating,e.rating_playthrough_id,e.current_playthrough_id,e.created_at,e.updated_at,e.public_id,e.visibility,e.version
         FROM library_entry_details e JOIN games g ON g.id=e.game_id WHERE e.user_id=$1 AND g.igdb_id=$2",
     )
     .bind(user.0.id.0.as_bytes().as_slice())
@@ -543,7 +546,7 @@ async fn save_entry(
     .execute(&mut *transaction)
     .await?;
     let row = sqlx::query_as(
-        "SELECT igdb_id,status,rating,rating_playthrough_id,current_playthrough_id,created_at,updated_at
+        "SELECT *
         FROM library_entry_details WHERE user_id=$1 AND game_id=$2",
     )
     .bind(user.0.id.0.as_bytes().as_slice())
