@@ -6589,6 +6589,7 @@ async fn browsing_pages_and_totals_share_a_snapshot_during_concurrent_writes() {
 
 // Remove feature 7 before reconstructing older schemas in disposable fixtures.
 async fn undo_lists(pool: &PgPool) {
+    undo_statistics(pool).await;
     sqlx::raw_sql(
         "DROP VIEW public_lists,selected_lists,game_list_details;
         DROP TABLE game_list_members,game_lists;
@@ -7289,5 +7290,592 @@ async fn list_browsing_and_migration_keep_private_data_out_of_public_counts() {
         )
         .await;
     }
+    f.finish().await;
+}
+
+// Reconstruct the pre-summary schema without changing existing profile values.
+async fn undo_statistics(pool: &PgPool) {
+    sqlx::raw_sql(
+        "ALTER TABLE profiles DROP COLUMN statistics_visibility;
+        DELETE FROM _sqlx_migrations WHERE version=202609160003;",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn statistics_choice(f: &Fixture, owner: &str, visibility: &str) -> Value {
+    let profile = owner_profile(f, owner).await;
+    f.edit(
+        "PUT",
+        "/api/me/publication",
+        owner,
+        &tag(&profile),
+        json!({"public_enabled":profile["public_enabled"],"statistics_visibility":visibility}),
+        StatusCode::OK,
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn statistics_define_runs_completions_replays_dates_and_live_corrections() {
+    let f = Fixture::new().await;
+    let (_, owner) = f.user("stats-owner").await;
+    let (_, other) = f.user("stats-other").await;
+    list_games_fixture(&f).await;
+    let empty = browse(&f, &owner, "/api/me/statistics").await;
+    assert_eq!(
+        empty["playthroughs"],
+        json!({"played_playthroughs":0,"unique_games_played":0,
+        "completed_playthroughs":0,"unique_completed_games":0,"replay_count":0,
+        "replayed_games":0,"undated_playthroughs":0})
+    );
+    assert_eq!(empty["rating_distribution"].as_array().unwrap().len(), 10);
+    for (index, bucket) in empty["rating_distribution"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(bucket, &json!({"rating":index+1,"count":0}));
+    }
+    let mut runs = Vec::new();
+    for input in [
+        json!({"igdb_id":42,"state":"completed","presentation_on":"2020-02-29","rating":8}),
+        json!({"igdb_id":42,"state":"completed","presentation_on":"2020-12-31","rating":8}),
+        json!({"igdb_id":43,"state":"abandoned","presentation_on":"2020-03-01","finished_on":"2020-03-01","rating":2}),
+        json!({"igdb_id":44,"state":"completed","rating":10}),
+        // An end date is evidence of play, never evidence of completion.
+        json!({"igdb_id":43,"finished_on":"2019-01-01","presentation_on":"2019-01-01"}),
+        // A review or rating by itself does not establish a run.
+        json!({"igdb_id":44,"rating":6,"review":"Only an assessment","presentation_on":"2020-01-01"}),
+    ] {
+        runs.push(
+            f.value(
+                "POST",
+                "/api/me/playthroughs",
+                &owner,
+                input,
+                StatusCode::CREATED,
+            )
+            .await,
+        );
+    }
+    f.value(
+        "PUT",
+        "/api/me/library/42",
+        &owner,
+        json!({"status":"backlog"}),
+        StatusCode::OK,
+    )
+    .await;
+    f.value(
+        "PUT",
+        "/api/me/library/43",
+        &owner,
+        json!({"status":"playing"}),
+        StatusCode::OK,
+    )
+    .await;
+    let list = new_list(&f, &owner, "Not activity").await;
+    edit_list(&f, &owner, &list, "/games", json!({"igdb_ids":[44]})).await;
+    let all = browse(&f, &owner, "/api/me/statistics").await;
+    assert_eq!(
+        all["playthroughs"],
+        json!({"played_playthroughs":5,"unique_games_played":3,
+        "completed_playthroughs":3,"unique_completed_games":2,"replay_count":2,
+        "replayed_games":2,"undated_playthroughs":1})
+    );
+    assert_eq!(
+        all["current_status_counts"],
+        json!({"backlog":1,"playing":1,"completed":0,"on_hold":0,"dropped":0})
+    );
+    assert_eq!(all["rating_distribution"][7]["count"], 2);
+    assert_eq!(all["rating_distribution"][9]["count"], 1);
+    assert_eq!(browse(&f, &other, "/api/me/statistics").await, empty);
+    let year = browse(&f, &owner, "/api/me/statistics?year=2020").await;
+    assert_eq!(
+        year["playthroughs"],
+        json!({"played_playthroughs":3,"unique_games_played":2,
+        "completed_playthroughs":2,"unique_completed_games":1,"replay_count":1,
+        "replayed_games":1,"undated_playthroughs":0})
+    );
+    assert_eq!(year["current_status_counts"], all["current_status_counts"]);
+    assert_eq!(year["rating_distribution"][5]["count"], 1);
+    assert_eq!(year["rating_distribution"][9]["count"], 0);
+    assert_eq!(
+        year,
+        browse(
+            &f,
+            &owner,
+            "/api/me/statistics?from_on=2020-01-01&to_on=2020-12-31"
+        )
+        .await
+    );
+    let leap = browse(
+        &f,
+        &owner,
+        "/api/me/statistics?from_on=2020-02-29&to_on=2020-02-29",
+    )
+    .await;
+    assert_eq!(leap["playthroughs"]["completed_playthroughs"], 1);
+    assert_eq!(leap["playthroughs"]["replay_count"], 0);
+    let unknown = browse(&f, &owner, "/api/me/statistics?undated=true").await;
+    assert_eq!(unknown["playthroughs"]["completed_playthroughs"], 1);
+    assert_eq!(unknown["rating_distribution"][9]["count"], 1);
+    assert_eq!(
+        browse(&f, &owner, "/api/me/statistics?undated=false").await["playthroughs"]["played_playthroughs"],
+        4
+    );
+    for query in [
+        "year=0",
+        "year=10000",
+        "year=2020&from_on=2020-01-01",
+        "undated=true&year=2020",
+        "from_on=2021-01-01&to_on=2020-01-01",
+        "from_on=2020-02-30",
+        "undated=yes",
+        "limit=20",
+        "user_id=x",
+        "year=2020&year=2021",
+    ] {
+        f.value(
+            "GET",
+            &format!("/api/me/statistics?{query}"),
+            &owner,
+            Value::Null,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    json_body(
+        f.send("GET", "/api/me/statistics", None, &[], Value::Null)
+            .await,
+        StatusCode::UNAUTHORIZED,
+    )
+    .await;
+    // Actual text editing has no date effect; chosen date, outcome and rating corrections do.
+    let edited = f
+        .edit(
+            "PATCH",
+            &run_path(&runs[0]),
+            &owner,
+            &tag(&runs[0]),
+            json!({"review":"Corrected text"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        browse(&f, &owner, "/api/me/statistics?year=2020").await,
+        year
+    );
+    f.edit(
+        "PATCH",
+        &run_path(&edited),
+        &owner,
+        &tag(&edited),
+        json!({"presentation_on":"2018-01-01","state":"abandoned","rating":1}),
+        StatusCode::OK,
+    )
+    .await;
+    let corrected = browse(&f, &owner, "/api/me/statistics?year=2020").await;
+    assert_eq!(corrected["playthroughs"]["completed_playthroughs"], 1);
+    assert_eq!(corrected["playthroughs"]["replay_count"], 0);
+    assert_eq!(corrected["rating_distribution"][7]["count"], 1);
+    f.edit(
+        "DELETE",
+        &run_path(&runs[1]),
+        &owner,
+        &tag(&runs[1]),
+        Value::Null,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert_eq!(
+        browse(&f, &owner, "/api/me/statistics?year=2020").await["playthroughs"]["completed_playthroughs"],
+        0
+    );
+    f.value(
+        "DELETE",
+        "/api/me/library/42",
+        &owner,
+        Value::Null,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    let removed = browse(&f, &owner, "/api/me/statistics").await;
+    assert_eq!(removed["playthroughs"]["unique_games_played"], 3);
+    assert_eq!(removed["current_status_counts"]["backlog"], 0);
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn statistics_public_summary_uses_only_selected_components_and_explicit_permission() {
+    let f = Fixture::new().await;
+    let (_, owner) = f.user("stats-public").await;
+    let (_, other) = f.user("stats-visitor").await;
+    list_games_fixture(&f).await;
+    let profile = publication(&f, &owner, true).await;
+    assert_eq!(profile["statistics_visibility"], "private");
+    let uri = format!(
+        "/api/public/profiles/{}/statistics",
+        profile["public_id"].as_str().unwrap()
+    );
+    let preview = "/api/me/public-preview/statistics";
+    for token in [None, Some(owner.as_str()), Some(other.as_str())] {
+        public_body(&f, &uri, token, StatusCode::NOT_FOUND).await;
+    }
+    public_body(&f, preview, Some(&owner), StatusCode::NOT_FOUND).await;
+    statistics_choice(&f, &owner, "public").await;
+    let baseline = public_body(&f, &uri, None, StatusCode::OK).await;
+    // Private runs of the same game cannot inflate public replays or ratings.
+    let private = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &owner,
+            json!({"igdb_id":42,"state":"completed","presentation_on":"2020-01-01","rating":10}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let run = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &owner,
+            json!({"igdb_id":42,"state":"completed","presentation_on":"2020-02-01","rating":2}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let rating_only = f.value("POST","/api/me/playthroughs",&owner,
+        json!({"igdb_id":43,"state":"completed","presentation_on":"2020-03-01","rating":7,"review":"Selected review"}),StatusCode::CREATED).await;
+    let entry = f
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &owner,
+            json!({"status":"playing"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(public_body(&f, &uri, None, StatusCode::OK).await, baseline);
+    let run = share_run(&f,&owner,&run,json!({"summary_visibility":"public","rating_visibility":"private","review_visibility":"private"})).await;
+    let rating_only = share_run(&f,&owner,&rating_only,json!({"summary_visibility":"private","rating_visibility":"public","review_visibility":"public"})).await;
+    f.edit(
+        "PUT",
+        "/api/me/library/42/visibility",
+        &owner,
+        &tag(&entry),
+        json!({"visibility":"public"}),
+        StatusCode::OK,
+    )
+    .await;
+    let shared = public_body(&f, &uri, None, StatusCode::OK).await;
+    assert_eq!(
+        shared["playthroughs"],
+        json!({"played_playthroughs":1,"unique_games_played":1,
+        "completed_playthroughs":1,"unique_completed_games":1,"replay_count":0,"replayed_games":0,"undated_playthroughs":0})
+    );
+    assert_eq!(shared["rating_distribution"][6]["count"], 1);
+    assert_eq!(shared["rating_distribution"][1]["count"], 0);
+    assert_eq!(shared["rating_distribution"][9]["count"], 0);
+    assert_eq!(shared["current_status_counts"]["playing"], 1);
+    for token in [Some(owner.as_str()), Some(other.as_str())] {
+        assert_eq!(public_body(&f, &uri, token, StatusCode::OK).await, shared);
+    }
+    assert_eq!(
+        public_body(&f, preview, Some(&owner), StatusCode::OK).await,
+        shared
+    );
+    assert_eq!(
+        public_body(&f, &format!("{uri}?year=2020"), None, StatusCode::OK).await,
+        shared
+    );
+    assert_eq!(
+        public_body(&f, &format!("{uri}?undated=true"), None, StatusCode::OK).await["playthroughs"]
+            ["played_playthroughs"],
+        0
+    );
+    for query in [
+        "state=completed",
+        "year=0",
+        "year=2020&undated=true",
+        "sort=date_added",
+    ] {
+        public_body(&f, &format!("{uri}?{query}"), None, StatusCode::BAD_REQUEST).await;
+        public_body(
+            &f,
+            &format!("{preview}?{query}"),
+            Some(&owner),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    // Private edits, dates, deletion and ratings have no public effect.
+    let private = f
+        .edit(
+            "PATCH",
+            &run_path(&private),
+            &owner,
+            &tag(&private),
+            json!({"presentation_on":"2020-12-31","rating":1}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(public_body(&f, &uri, None, StatusCode::OK).await, shared);
+    f.edit(
+        "DELETE",
+        &run_path(&private),
+        &owner,
+        &tag(&private),
+        Value::Null,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert_eq!(public_body(&f, &uri, None, StatusCode::OK).await, shared);
+    // Disable/re-enable retains the summary choice; only the owner can preview.
+    publication(&f, &owner, false).await;
+    for token in [None, Some(owner.as_str()), Some(other.as_str())] {
+        public_body(&f, &uri, token, StatusCode::NOT_FOUND).await;
+    }
+    assert_eq!(
+        public_body(&f, preview, Some(&owner), StatusCode::OK).await,
+        shared
+    );
+    public_body(&f, preview, Some(&other), StatusCode::NOT_FOUND).await;
+    public_body(&f, preview, None, StatusCode::UNAUTHORIZED).await;
+    publication(&f, &owner, true).await;
+    // Summary revocation retains independently public content and owner totals.
+    let own = browse(&f, &owner, "/api/me/statistics").await;
+    statistics_choice(&f, &owner, "private").await;
+    public_body(&f, &uri, None, StatusCode::NOT_FOUND).await;
+    public_body(&f, preview, Some(&owner), StatusCode::NOT_FOUND).await;
+    assert_eq!(browse(&f, &owner, "/api/me/statistics").await, own);
+    public_body(
+        &f,
+        &format!("/api/public/playthroughs/{}", run["id"].as_str().unwrap()),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    statistics_choice(&f, &owner, "public").await;
+    share_run(&f,&owner,&run,json!({"summary_visibility":"private","rating_visibility":"private","review_visibility":"private"})).await;
+    let revoked = public_body(&f, &uri, None, StatusCode::OK).await;
+    assert_eq!(revoked["playthroughs"]["played_playthroughs"], 0);
+    assert_eq!(revoked["rating_distribution"][6]["count"], 1);
+    f.edit(
+        "DELETE",
+        &run_path(&rating_only),
+        &owner,
+        &tag(&rating_only),
+        Value::Null,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert_eq!(
+        public_body(&f, &uri, None, StatusCode::OK).await["rating_distribution"],
+        baseline["rating_distribution"]
+    );
+    let head = f.send("HEAD", &uri, None, &[], Value::Null).await;
+    assert_eq!(head.status(), StatusCode::OK);
+    assert_eq!(head.headers()["cache-control"], "no-store");
+    assert!(!head.headers().contains_key("etag"));
+    assert!(!head.headers().contains_key("last-modified"));
+    public_body(
+        &f,
+        &format!("/api/public/profiles/{}/statistics", Uuid::new_v4()),
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn statistics_migration_and_publication_preserve_data_and_reject_stale_choices() {
+    let f = Fixture::new().await;
+    let (_, owner) = f.user("stats-migration").await;
+    let profile = publication(&f, &owner, true).await;
+    let run = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &owner,
+            json!({"igdb_id":42,"state":"completed","rating":9}),
+            StatusCode::CREATED,
+        )
+        .await;
+    undo_statistics(&f.database.app).await;
+    sqlx::migrate!("./migrations")
+        .run(&f.database.app)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations")
+        .run(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(owner_profile(&f, &owner).await, profile);
+    assert_eq!(browse(&f, &owner, &run_path(&run)).await, run);
+    let saved = statistics_choice(&f, &owner, "public").await;
+    assert_eq!(
+        saved["version"].as_i64().unwrap(),
+        profile["version"].as_i64().unwrap() + 1
+    );
+    assert_eq!(statistics_choice(&f, &owner, "public").await, saved);
+    assert_eq!(publication(&f, &owner, true).await, saved); // omission preserves
+    let null = f
+        .edit(
+            "PUT",
+            "/api/me/publication",
+            &owner,
+            &tag(&saved),
+            json!({"public_enabled":true,"statistics_visibility":null}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(null, saved);
+    f.edit(
+        "PUT",
+        "/api/me/publication",
+        &owner,
+        &tag(&profile),
+        json!({"public_enabled":true,"statistics_visibility":"private"}),
+        StatusCode::PRECONDITION_FAILED,
+    )
+    .await;
+    f.edit(
+        "PUT",
+        "/api/me/publication",
+        &owner,
+        &tag(&saved),
+        json!({"public_enabled":true,"statistics_visibility":"friends"}),
+        StatusCode::UNPROCESSABLE_ENTITY,
+    )
+    .await;
+    let tag = tag(&saved);
+    let headers = [("If-Match", tag.as_str())];
+    let (a, b) = tokio::join!(
+        f.send(
+            "PUT",
+            "/api/me/publication",
+            Some(&owner),
+            &headers,
+            json!({"public_enabled":true,"statistics_visibility":"private"})
+        ),
+        f.send(
+            "PUT",
+            "/api/me/publication",
+            Some(&owner),
+            &headers,
+            json!({"public_enabled":false,"statistics_visibility":"public"})
+        )
+    );
+    let mut codes = [a.status().as_u16(), b.status().as_u16()];
+    codes.sort();
+    assert_eq!(codes, [200, 412]);
+    let uri = format!(
+        "/api/public/profiles/{}/statistics",
+        profile["public_id"].as_str().unwrap()
+    );
+    public_body(&f, &uri, None, StatusCode::NOT_FOUND).await;
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn statistics_snapshots_keep_metrics_consistent_during_concurrent_history_edits() {
+    let f = Fixture::new().await;
+    let (uid, owner) = f.user("stats-snapshot").await;
+    let profile = publication(&f, &owner, true).await;
+    statistics_choice(&f, &owner, "public").await;
+    let run = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &owner,
+            json!({"igdb_id":42,"state":"completed","rating":8,"presentation_on":"2020-01-01"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    share_run(&f, &owner, &run, json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"private"})).await;
+    let entry = f
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &owner,
+            json!({"status":"completed"}),
+            StatusCode::OK,
+        )
+        .await;
+    f.edit(
+        "PUT",
+        "/api/me/library/42/visibility",
+        &owner,
+        &tag(&entry),
+        json!({"visibility":"public"}),
+        StatusCode::OK,
+    )
+    .await;
+    let uri = format!(
+        "/api/public/profiles/{}/statistics",
+        profile["public_id"].as_str().unwrap()
+    );
+    // Atomically alternate completion/rating/status/date. A response must see
+    // one committed combination even though its component queries are separate.
+    let ((), ()) = tokio::join!(
+        async {
+            for n in 0..40 {
+                let mut tx = f.database.app.begin().await.unwrap();
+                let completed = n % 2 == 1;
+                sqlx::query("UPDATE playthroughs SET state=$2,rating=$3,presentation_on=$4::text::date WHERE user_id=$1")
+                    .bind(uid.0.as_bytes().as_slice())
+                    .bind(if completed {"completed"} else {"abandoned"})
+                    .bind(if completed {8_i16} else {2_i16})
+                    .bind(if completed {"2020-01-01"} else {"2019-01-01"})
+                    .execute(&mut *tx).await.unwrap();
+                sqlx::query("UPDATE library_entries SET status=$2 WHERE user_id=$1")
+                    .bind(uid.0.as_bytes().as_slice())
+                    .bind(if completed { "completed" } else { "dropped" })
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        },
+        async {
+            for _ in 0..20 {
+                let public = public_body(&f, &uri, None, StatusCode::OK).await;
+                let personal = browse(&f, &owner, "/api/me/statistics").await;
+                let filtered =
+                    public_body(&f, &format!("{uri}?year=2020"), None, StatusCode::OK).await;
+                for value in [&public, &personal, &filtered] {
+                    assert_eq!(
+                        value["playthroughs"]["completed_playthroughs"],
+                        value["rating_distribution"][7]["count"]
+                    );
+                    assert_eq!(
+                        value["playthroughs"]["completed_playthroughs"],
+                        value["current_status_counts"]["completed"]
+                    );
+                    assert_eq!(value["playthroughs"]["replay_count"], 0);
+                }
+                assert_eq!(
+                    filtered["playthroughs"]["played_playthroughs"],
+                    filtered["playthroughs"]["completed_playthroughs"]
+                );
+                for value in [&public, &personal] {
+                    assert_eq!(value["playthroughs"]["played_playthroughs"], 1);
+                    assert_eq!(
+                        value["rating_distribution"][1]["count"],
+                        value["current_status_counts"]["dropped"]
+                    );
+                }
+            }
+        }
+    );
     f.finish().await;
 }

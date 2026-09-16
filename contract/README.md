@@ -268,3 +268,19 @@ Profile counts include `lists`; favorites are identified by kind within that sec
 Public/preview detail contains full ordered game context without personal status,
 ratings, history, revisions or timestamps. See the
 [complete contract](../docs/api.md#favorites-ordered-lists-and-want-to-play).
+
+## Statistics
+
+`statistics(query)` reads personal aggregates. `publicStatistics(profileId, query)`
+and `previewStatistics(query)` read only selected public components. All return
+`Statistics`: recorded-run metrics, ten rating buckets, and current library status
+counts. `StatisticsQuery` accepts `year` or inclusive `from_on`/`to_on`, plus
+`undated`. Filters use chosen presentation dates; current status counts always
+remain current. Replays count additional runs per game within the selected period;
+ratings count entries, independently of summary publication.
+
+Use `setPublication(profile, {public_enabled, statistics_visibility: "public"})`
+to opt into a summary. This choice defaults private and omission/null preserves it.
+Preview bypasses only the profile gate, so first select the public summary while
+the profile is disabled to preview it before enabling. Private inputs never affect
+public statistics. See [metric definitions and privacy](../docs/api.md#personal-statistics-and-explicitly-shared-summaries).

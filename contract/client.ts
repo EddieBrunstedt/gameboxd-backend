@@ -1,3 +1,5 @@
+import type { Statistics } from "./types/Statistics";
+import type { StatisticsQuery } from "./types/StatisticsQuery";
 import type { GameList } from "./types/GameList";
 import type { GameListDetail } from "./types/GameListDetail";
 import type { PublicList } from "./types/PublicList";
@@ -441,3 +443,17 @@ export const publicLists = (profileId: string, query: ListQuery = {}): Promise<P
 /** Selected membership only, with the authenticated owner's profile gate bypassed. */
 export const previewList = (id: string): Promise<PublicListDetail> =>
   request("GET", `/api/me/public-preview/lists/${encodeURIComponent(id)}`);
+
+// --- Statistics -----------------------------------------------------------
+
+/** Date filters use chosen historical dates; status counts remain current. */
+export const statistics = (query: StatisticsQuery = {}): Promise<Statistics> =>
+  request("GET", "/api/me/statistics", { query });
+
+/** Requires explicit statistics publication and an enabled profile. */
+export const publicStatistics = (profileId: string, query: StatisticsQuery = {}): Promise<Statistics> =>
+  request("GET", `/api/public/profiles/${encodeURIComponent(profileId)}/statistics`, { query });
+
+/** Applies the summary choice and public inputs, bypassing only the profile gate. */
+export const previewStatistics = (query: StatisticsQuery = {}): Promise<Statistics> =>
+  request("GET", "/api/me/public-preview/statistics", { query });

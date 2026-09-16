@@ -86,3 +86,8 @@ export type { CreateListInput } from "./types/CreateListInput";
 export type { ListInput } from "./types/ListInput";
 export type { ListGamesInput } from "./types/ListGamesInput";
 export type { ListKind } from "./types/ListKind";
+
+export type { Statistics } from "./types/Statistics";
+export type { StatisticsQuery } from "./types/StatisticsQuery";
+export type { PlaythroughStatistics } from "./types/PlaythroughStatistics";
+export type { RatingBucket } from "./types/RatingBucket";

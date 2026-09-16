@@ -22,6 +22,7 @@ mod notes;
 use browsing::{BrowsePage, BrowseQuery, Kind};
 mod profiles;
 mod sharing;
+mod statistics;
 
 use crate::{
     AppState,
@@ -39,6 +40,7 @@ pub fn routes() -> Router<AppState> {
         .merge(lists::routes())
         .merge(sharing::routes())
         .merge(profiles::routes())
+        .merge(statistics::routes())
         .route("/api/me", get(me).put(update_profile))
         .route("/api/games", get(games))
         .route("/api/games/{igdb_id}", get(game))

@@ -133,29 +133,30 @@ pub enum PublicProfileSection {
 }
 
 // Scope is constructed by handlers, never deserialized from visitor input.
-enum Scope {
+pub(super) enum Scope {
     PublicId(Uuid),
     Handle(String),
     OwnerPreview(Vec<u8>),
 }
 
 #[derive(FromRow)]
-struct SelectedProfile {
-    user_id: Vec<u8>,
+pub(super) struct SelectedProfile {
+    pub(super) user_id: Vec<u8>,
+    pub(super) statistics_visibility: crate::models::Visibility,
     id: Uuid,
     handle: Option<String>,
     display_name: String,
     bio: Option<String>,
 }
 
-async fn resolve(conn: &mut PgConnection, scope: Scope) -> ApiResult<SelectedProfile> {
+pub(super) async fn resolve(conn: &mut PgConnection, scope: Scope) -> ApiResult<SelectedProfile> {
     let (id, handle, owner) = match scope {
         Scope::PublicId(id) => (Some(id), None, None),
         Scope::Handle(handle) => (None, Some(handle), None),
         Scope::OwnerPreview(owner) => (None, None, Some(owner)),
     };
     sqlx::query_as(
-        "SELECT user_id,public_id AS id,handle,display_name,
+        "SELECT user_id,statistics_visibility,public_id AS id,handle,display_name,
                 CASE WHEN bio_visibility='public' THEN bio END AS bio
          FROM profiles WHERE (public_enabled AND (public_id=$1 OR handle=$2)) OR user_id=$3",
     )

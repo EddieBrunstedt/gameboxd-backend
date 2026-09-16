@@ -147,7 +147,7 @@ impl BrowseQuery {
         Ok(())
     }
 
-    fn filters(&self, sql: &mut QueryBuilder<Postgres>, include_status: bool) {
+    pub(super) fn filters(&self, sql: &mut QueryBuilder<Postgres>, include_status: bool) {
         if let Some(q) = &self.q {
             sql.push(" AND lower(game_name) LIKE lower(")
                 .push_bind(pattern(q))

@@ -833,3 +833,101 @@ or disabling the profile removes subsequent public access with indistinguishable
 including errors/HEAD, are `Cache-Control: no-store`, without ETag or Last-Modified.
 An already in-flight read can finish from its authorized snapshot; no stale response
 cache may continue serving revoked lists.
+
+## Personal statistics and explicitly shared summaries
+
+| Method | Route | Access / result |
+| --- | --- | --- |
+| GET | `/api/me/statistics` | Session owner's complete `Statistics` |
+| GET | `/api/public/profiles/{public_id}/statistics` | Selected public `Statistics`, only with an enabled profile and public summary choice |
+| GET | `/api/me/public-preview/statistics` | Session owner's selected public `Statistics`; bypasses only the profile gate |
+
+Statistics publication is a separate choice on the owner `Profile`:
+`statistics_visibility: "private" | "public"`, initially **private**, including
+for profiles already enabled before migration. Set it through
+`PUT /api/me/publication` alongside required `public_enabled`, using the profile's
+current `If-Match` revision. Omission or null preserves the summary choice.
+No-op writes preserve timestamps/revisions; competing profile/publication edits
+use the same profile lock and revision. Enabling a profile does not publish its
+summary. Publishing a summary does not publish any underlying private component.
+Disabling the profile preserves all choices. Missing, disabled, and unshared
+summaries return the same 404, even to a signed-in owner. Preview requires the
+summary choice to be public, so select it while the profile is disabled to preview
+before enabling. The personal endpoint always remains available to its owner.
+
+All three endpoints accept only `year`, `from_on`, `to_on`, and `undated`:
+
+- `year=2020` selects January 1 through December 31, inclusive (years 1–9999).
+  Alternatively use an inclusive date range, with either or both endpoints.
+  Reversed ranges, year combined with a range, duplicate/unknown parameters,
+  malformed dates and invalid booleans return 400.
+- Date filtering uses **`presentation_on`**, the chosen historical day, for both
+  run and rating statistics. It never substitutes start/end dates or actual write,
+  edit or publication timestamps. A run with a known end date but no chosen
+  presentation date remains undated for these statistics, matching diary browsing.
+  A yearly completion count therefore means completed runs presented in that year,
+  not a claim that their end dates fall within it.
+- Without date filters, include dated and undated records. `undated=true` selects
+  unknown chosen dates and cannot combine with a year/range; `undated=false`
+  selects known dates and may narrow a year/range. Date filters exclude unknown
+  dates. Calendar days are not converted through time zones.
+- **`current_status_counts` always describes the current library**, unaffected by
+  historical filters. There is no reconstructed historical library snapshot.
+
+`Statistics` is a dedicated aggregate response with three fields:
+`playthroughs`, `rating_distribution`, and `current_status_counts`. It has no
+resource IDs, write/edit timestamps, revisions, generated-at times or history.
+The owner/public endpoints share this safe wire shape, but use different inputs.
+
+A **recorded played run** has a non-null state (`active`, `paused`, `completed`,
+`abandoned`) or at least one explicit start/end date. An otherwise unknown
+review/rating-only entry is not evidence of a run, even if its assessment has a
+presentation date. Lightweight library status, notes, list membership and
+favorites do not create recorded runs. Unknown-state runs with play dates count
+as played, but not completed. Within the eligible, date-filtered run set:
+
+| `playthroughs` field | Definition |
+| --- | --- |
+| `played_playthroughs` | Number of recorded played runs |
+| `unique_games_played` | Distinct games represented by those runs |
+| `completed_playthroughs` | Runs with state exactly `completed`; a finish date or abandonment alone never qualifies |
+| `unique_completed_games` | Distinct games among completed runs |
+| `replay_count` | Sum of `max(run_count_for_game - 1, 0)`; additional recorded runs beyond one per game |
+| `replayed_games` | Distinct games with at least two recorded runs |
+| `undated_playthroughs` | Recorded runs whose chosen presentation date is unknown, within the selected set |
+
+Two completed runs of one game give two played runs, two completions, one unique
+played/completed game, one replay and one replayed game. Replay counts do not
+require completion. They are calculated **within the selected period**, without
+looking up earlier runs outside it: one run in each of two years contributes one
+all-time replay but zero in each year's isolated statistics. There is no claim
+about which undated or tied run was chronologically first. Hidden runs never
+classify a public run as a replay. Deleting/correcting a run deliberately changes
+these counts.
+
+`rating_distribution` always contains ten `{rating, count}` buckets in ascending
+1–10 order, including zero buckets. Each eligible non-null rating contributes
+once, including rating-only entries and repeat assessments of the same game.
+It is an **entry distribution**, not the library's latest-rating-per-game rule.
+No rating is inferred from an unrated run. `current_status_counts` contains
+`backlog`, `playing`, `completed`, `on_hold`, and `dropped`, counting current
+library entries per status. A `completed` library status is lightweight tracking
+and is independent of recorded playthrough completions; no status asserts ownership.
+Empty accounts return zero counts and all ten zero rating buckets.
+
+Personal inputs are the owner's recorded runs, ratings and library entries.
+Public/preview inputs are **only** `selected_playthroughs`, `selected_ratings`,
+and `selected_library_entries`, after authorizing the profile and summary choice.
+A public rating contributes without publishing its run summary; a public summary
+contributes no private rating. A public review/note/list contributes neither a run
+nor a rating by itself. Counts never include private runs, private library statuses,
+private ratings, or effects of private rows on deduplication/replay classification.
+
+Each response authorizes and calculates all metrics in one read-only repeatable-read
+snapshot. There are no materialized counters or caches: historical edits, deletion,
+component revocation, profile disabling and summary revocation take effect on
+subsequent reads. A read already in flight may complete using its earlier authorized
+snapshot, as with other public views. Every response (including errors and HEAD) is
+`Cache-Control: no-store`; public/preview responses omit ETag and Last-Modified.
+No provider request is needed. Refetch after changes; a previously delivered response
+cannot be withdrawn from a visitor's memory.

@@ -101,3 +101,9 @@ revision, including reorders and visibility. Lists appear in public profiles and
 visitor preview through separate safe projections. `backlog` remains want-to-play;
 no library status or list membership claims ownership.
 See [the list API contract](docs/api.md#favorites-ordered-lists-and-want-to-play).
+
+Personal statistics are available at `/api/me/statistics`, with chosen-date
+filtering, recorded-run/completion/replay metrics, rating buckets and current
+library status counts. Public summaries require a separate private-by-default
+`statistics_visibility` choice and use only explicitly public inputs. Owner preview
+applies the same rules. See [the statistics contract](docs/api.md#personal-statistics-and-explicitly-shared-summaries).

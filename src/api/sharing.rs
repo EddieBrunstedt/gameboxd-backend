@@ -35,6 +35,9 @@ pub struct PublicationInput {
     // Omission/null preserves the existing explicit bio choice.
     #[ts(optional = nullable)]
     pub bio_visibility: Option<Visibility>,
+    // Omission/null preserves the explicit summary choice.
+    #[ts(optional = nullable)]
+    pub statistics_visibility: Option<Visibility>,
 }
 
 #[derive(Deserialize, TS)]
@@ -72,10 +75,11 @@ async fn set_publication(
     if !precondition.is_met_by(version) {
         return Err(stale());
     }
-    let row = sqlx::query_as("UPDATE profiles SET public_enabled=$2,bio_visibility=COALESCE($3,bio_visibility) WHERE user_id=$1 RETURNING *")
+    let row = sqlx::query_as("UPDATE profiles SET public_enabled=$2,bio_visibility=COALESCE($3,bio_visibility),statistics_visibility=COALESCE($4,statistics_visibility) WHERE user_id=$1 RETURNING *")
         .bind(owner)
         .bind(input.public_enabled)
         .bind(input.bio_visibility)
+        .bind(input.statistics_visibility)
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
