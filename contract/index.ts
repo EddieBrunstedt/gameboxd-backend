@@ -77,3 +77,12 @@ export type { BrowsePage } from "./types/BrowsePage";
 export type { BrowseQuery } from "./types/BrowseQuery";
 export type { StatusCounts } from "./types/StatusCounts";
 export type { LibrarySort } from "./types/LibrarySort";
+
+export type { GameList } from "./types/GameList";
+export type { GameListDetail } from "./types/GameListDetail";
+export type { PublicList } from "./types/PublicList";
+export type { PublicListDetail } from "./types/PublicListDetail";
+export type { CreateListInput } from "./types/CreateListInput";
+export type { ListInput } from "./types/ListInput";
+export type { ListGamesInput } from "./types/ListGamesInput";
+export type { ListKind } from "./types/ListKind";

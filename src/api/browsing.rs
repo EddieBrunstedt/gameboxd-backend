@@ -58,6 +58,7 @@ pub(super) enum Kind {
     PublicNotes,
     Ratings,
     Reviews,
+    Lists,
 }
 
 impl Kind {
@@ -103,7 +104,7 @@ impl BrowseQuery {
         }
         if let Some(after) = &self.after {
             Cursor::parse(after)?;
-            if kind.library() || self.offset() != 0 {
+            if matches!(kind, Kind::Lists) || kind.library() || self.offset() != 0 {
                 return Err(ApiError::invalid(
                     "after requires a dated collection and offset=0",
                 ));
@@ -113,7 +114,16 @@ impl BrowseQuery {
             || self.from_on.is_some()
             || self.to_on.is_some()
             || self.undated.is_some();
-        let invalid = if kind.library() {
+        let invalid = if matches!(kind, Kind::Lists) {
+            dates
+                || self.igdb_id.is_some()
+                || self.state.is_some()
+                || self.has_rating.is_some()
+                || self.has_review.is_some()
+                || self.text.is_some()
+                || self.status.is_some()
+                || self.sort.is_some()
+        } else if kind.library() {
             dates
                 || self.state.is_some()
                 || self.has_review.is_some()
@@ -325,7 +335,9 @@ where
     if let Some(after) = &params.after {
         Cursor::parse(after)?.filter(&mut sql);
     }
-    let order = if kind.library() {
+    let order = if matches!(kind, Kind::Lists) {
+        "lower(title),id"
+    } else if kind.library() {
         match params.sort.unwrap_or_default() {
             LibrarySort::Title => "lower(game_name),igdb_id",
             LibrarySort::Rating => "rating DESC NULLS LAST,lower(game_name),igdb_id",
@@ -346,7 +358,7 @@ where
     let mut rows = sql.build().fetch_all(&mut *conn).await?;
     let has_more = rows.len() > params.limit() as usize;
     rows.truncate(params.limit() as usize);
-    let next_cursor = if has_more && !kind.library() {
+    let next_cursor = if has_more && !kind.library() && !matches!(kind, Kind::Lists) {
         rows.last()
             .map(|row| {
                 Ok::<_, sqlx::Error>(

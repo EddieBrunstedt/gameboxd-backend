@@ -5200,6 +5200,7 @@ async fn visibility_migration_keeps_existing_content_private_without_changing_hi
 
 // Undo only feature 5 in disposable fixtures; restore feature 4's gated views.
 async fn undo_public_profiles(pool: &PgPool) {
+    undo_lists(pool).await;
     sqlx::raw_sql("DROP VIEW public_library_entries,public_reviews,public_ratings,public_playthroughs,public_notes;
         DROP VIEW selected_library_entries;
         DROP VIEW selected_reviews,selected_ratings,selected_playthroughs,selected_notes;
@@ -5320,7 +5321,7 @@ async fn public_profiles_and_owner_preview_share_projection_counts_and_permissio
     assert_eq!(
         preview,
         json!({"id":id,"handle":null,"display_name":"Public author","bio":null,
-        "counts":{"current_games":1,"library":1,"playthroughs":1,"ratings":1,"reviews":1,"notes":1}})
+        "counts":{"current_games":1,"library":1,"playthroughs":1,"ratings":1,"reviews":1,"notes":1,"lists":0}})
     );
     // Preview has no target user input. Another owner sees only their own selection.
     let other_profile = owner_profile(&f, &other).await;
@@ -5469,7 +5470,7 @@ async fn public_profiles_and_owner_preview_share_projection_counts_and_permissio
             .clone();
     assert_eq!(
         counts,
-        json!({"current_games":1,"library":1,"playthroughs":0,"ratings":0,"reviews":0,"notes":1})
+        json!({"current_games":1,"library":1,"playthroughs":0,"ratings":0,"reviews":0,"notes":1,"lists":0})
     );
     let library = public_body(
         &f,
@@ -5546,7 +5547,7 @@ async fn profile_chronology_pagination_and_independent_review_links_use_selected
     );
     assert_eq!(
         public_body(&f, &base, None, StatusCode::OK).await["counts"],
-        json!({"current_games":0,"library":0,"playthroughs":0,"ratings":0,"reviews":4,"notes":0})
+        json!({"current_games":0,"library":0,"playthroughs":0,"ratings":0,"reviews":4,"notes":0,"lists":0})
     );
     for (offset, id) in expected.iter().enumerate() {
         let route = format!("{base}/reviews?limit=1&offset={offset}");
@@ -6583,5 +6584,710 @@ async fn browsing_pages_and_totals_share_a_snapshot_during_concurrent_writes() {
             }
         }
     );
+    f.finish().await;
+}
+
+// Remove feature 7 before reconstructing older schemas in disposable fixtures.
+async fn undo_lists(pool: &PgPool) {
+    sqlx::raw_sql(
+        "DROP VIEW public_lists,selected_lists,game_list_details;
+        DROP TABLE game_list_members,game_lists;
+        DROP FUNCTION game_list_revision();
+        DELETE FROM _sqlx_migrations WHERE version=202609160002;",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+async fn list_games_fixture(f: &Fixture) {
+    for id in [42_i64, 43, 44] {
+        sqlx::query("INSERT INTO games(id,igdb_id,name,slug,source_url) VALUES ($1,$2,$3,$3,'https://example.test')")
+            .bind(Uuid::new_v4()).bind(id).bind(format!("Game {id}"))
+            .execute(&f.database.app).await.unwrap();
+    }
+}
+
+fn list_path(list: &Value) -> String {
+    format!("/api/me/lists/{}", list["list"]["id"].as_str().unwrap())
+}
+fn member_ids(list: &Value) -> Vec<i64> {
+    list["games"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|g| g["igdb_id"].as_i64().unwrap())
+        .collect()
+}
+async fn edit_list(f: &Fixture, owner: &str, list: &Value, suffix: &str, input: Value) -> Value {
+    f.edit(
+        "PUT",
+        &format!("{}{suffix}", list_path(list)),
+        owner,
+        &tag(&list["list"]),
+        input,
+        StatusCode::OK,
+    )
+    .await
+}
+async fn new_list(f: &Fixture, owner: &str, title: &str) -> Value {
+    f.value(
+        "POST",
+        "/api/me/lists",
+        owner,
+        json!({"title":title}),
+        StatusCode::CREATED,
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn ordered_lists_validate_edits_and_preserve_independent_history() {
+    let f = Fixture::new().await;
+    let (uid, owner) = f.user("lists-owner").await;
+    let (_, other) = f.user("lists-other").await;
+    list_games_fixture(&f).await;
+    let entry = f
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &owner,
+            json!({"status":"backlog"}),
+            StatusCode::OK,
+        )
+        .await;
+    let run = f.value("POST", "/api/me/playthroughs", &owner,
+        json!({"igdb_id":42,"rating":8,"review":"Private history","presentation_on":"2001-01-01"}), StatusCode::CREATED).await;
+    let list = new_list(&f, &owner, "Play next").await;
+    assert_eq!(list["list"]["kind"], "custom");
+    assert_eq!(list["list"]["visibility"], "private");
+    assert_eq!(list["list"]["version"], 1);
+    assert_eq!(list["games"], json!([]));
+    let uri = list_path(&list);
+    for method in ["GET", "PUT", "DELETE"] {
+        let response = f
+            .send(
+                method,
+                &uri,
+                Some(&other),
+                &[("If-Match", "\"1\"")],
+                json!({"title":"Takeover"}),
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+    assert_eq!(
+        f.call("GET", &uri, None, Value::Null).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for suffix in ["/games", "/visibility"] {
+        let input = if suffix == "/games" {
+            json!({"igdb_ids":[42]})
+        } else {
+            json!({"visibility":"public"})
+        };
+        f.edit(
+            "PUT",
+            &format!("{uri}{suffix}"),
+            &other,
+            "\"1\"",
+            input,
+            StatusCode::NOT_FOUND,
+        )
+        .await;
+    }
+    for input in [
+        json!({"title":"  "}),
+        json!({"title":"a".repeat(121)}),
+        json!({"title":"ok","description":"x".repeat(5001)}),
+        json!({"title":"x\u{0}"}),
+    ] {
+        f.value(
+            "POST",
+            "/api/me/lists",
+            &owner,
+            input.clone(),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        f.edit("PUT", &uri, &owner, "\"1\"", input, StatusCode::BAD_REQUEST)
+            .await;
+    }
+    for input in [
+        json!({"title":"x","kind":"wishlist"}),
+        json!({"title":"x","visibility":"public"}),
+        json!({"title":null}),
+    ] {
+        f.value(
+            "POST",
+            "/api/me/lists",
+            &owner,
+            input,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+    }
+    for invalid_tag in ["*", "1", "W/\"1\""] {
+        let expected = if invalid_tag.starts_with("W/") {
+            StatusCode::PRECONDITION_FAILED
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        f.edit(
+            "PUT",
+            &format!("{uri}/games"),
+            &owner,
+            invalid_tag,
+            json!({"igdb_ids":[42]}),
+            expected,
+        )
+        .await;
+    }
+    for input in [
+        json!([42, 42]),
+        json!([0]),
+        json!([-1]),
+        json!([42, 999]),
+        json!((1..=501).collect::<Vec<_>>()),
+    ] {
+        f.edit(
+            "PUT",
+            &format!("{uri}/games"),
+            &owner,
+            "\"1\"",
+            json!({"igdb_ids":input}),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        assert_eq!(browse(&f, &owner, &uri).await, list);
+    }
+    for (method, suffix, input) in [
+        ("PUT", "", json!({"title":"x"})),
+        ("PUT", "/games", json!({"igdb_ids":[42]})),
+        ("PUT", "/visibility", json!({"visibility":"public"})),
+        ("DELETE", "", Value::Null),
+    ] {
+        f.value(
+            method,
+            &format!("{uri}{suffix}"),
+            &owner,
+            input,
+            StatusCode::PRECONDITION_REQUIRED,
+        )
+        .await;
+    }
+    let list = edit_list(&f, &owner, &list, "/games", json!({"igdb_ids":[43,42,44]})).await;
+    assert_eq!(member_ids(&list), [43, 42, 44]);
+    assert_eq!(list["list"]["version"], 2);
+    assert_eq!(list["list"]["game_count"], 3);
+    let noop = edit_list(&f, &owner, &list, "/games", json!({"igdb_ids":[43,42,44]})).await;
+    assert_eq!(noop, list);
+    let list = edit_list(
+        &f,
+        &owner,
+        &list,
+        "",
+        json!({"title":"  My next games  ","description":"Notes\nabout games"}),
+    )
+    .await;
+    assert_eq!(list["list"]["title"], "  My next games  ");
+    let list = edit_list(&f, &owner, &list, "/games", json!({"igdb_ids":[44,43]})).await;
+    assert_eq!(member_ids(&browse(&f, &owner, &uri).await), [44, 43]);
+    let current = f.current_entry(&owner).await;
+    assert_eq!(current["status"], entry["status"]);
+    assert_eq!(current["version"], entry["version"]);
+    assert_eq!(browse(&f, &owner, &run_path(&run)).await, run);
+    assert_eq!(browse(&f, &owner, "/api/me/library").await["total"], 1);
+    assert_eq!(browse(&f, &owner, "/api/me/playthroughs").await["total"], 1);
+    f.value(
+        "DELETE",
+        "/api/me/library/42",
+        &owner,
+        Value::Null,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert_eq!(browse(&f, &owner, &uri).await, list);
+    assert_eq!(browse(&f, &other, "/api/me/lists").await["total"], 0);
+    let empty = edit_list(&f, &owner, &list, "/games", json!({"igdb_ids":[]})).await;
+    assert_eq!(empty["list"]["game_count"], 0);
+    let list = edit_list(&f, &owner, &empty, "/games", json!({"igdb_ids":[42]})).await;
+    f.edit(
+        "DELETE",
+        &uri,
+        &owner,
+        &tag(&empty["list"]),
+        Value::Null,
+        StatusCode::PRECONDITION_FAILED,
+    )
+    .await;
+    f.edit(
+        "DELETE",
+        &uri,
+        &owner,
+        &tag(&list["list"]),
+        Value::Null,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM game_list_members")
+            .fetch_one(&f.database.app)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(browse(&f, &owner, &run_path(&run)).await, run);
+    // Account deletion removes lists/members without deleting shared catalog games.
+    let list = new_list(&f, &owner, "Deleted account").await;
+    edit_list(&f, &owner, &list, "/games", json!({"igdb_ids":[42]})).await;
+    sqlx::query("DELETE FROM gameboxd_auth.users WHERE id=$1")
+        .bind(uid.0.as_bytes().as_slice())
+        .execute(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM game_lists")
+            .fetch_one(&f.database.app)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM game_list_members")
+            .fetch_one(&f.database.app)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM games")
+            .fetch_one(&f.database.app)
+            .await
+            .unwrap(),
+        3
+    );
+    assert!(f.server.received_requests().await.unwrap().is_empty());
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn public_lists_share_only_selected_membership_and_revoke_every_access_path() {
+    let f = Fixture::new().await;
+    let (_, owner) = f.user("public-lists-owner").await;
+    let (_, other) = f.user("public-lists-other").await;
+    list_games_fixture(&f).await;
+    let profile = owner_profile(&f, &owner).await;
+    let profile_uri = format!(
+        "/api/public/profiles/{}",
+        profile["public_id"].as_str().unwrap()
+    );
+    let list = new_list(&f, &owner, "Play next").await;
+    let list = edit_list(&f, &owner, &list, "/games", json!({"igdb_ids":[43,42]})).await;
+    let id = list["list"]["id"].as_str().unwrap().to_owned();
+    let public_uri = format!("/api/public/lists/{id}");
+    let preview_uri = format!("/api/me/public-preview/lists/{id}");
+    public_body(&f, &preview_uri, Some(&owner), StatusCode::NOT_FOUND).await;
+    let list = edit_list(
+        &f,
+        &owner,
+        &list,
+        "/visibility",
+        json!({"visibility":"public"}),
+    )
+    .await;
+    let preview = public_body(&f, &preview_uri, Some(&owner), StatusCode::OK).await;
+    for visitor in [None, Some(owner.as_str()), Some(other.as_str())] {
+        public_body(&f, &public_uri, visitor, StatusCode::NOT_FOUND).await;
+    }
+    public_body(&f, &preview_uri, Some(&other), StatusCode::NOT_FOUND).await;
+    public_body(&f, &preview_uri, None, StatusCode::UNAUTHORIZED).await;
+    let selected = public_body(
+        &f,
+        "/api/me/public-preview/lists",
+        Some(&owner),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(selected["page"]["data"], json!([preview["list"]]));
+    publication(&f, &owner, true).await;
+    for visitor in [None, Some(owner.as_str()), Some(other.as_str())] {
+        assert_eq!(
+            public_body(&f, &public_uri, visitor, StatusCode::OK).await,
+            preview
+        );
+        assert_eq!(
+            public_body(&f, &format!("{profile_uri}/lists"), visitor, StatusCode::OK).await,
+            selected
+        );
+    }
+    assert_eq!(
+        public_body(&f, &profile_uri, None, StatusCode::OK).await["counts"]["lists"],
+        1
+    );
+    let mut keys: Vec<_> = preview["list"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort();
+    assert_eq!(
+        keys,
+        [
+            "author_id",
+            "author_name",
+            "description",
+            "game_count",
+            "id",
+            "kind",
+            "title"
+        ]
+    );
+    for game in preview["games"].as_array().unwrap() {
+        let mut keys: Vec<_> = game
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort();
+        assert_eq!(keys, ["cover_url", "game_name", "game_slug", "igdb_id"]);
+    }
+    // Private history, membership, ratings and other lists cannot change public rows or counts.
+    f.value(
+        "PUT",
+        "/api/me/library/42",
+        &owner,
+        json!({"status":"completed"}),
+        StatusCode::OK,
+    )
+    .await;
+    f.value(
+        "POST",
+        "/api/me/playthroughs",
+        &owner,
+        json!({"igdb_id":42,"rating":9,"review":"Secret","platform":"Secret"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    new_list(&f, &owner, "AAA private list").await;
+    assert_eq!(
+        public_body(&f, &public_uri, None, StatusCode::OK).await,
+        preview
+    );
+    assert_eq!(
+        public_body(&f, &format!("{profile_uri}/lists"), None, StatusCode::OK).await,
+        selected
+    );
+    let list = edit_list(&f, &owner, &list, "/games", json!({"igdb_ids":[44,43]})).await;
+    assert_eq!(
+        member_ids(&public_body(&f, &public_uri, None, StatusCode::OK).await),
+        [44, 43]
+    );
+    let list = edit_list(&f, &owner, &list, "", json!({"title":"Play next 2"})).await;
+    assert_eq!(
+        public_body(&f, &public_uri, None, StatusCode::OK).await["list"]["title"],
+        "Play next 2"
+    );
+    for enabled in [false, true] {
+        publication(&f, &owner, enabled).await;
+        public_body(
+            &f,
+            &public_uri,
+            None,
+            if enabled {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            },
+        )
+        .await;
+        public_body(
+            &f,
+            &format!("{profile_uri}/lists"),
+            None,
+            if enabled {
+                StatusCode::OK
+            } else {
+                StatusCode::NOT_FOUND
+            },
+        )
+        .await;
+        assert_eq!(
+            public_body(&f, &preview_uri, Some(&owner), StatusCode::OK).await["list"]["id"],
+            id
+        );
+    }
+    let list = edit_list(
+        &f,
+        &owner,
+        &list,
+        "/visibility",
+        json!({"visibility":"private"}),
+    )
+    .await;
+    for visitor in [None, Some(owner.as_str()), Some(other.as_str())] {
+        public_body(&f, &public_uri, visitor, StatusCode::NOT_FOUND).await;
+    }
+    public_body(&f, &preview_uri, Some(&owner), StatusCode::NOT_FOUND).await;
+    assert_eq!(
+        public_body(&f, &format!("{profile_uri}/lists"), None, StatusCode::OK).await["page"]["total"],
+        0
+    );
+    assert_eq!(
+        public_body(&f, &profile_uri, None, StatusCode::OK).await["counts"]["lists"],
+        0
+    );
+    let list = edit_list(
+        &f,
+        &owner,
+        &list,
+        "/visibility",
+        json!({"visibility":"public"}),
+    )
+    .await;
+    f.edit(
+        "DELETE",
+        &list_path(&list),
+        &owner,
+        &tag(&list["list"]),
+        Value::Null,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    public_body(&f, &public_uri, None, StatusCode::NOT_FOUND).await;
+    public_body(&f, &preview_uri, Some(&owner), StatusCode::NOT_FOUND).await;
+    let head = f.call("HEAD", &public_uri, None, Value::Null).await;
+    assert_eq!(head.status(), StatusCode::NOT_FOUND);
+    assert_eq!(head.headers()["cache-control"], "no-store");
+    assert!(!head.headers().contains_key("etag"));
+    assert!(f.server.received_requests().await.unwrap().is_empty());
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn list_concurrency_preserves_membership_and_arbitrates_favorites() {
+    let f = Fixture::new().await;
+    let (_, owner) = f.user("concurrent-lists").await;
+    list_games_fixture(&f).await;
+    let (a, b) = tokio::join!(
+        f.call(
+            "POST",
+            "/api/me/lists",
+            Some(&owner),
+            json!({"kind":"favorites","title":"Favorites"})
+        ),
+        f.call(
+            "POST",
+            "/api/me/lists",
+            Some(&owner),
+            json!({"kind":"favorites","title":"Favorites"})
+        )
+    );
+    let (winner, loser) = if a.status() == StatusCode::CREATED {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    assert_eq!(
+        json_body(loser, StatusCode::CONFLICT).await["error"]["code"],
+        "favorites_exists"
+    );
+    let list = json_body(winner, StatusCode::CREATED).await;
+    assert_eq!(list["list"]["kind"], "favorites");
+    let mut list = edit_list(&f, &owner, &list, "/games", json!({"igdb_ids":[42,43]})).await;
+    let uri = list_path(&list);
+    // Addition and reorder, removal and reorder, then publication and reorder.
+    for (suffix, input) in [
+        ("/games", json!({"igdb_ids":[42,43,44]})),
+        ("/games", json!({"igdb_ids":[42]})),
+        ("/visibility", json!({"visibility":"public"})),
+        ("", json!({"title":"Renamed favorites"})),
+    ] {
+        let revision = tag(&list["list"]);
+        let first_uri = format!("{uri}{suffix}");
+        let reorder_uri = format!("{uri}/games");
+        let mut reordered = member_ids(&list);
+        reordered.reverse();
+        // Always make a real membership change, including the single-member case.
+        if reordered == member_ids(&list) {
+            reordered.push(43);
+        }
+        let headers = [("If-Match", revision.as_str())];
+        let (a, b) = tokio::join!(
+            f.send("PUT", &first_uri, Some(&owner), &headers, input),
+            f.send(
+                "PUT",
+                &reorder_uri,
+                Some(&owner),
+                &headers,
+                json!({"igdb_ids":reordered})
+            )
+        );
+        let (winner, loser) = if a.status() == StatusCode::OK {
+            (a, b)
+        } else {
+            (b, a)
+        };
+        json_body(loser, StatusCode::PRECONDITION_FAILED).await;
+        let next = json_body(winner, StatusCode::OK).await;
+        assert_eq!(
+            next["list"]["version"].as_i64().unwrap(),
+            list["list"]["version"].as_i64().unwrap() + 1
+        );
+        assert_eq!(browse(&f, &owner, &uri).await, next);
+        list = next;
+    }
+    // Deletion and a member edit serialize against the same aggregate lock.
+    let revision = tag(&list["list"]);
+    let headers = [("If-Match", revision.as_str())];
+    let games_uri = format!("{uri}/games");
+    let (delete, edit) = tokio::join!(
+        f.send("DELETE", &uri, Some(&owner), &headers, Value::Null),
+        f.send(
+            "PUT",
+            &games_uri,
+            Some(&owner),
+            &headers,
+            json!({"igdb_ids":[]})
+        )
+    );
+    if delete.status() == StatusCode::NO_CONTENT {
+        assert_eq!(edit.status(), StatusCode::NOT_FOUND);
+    } else {
+        assert_eq!(delete.status(), StatusCode::PRECONDITION_FAILED);
+        let list = json_body(edit, StatusCode::OK).await;
+        f.edit(
+            "DELETE",
+            &uri,
+            &owner,
+            &tag(&list["list"]),
+            Value::Null,
+            StatusCode::NO_CONTENT,
+        )
+        .await;
+    }
+    let recreated = f
+        .value(
+            "POST",
+            "/api/me/lists",
+            &owner,
+            json!({"kind":"favorites","title":"Favorites"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_ne!(recreated["list"]["id"], list["list"]["id"]);
+    assert_eq!(recreated["list"]["visibility"], "private");
+    assert_eq!(member_ids(&recreated), Vec::<i64>::new());
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn list_browsing_and_migration_keep_private_data_out_of_public_counts() {
+    let f = Fixture::new().await;
+    let (_, owner) = f.user("list-migration").await;
+    list_games_fixture(&f).await;
+    let profile = publication(&f, &owner, true).await;
+    let run = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &owner,
+            json!({"igdb_id":42,"rating":7,"review":"Old private history"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    undo_lists(&f.database.app).await;
+    sqlx::migrate!("./migrations")
+        .run(&f.database.app)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations")
+        .run(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(owner_profile(&f, &owner).await, profile);
+    assert_eq!(browse(&f, &owner, &run_path(&run)).await, run);
+    assert_eq!(browse(&f, &owner, "/api/me/lists").await["total"], 0);
+    let public_uri = format!(
+        "/api/public/profiles/{}/lists",
+        profile["public_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        public_body(&f, &public_uri, None, StatusCode::OK).await["page"]["total"],
+        0
+    );
+    let mut public_ids = Vec::new();
+    for title in ["z last", "Alpha", "Alpha", "50%_ fun"] {
+        let list = new_list(&f, &owner, title).await;
+        let list = edit_list(
+            &f,
+            &owner,
+            &list,
+            "/visibility",
+            json!({"visibility":"public"}),
+        )
+        .await;
+        public_ids.push(list["list"]["id"].as_str().unwrap().to_owned());
+    }
+    new_list(&f, &owner, "AAA private").await;
+    let owner_page = browse(&f, &owner, "/api/me/lists?limit=1").await;
+    assert_eq!(owner_page["data"][0]["title"], "50%_ fun");
+    assert_eq!(owner_page["total"], 5);
+    let first = public_body(&f, &format!("{public_uri}?limit=1"), None, StatusCode::OK).await;
+    assert_eq!(first["page"]["total"], 4);
+    assert_eq!(first["page"]["has_more"], true);
+    assert_eq!(first["page"]["next_cursor"], Value::Null);
+    let ties = public_body(
+        &f,
+        &format!("{public_uri}?limit=2&offset=1"),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    let mut expected = [public_ids[1].clone(), public_ids[2].clone()];
+    expected.sort();
+    assert_eq!(ties["page"]["data"][0]["id"], expected[0]);
+    assert_eq!(ties["page"]["data"][1]["id"], expected[1]);
+    let literal = public_body(&f, &format!("{public_uri}?q=%25_"), None, StatusCode::OK).await;
+    assert_eq!(literal["page"]["total"], 1);
+    let empty = public_body(&f, &format!("{public_uri}?offset=99"), None, StatusCode::OK).await;
+    assert_eq!(empty["page"]["total"], 4);
+    assert_eq!(empty["page"]["data"], json!([]));
+    assert_eq!(empty["page"]["has_more"], false);
+    for query in [
+        "limit=0",
+        "offset=10001",
+        "status=backlog",
+        "sort=title",
+        "igdb_id=42",
+        "year=2020",
+        "has_rating=true",
+        "text=private",
+        "state=paused",
+        "undated=true",
+        "unknown=x",
+    ] {
+        public_body(
+            &f,
+            &format!("{public_uri}?{query}"),
+            None,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+        f.value(
+            "GET",
+            &format!("/api/me/lists?{query}"),
+            &owner,
+            Value::Null,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
     f.finish().await;
 }

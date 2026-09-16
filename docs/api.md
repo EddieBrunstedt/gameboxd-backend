@@ -49,6 +49,15 @@ Base URL: `http://localhost:3000`. All bodies are JSON unless a response is `204
 | GET | `/api/public/profiles/{id}/{section}` | No | Paginated public profile section |
 | GET | `/api/me/public-preview` | Yes | Session owner's visitor profile, including while disabled |
 | GET | `/api/me/public-preview/{section}` | Yes | Session owner's selected visitor section |
+| GET | `/api/me/lists` | Yes | Paginated own lists, including favorites |
+| POST | `/api/me/lists` | Yes | Create an empty private list (201) |
+| GET | `/api/me/lists/{id}` | Yes | Own list and all ordered members, with revision ETag |
+| PUT | `/api/me/lists/{id}` | Yes | Replace title/description; requires revision `If-Match` |
+| PUT | `/api/me/lists/{id}/games` | Yes | Replace ordered membership; requires revision `If-Match` |
+| PUT | `/api/me/lists/{id}/visibility` | Yes | Set list visibility; requires revision `If-Match` |
+| DELETE | `/api/me/lists/{id}` | Yes | Delete list and membership (204); requires revision `If-Match` |
+| GET | `/api/public/lists/{id}` | No | Public list and ordered game context |
+| GET | `/api/me/public-preview/lists/{id}` | Yes | Visitor detail of owner's selected list, including while profile is disabled |
 
 The owner-only stored game shape (authenticated import response and nested owner library game) includes `id`, `igdb_id`, `name`, `slug`, nullable `summary`, `cover_url`, `first_release_date`, arrays of `{id,name}` for `platforms`, `genres`, `developers`, nullable `game_type`, `parent_igdb_id`, `version_parent_igdb_id`, `source_url`, `imported_at` and `refreshed_at`. Taxonomy/parent IDs are upstream IGDB IDs, not local UUIDs. The `game` nested in an owner library listing is that same object, field for field. Public local game reads (`GET /api/games` and `/api/games/{igdb_id}`) instead return the descriptive catalog shape below, without local identity or import/refresh bookkeeping.
 
@@ -353,7 +362,7 @@ page after such edits. Catalog/local-game pagination is unchanged.
 {"error":{"code":"validation_error","message":"rating must be an integer from 1 to 10, or null"}}
 ```
 
-Application error codes are exactly `validation_error`, `invalid_json`, `not_found`, `method_not_allowed`, `precondition_required`, `precondition_failed`, `lifecycle_conflict`, `handle_unavailable`, `request_rejected`, `internal_error`, `database_unavailable`, `igdb_not_configured`, `igdb_unavailable`, `igdb_rate_limited`, `catalog_busy` — a closed set, published as a TypeScript union and checked against this list by `tests/contract.rs`. Validation is generally 400; malformed JSON/schema/content type retains Axum's 400/422/415 status; oversized bodies return 413.
+Application error codes are exactly `validation_error`, `invalid_json`, `not_found`, `method_not_allowed`, `precondition_required`, `precondition_failed`, `lifecycle_conflict`, `handle_unavailable`, `favorites_exists`, `request_rejected`, `internal_error`, `database_unavailable`, `igdb_not_configured`, `igdb_unavailable`, `igdb_rate_limited`, `catalog_busy` — a closed set, published as a TypeScript union and checked against this list by `tests/contract.rs`. Validation is generally 400; malformed JSON/schema/content type retains Axum's 400/422/415 status; oversized bodies return 413.
 
 ### Field-level errors
 
@@ -636,7 +645,7 @@ planned for feature 12.
 `display_name`, nullable `bio`, and `counts`. It exposes no profile gate, private
 identity, visibility settings, write/edit times or revisions. Counts are selected
 row counts for `current_games`, `library`, `playthroughs`, `ratings`, `reviews`, and
-`notes`, independently calculated from each section's eligible records. They are
+`notes`, plus `lists` (including the favorites list), independently calculated from each section's eligible records. They are
 not total private history or counts of unique games across sections.
 
 Existing and new biographies are private by default. To include a bio, explicitly
@@ -657,14 +666,16 @@ already shared bio updates that public text.
 | `ratings` | Independently public ratings, as `PublicRating` | Same historical order |
 | `reviews` | Independently public reviews, as `PublicReview` | Same historical order |
 | `notes` | Independently public diary notes, as `PublicNote` | Same historical order |
+| `lists` | Public custom/favorites lists, as `PublicList` | Lowercase list title, UUID ascending |
 
 Current games include lightweight status tracking; the section does not expose or
 infer private current-playthrough relationships. A paused/on-hold entry is in the
 library section but not current games. Library ratings use only independently
 selected public ratings, including during disabled-profile preview. Reviews and
 notes can appear without a public library entry or parent summary. Every item
-carries its `author_id` (public profile UUID), display-name attribution and local
-game ID/title/slug/cover context. No profile read contacts or refreshes IGDB.
+carries its `author_id` (public profile UUID) and display-name attribution.
+Game-based items include local game ID/title/slug/cover context; list sections
+return summaries whose ordered game context is available at the list detail URL. No profile read contacts or refreshes IGDB.
 
 Responses are a discriminated `{section,page}` envelope. `page` has
 `BrowsePage<T>` with filtered totals, library facets, and dated continuation
@@ -701,3 +712,124 @@ All public and preview responses, including errors and HEAD, are `no-store` and
 omit revision ETags and Last-Modified. Reads already in flight may finish with
 their authorized snapshot; subsequent reads reflect revocation. Do not serve
 previously fetched public content from a cache after permission changes.
+
+
+## Favorites, ordered lists and want-to-play
+
+Library membership describes tracking, **not ownership**. `backlog` is the
+canonical lightweight **want-to-play** status: it says the user intends to play,
+regardless of whether they bought, borrowed, subscribed to, or own the game.
+It neither claims ownership nor creates a playthrough. There is no separate
+built-in wishlist competing with backlog. Existing statuses/history are not
+rewritten. Store ownership, purchases and subscriptions are outside this API.
+
+Lists are independent curation. A custom “Play next” list can order a subset of
+intentions, include possible replays of completed games, or contain games with no
+library entry. Adding/removing games never sets a status, creates history, or
+changes ratings. Removing library membership or playthroughs leaves lists intact;
+deleting a list leaves games, history and library entries intact. Account deletion
+cascades to its lists and memberships.
+
+Create with `POST /api/me/lists`:
+
+```json
+{"kind":"custom","title":"Play next","description":"A few games for autumn."}
+```
+
+`kind` defaults to `custom`; `favorites` identifies the owner's single favorites
+collection. Favorites use exactly the same ordering, editing and publication
+rules as custom lists. Create them explicitly with `kind: "favorites"`, discover
+them by `kind` in the owner's list summaries, and edit by their stable UUID.
+Concurrent attempts to create favorites produce one 201 and one
+`409 favorites_exists`. Edit the existing favorites list after that conflict.
+The kind is immutable, while its title/description are editable. Deleting favorites
+removes that collection; recreating it creates a new UUID, empty and private.
+No favorites or lists are inferred from ratings or existing records.
+
+`title` is required, non-null, nonblank, and at most 120 Unicode characters.
+`description` is at most 5,000 Unicode characters; omission becomes an empty
+string. Both are plain text preserved verbatim and reject NUL; render as text.
+Titles need not be unique. Creation rejects visibility and membership fields;
+new lists are always empty and private. Unknown fields and invalid shapes return
+422, invalid values return field-specific 400. `PUT /api/me/lists/{id}` takes
+`{title,description?}`, replacing only those two fields; omitted description
+clears it. It cannot change kind, games, or publication.
+
+`PUT /api/me/lists/{id}/games` performs addition, removal and reorder atomically:
+
+```json
+{"igdb_ids":[42,43,44]}
+```
+
+The array is the **complete desired membership in order**, limited to 500 distinct
+positive IGDB IDs per list. Duplicate, nonpositive, or unstored IDs reject the
+entire operation with a field-specific 400; nothing changes. Import unknown games
+first with `POST /api/catalog/import/{igdb_id}`. Importing only stores catalog
+metadata, never library membership. List writes/read responses use local metadata
+and make no IGDB requests. An empty array clears the list. The bounded complete
+representation lets clients reconcile membership and order from one snapshot.
+Array order is the persisted order; no recording timestamp supplies a tie-breaker.
+
+All PUT and DELETE list operations require `If-Match` with a quoted decimal
+revision from `list.version` or the owner detail ETag. Missing preconditions return
+428; malformed headers return 400; stale or weak-only tags return 412. Unlike the
+older item routes, lists reject `If-Match: *` with 400: edits must name an observed
+revision. Multiple strong tags use the existing match-any-tag semantics.
+The list's single revision covers metadata, visibility, membership and order.
+Real edits increment it once; identical writes preserve revision/timestamps.
+All edits and deletion acquire the same list row lock. Conflicting edits cannot
+silently discard membership changes, even if one edits publication or the title.
+After 412, reread and reconcile; do not blindly retry a stale array with a fresh
+revision. An uncertain creation response requires rereading collections before
+retrying; general creation idempotency remains future work. Missing/other-owner
+IDs return the same 404, including conditional deletion after a prior deletion.
+
+Owner summaries (`GameList`) contain `id`, `kind`, `title`, `description`,
+`visibility`, `game_count`, `version`, `created_at`, and `updated_at`. Owner GET
+and successful POST/PUT detail responses (`GameListDetail`) are `{list,games}`:
+`list` is that summary; `games` is the full ordered array of public game context
+(`igdb_id`, `game_name`, `game_slug`, nullable `cover_url`). Detail responses include
+the list revision ETag. Games have no membership/status/rating or parent-history
+fields. GET reads metadata, counts and members in one repeatable-read snapshot.
+
+`PUT /api/me/lists/{id}/visibility` accepts `{"visibility":"public"}` or
+`{"visibility":"private"}`. **Publishing a list explicitly shares its title,
+description and entire ordered membership. Later membership additions and text
+edits are explicit edits to that public list and become visible immediately when
+the profile is enabled.** This never publishes the games' library entries,
+playthroughs, ratings, reviews, notes or other lists. Metadata/membership edits
+preserve visibility. Because visibility shares the aggregate revision, an edit
+based on a private version cannot inadvertently land after concurrent publication.
+
+Public list summaries (`PublicList`) expose only `id`, `kind`, `title`,
+`description`, `game_count`, `author_id`, and `author_name`. Direct public detail
+`GET /api/public/lists/{id}` returns `PublicListDetail` (`{list,games}`), with exactly
+the safe game context above. No internal dates, revisions, visibility, authentication
+identity, library membership, status, ratings or playthrough details are exposed.
+Public lists are ordered by title, not creation, edit or publication time, and do
+not create dated activity events. UUID links survive title and membership edits.
+
+`GET /api/me/lists`, profile section `GET /api/public/profiles/{id}/lists`, and
+owner preview section `GET /api/me/public-preview/lists` support only `q` (literal,
+case-insensitive **list title** search), `limit` (1–50, default 20), and `offset`
+(0–10000, default 0). Other browsing filters/sorts/cursors are rejected with 400.
+They use the common `BrowsePage` envelope (profile/preview wrap it in
+`{section:"lists",page}`), with matching `total`, `has_more`, null `next_cursor`
+and null `status_counts`. Ordering is `lower(title), id` ascending, with stable UUID
+ties. Offset pages can shift across calls after insertions, deletions, renames or
+permission changes; refresh after edits. Counts and rows within a response share
+one authorized snapshot. Profile `counts.lists` counts selected lists including
+favorites, independently of pagination/search; `game_count` counts only members of
+that explicitly selected list, never library entries or private history.
+
+Direct public reads and public sections require both public list visibility and
+an enabled profile. Owner/other-user cookies grant no bypass. The authenticated
+owner preview detail (`GET /api/me/public-preview/lists/{id}`) and section use the
+same selected projection, bypassing only the owner's disabled profile gate.
+Initialize the owner profile through `/api/me`, as for existing preview operations.
+A private list is unavailable even in preview. Making a list private, deleting it,
+or disabling the profile removes subsequent public access with indistinguishable
+404s and removes it from public sections/counts. All public and preview responses,
+including errors/HEAD, are `Cache-Control: no-store`, without ETag or Last-Modified.
+An already in-flight read can finish from its authorized snapshot; no stale response
+cache may continue serving revoked lists.

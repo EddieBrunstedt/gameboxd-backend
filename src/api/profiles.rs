@@ -93,6 +93,7 @@ pub struct PublicProfileCounts {
     pub ratings: i64,
     pub reviews: i64,
     pub notes: i64,
+    pub lists: i64,
 }
 
 #[derive(Serialize, TS)]
@@ -115,6 +116,7 @@ pub enum ProfileSection {
     Ratings,
     Reviews,
     Notes,
+    Lists,
 }
 
 #[derive(Serialize, TS)]
@@ -127,6 +129,7 @@ pub enum PublicProfileSection {
     Ratings(BrowsePage<PublicRating>),
     Reviews(BrowsePage<PublicReview>),
     Notes(BrowsePage<PublicNote>),
+    Lists(BrowsePage<lists::PublicList>),
 }
 
 // Scope is constructed by handlers, never deserialized from visitor input.
@@ -174,7 +177,8 @@ async fn read_profile(state: &AppState, scope: Scope) -> ApiResult<Json<PublicPr
         (SELECT count(*) FROM selected_playthroughs WHERE user_id=$1) AS playthroughs,
         (SELECT count(*) FROM selected_ratings WHERE user_id=$1) AS ratings,
         (SELECT count(*) FROM selected_reviews WHERE user_id=$1) AS reviews,
-        (SELECT count(*) FROM selected_notes WHERE user_id=$1) AS notes",
+        (SELECT count(*) FROM selected_notes WHERE user_id=$1) AS notes,
+        (SELECT count(*) FROM selected_lists WHERE user_id=$1) AS lists",
     ).bind(&profile.user_id).fetch_one(&mut *tx).await?;
     tx.commit().await?;
     Ok(Json(PublicProfile {
@@ -205,6 +209,7 @@ where
             Kind::Reviews,
         ),
         ProfileSection::Notes => ("SELECT * FROM selected_notes", Kind::PublicNotes),
+        ProfileSection::Lists => (lists::SELECTED, Kind::Lists),
     };
     params.validate(kind)?;
     browsing::read_page(conn, owner, source, params, kind, None).await
@@ -237,6 +242,9 @@ async fn read_section(
         }
         ProfileSection::Notes => {
             PublicProfileSection::Notes(selected_page(&mut tx, owner, &section, &params).await?)
+        }
+        ProfileSection::Lists => {
+            PublicProfileSection::Lists(selected_page(&mut tx, owner, &section, &params).await?)
         }
     };
     tx.commit().await?;

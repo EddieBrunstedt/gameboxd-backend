@@ -245,3 +245,26 @@ filters or chosen dates. Totals cover the entire matching set, and library statu
 facets ignore only the selected status. Review edits never affect recent-play
 sorting. See [the complete browsing policy](../docs/api.md#library-and-diary-browsing)
 for null/tie orders, date semantics, public-only inputs, and concurrent changes.
+
+
+## Lists and favorites
+
+`lists`, `list`, `createList`, `replaceList`, `setListGames`, `setListVisibility`,
+and `deleteList` manage ordered collections. Creation always starts empty/private;
+`kind: "favorites"` creates the owner's single favorites list (`favorites_exists`
+on conflict). Other collections use `custom`. Detail results contain `{list,games}`;
+pass the nested `list` to edit/delete functions so they send its current revision.
+
+`setListGames` replaces the entire ordered membership (up to 500 distinct positive
+IGDB IDs, already imported). It supports addition, removal and reorder without
+changing library or history. Edits to a public list explicitly publish the new
+membership. On 412, reread and reconcile; never retry a stale array unconditionally.
+The server rejects wildcard list preconditions. `backlog` means want-to-play, never
+ownership; there is no competing built-in wishlist collection.
+
+`publicList`, `publicLists`, profile section `lists`, and `previewList` expose
+safe list projections. `ListQuery` supports only title `q`, `limit` and `offset`.
+Profile counts include `lists`; favorites are identified by kind within that section.
+Public/preview detail contains full ordered game context without personal status,
+ratings, history, revisions or timestamps. See the
+[complete contract](../docs/api.md#favorites-ordered-lists-and-want-to-play).

@@ -69,6 +69,7 @@ Provider tests use a local mock HTTP server, so tests do not require Twitch cred
 - `src/refresh.rs`: background metadata refresh, so saves do not wait on the provider.
 - `src/api.rs`: game, owner profile, library and playthrough endpoints.
 - `src/api/browsing.rs`: validated collection filters, explicit sort policies, snapshot totals/facets, and historical cursor paging.
+- `src/api/lists.rs`: revision-protected ordered custom/favorites lists, explicit publication and safe detail/preview reads.
 - `src/api/profiles.rs`: public identity, profile sections and authenticated visitor preview.
 - `src/api/sharing.rs`: item publication controls and dedicated public projections.
 - `src/lib.rs`, `src/main.rs`: routing, middleware, startup and shutdown.
@@ -88,4 +89,15 @@ Authentication client identity comes from the immediate socket peer via Axum's `
 
 This backend has no trusted-proxy IP resolver. Behind a reverse proxy, all clients reaching the backend through the same proxy IP share its authentication limits and are recorded under that IP. Before relying on per-client limits behind a proxy, implement host middleware that validates the immediate peer against explicitly trusted proxies, resolves and validates the forwarding chain, and inserts Doorman's typed `ClientIp` request extension before authentication handlers run. Configure that policy and edge abuse controls for the actual hosting topology.
 
-Authentication tables and their migration history live in `gameboxd_auth`; application tables and migration history live in `gameboxd`. `pg_trgm` is installed into `gameboxd` on a fresh database, or reused wherever it already exists. The only schema coupling is a foreign key to Doorman's BYTEA user ID, with deletion cascades for profiles, library entries and playthroughs (and their notes). Check this against any Doorman revision update. Runtime application queries never directly mutate authentication tables.
+Authentication tables and their migration history live in `gameboxd_auth`; application tables and migration history live in `gameboxd`. `pg_trgm` is installed into `gameboxd` on a fresh database, or reused wherever it already exists. The only schema coupling is a foreign key to Doorman's BYTEA user ID, with deletion cascades for profiles, library entries and playthroughs (and their notes), and lists (and their members). Check this against any Doorman revision update. Runtime application queries never directly mutate authentication tables.
+
+
+## Lists and favorites
+
+Custom lists and one optional favorites list per owner organize up to 500 games
+in an editable order independently of library/history. Every list starts private;
+publication shares its ordered membership explicitly. All edits require a list
+revision, including reorders and visibility. Lists appear in public profiles and
+visitor preview through separate safe projections. `backlog` remains want-to-play;
+no library status or list membership claims ownership.
+See [the list API contract](docs/api.md#favorites-ordered-lists-and-want-to-play).

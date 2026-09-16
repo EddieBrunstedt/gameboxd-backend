@@ -1,3 +1,10 @@
+import type { GameList } from "./types/GameList";
+import type { GameListDetail } from "./types/GameListDetail";
+import type { PublicList } from "./types/PublicList";
+import type { PublicListDetail } from "./types/PublicListDetail";
+import type { CreateListInput } from "./types/CreateListInput";
+import type { ListInput } from "./types/ListInput";
+import type { ListGamesInput } from "./types/ListGamesInput";
 import type { BrowseQuery } from "./types/BrowseQuery";
 import type { BrowsePage } from "./types/BrowsePage";
 import type { PublicProfileSection } from "./types/PublicProfileSection";
@@ -391,3 +398,46 @@ export const publicPreviewSection = (
   section: ProfileSection, query?: BrowseQuery,
 ): Promise<PublicProfileSection> =>
   request("GET", `/api/me/public-preview/${section}`, { query });
+
+// --- Ordered lists and favorites ------------------------------------------
+
+export type ListQuery = Pick<BrowseQuery, "limit" | "offset" | "q">;
+
+/** q searches list titles; order is title, then stable list ID. */
+export const lists = (query: ListQuery = {}): Promise<BrowsePage<GameList>> =>
+  request("GET", "/api/me/lists", { query });
+
+export const list = (id: string): Promise<GameListDetail> =>
+  request("GET", `/api/me/lists/${encodeURIComponent(id)}`);
+
+/** Empty and private initially; at most one kind=favorites list per owner. */
+export const createList = (input: CreateListInput): Promise<GameListDetail> =>
+  request("POST", "/api/me/lists", { body: input });
+
+/** Replaces title/description. Omitted description becomes empty. */
+export const replaceList = (current: GameList, input: ListInput): Promise<GameListDetail> =>
+  request("PUT", `/api/me/lists/${current.id}`, { body: input, ifMatch: precondition(current) });
+
+/**
+ * Adds, removes and reorders by replacing the complete sequence (max 500).
+ * Import unknown games first. A 412 requires rereading and reconciling changes.
+ * Editing a public list explicitly shares its new membership immediately.
+ */
+export const setListGames = (current: GameList, input: ListGamesInput): Promise<GameListDetail> =>
+  request("PUT", `/api/me/lists/${current.id}/games`, { body: input, ifMatch: precondition(current) });
+
+export const setListVisibility = (current: GameList, input: VisibilityInput): Promise<GameListDetail> =>
+  request("PUT", `/api/me/lists/${current.id}/visibility`, { body: input, ifMatch: precondition(current) });
+
+export const deleteList = (current: GameList): Promise<void> =>
+  request("DELETE", `/api/me/lists/${current.id}`, { ifMatch: precondition(current) });
+
+export const publicList = (id: string): Promise<PublicListDetail> =>
+  request("GET", `/api/public/lists/${encodeURIComponent(id)}`);
+
+export const publicLists = (profileId: string, query: ListQuery = {}): Promise<PublicProfileSection> =>
+  publicProfileSection(profileId, "lists", query);
+
+/** Selected membership only, with the authenticated owner's profile gate bypassed. */
+export const previewList = (id: string): Promise<PublicListDetail> =>
+  request("GET", `/api/me/public-preview/lists/${encodeURIComponent(id)}`);

@@ -17,6 +17,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 mod browsing;
+mod lists;
 mod notes;
 use browsing::{BrowsePage, BrowseQuery, Kind};
 mod profiles;
@@ -35,6 +36,7 @@ use crate::{
 pub fn routes() -> Router<AppState> {
     Router::new()
         .merge(notes::routes())
+        .merge(lists::routes())
         .merge(sharing::routes())
         .merge(profiles::routes())
         .route("/api/me", get(me).put(update_profile))

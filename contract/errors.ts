@@ -155,6 +155,7 @@ export function isRecoveryCooldown(error: unknown): boolean {
 // (wording, localisation). The server keys are the codes doorman-axum emits;
 // the rest are the browser-side ceremony outcomes above.
 export const ERROR_GUIDANCE: Record<string, string> = {
+  favorites_exists: "Your favorites list already exists. Edit that list instead.",
   handle_unavailable: "That handle is unavailable. Choose another name.",
   lifecycle_conflict: "Reload the current run and choose an action allowed in its current state.",
   recovery_cooldown_active:
