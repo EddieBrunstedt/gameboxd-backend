@@ -1,3 +1,7 @@
+import type { PublicProfileSection } from "./types/PublicProfileSection";
+import type { ProfileSection } from "./types/ProfileSection";
+import type { PublicProfile } from "./types/PublicProfile";
+import type { HandleInput } from "./types/HandleInput";
 import type { PublicationInput } from "./types/PublicationInput";
 import type { VisibilityInput } from "./types/VisibilityInput";
 import type { PlaythroughVisibilityInput } from "./types/PlaythroughVisibilityInput";
@@ -355,3 +359,29 @@ export const publicReview = (id: string): Promise<PublicReview> =>
   request("GET", `/api/public/reviews/${encodeURIComponent(id)}`);
 export const publicNote = (id: string): Promise<PublicNote> =>
   request("GET", `/api/public/notes/${encodeURIComponent(id)}`);
+
+// --- Public profiles and authenticated visitor preview ---------------------
+
+export const setHandle = (current: Profile, input: HandleInput): Promise<Profile> =>
+  request("PUT", "/api/me/handle", { body: input, ifMatch: precondition(current) });
+
+export const publicProfile = (id: string): Promise<PublicProfile> =>
+  request("GET", `/api/public/profiles/${encodeURIComponent(id)}`);
+
+/** Resolves a current handle to the canonical profile; retired names return 404. */
+export const publicProfileByHandle = (handle: string): Promise<PublicProfile> =>
+  request("GET", `/api/public/handles/${encodeURIComponent(handle)}`);
+
+export const publicProfileSection = (
+  id: string, section: ProfileSection, query?: { limit?: number; offset?: number },
+): Promise<PublicProfileSection> =>
+  request("GET", `/api/public/profiles/${encodeURIComponent(id)}/${section}`, { query });
+
+/** Uses the session owner's item choices, even while their profile is disabled. */
+export const publicPreview = (): Promise<PublicProfile> =>
+  request("GET", "/api/me/public-preview");
+
+export const publicPreviewSection = (
+  section: ProfileSection, query?: { limit?: number; offset?: number },
+): Promise<PublicProfileSection> =>
+  request("GET", `/api/me/public-preview/${section}`, { query });

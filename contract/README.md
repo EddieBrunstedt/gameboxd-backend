@@ -201,7 +201,26 @@ review clears its publication choice. Profile disabling preserves item choices.
 bookkeeping or implicit parent details. The public library rating uses only public
 ratings. Public routes give owners the same result as anonymous visitors and return
 404 when unavailable. Refetch public views: all responses are `no-store`, with no
-public revision validators. Profile pages/handles/visitor preview remain feature 5.
+public revision validators. Public profiles and visitor preview reuse those projections.
 Public local `games`/`game` now return `CatalogGame` descriptions, while authenticated
 imports and owner library game objects retain `Game` bookkeeping. See the
 [sharing contract](../docs/api.md#per-item-visibility-and-public-representations).
+
+
+`setHandle(profile, {handle})` carries the owner profile revision and returns the
+updated `Profile`. Its `public_id` is the canonical stable profile UUID; handle
+renames cannot change it. `publicProfile(id)` and `publicProfileByHandle(handle)`
+return `PublicProfile` with selected counts. Retired handles return 404 and cannot
+be taken by another account. `handle_unavailable` means choose another handle.
+
+`publicProfileSection(id, section, {limit,offset})` returns the generated
+`PublicProfileSection` discriminated union; narrow on `section` to obtain the
+corresponding `page.data` type. `publicPreview()` and `publicPreviewSection()`
+return exactly the same public types for the session owner, including while their
+profile is disabled. Private components stay hidden. Read the owner's `Profile`
+to label publication state; it is not part of the preview response.
+
+Biographies default private. `setPublication` accepts optional `bio_visibility`;
+omission/null preserves it and publishing the profile alone never publishes a
+bio. Each public item has an `author_id` linking to the stable public profile.
+See the [profile, handle and preview contract](../docs/api.md#public-profiles-stable-links-and-visitor-preview).

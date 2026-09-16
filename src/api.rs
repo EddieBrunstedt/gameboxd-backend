@@ -17,6 +17,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 mod notes;
+mod profiles;
 mod sharing;
 
 use crate::{
@@ -33,6 +34,7 @@ pub fn routes() -> Router<AppState> {
     Router::new()
         .merge(notes::routes())
         .merge(sharing::routes())
+        .merge(profiles::routes())
         .route("/api/me", get(me).put(update_profile))
         .route("/api/games", get(games))
         .route("/api/games/{igdb_id}", get(game))

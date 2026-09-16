@@ -2,4 +2,4 @@
 import type { PlaythroughState } from "./PlaythroughState";
 import type { PublicGame } from "./PublicGame";
 
-export type PublicPlaythrough = { id: string, author_name: string, game: PublicGame, presentation_on: string | null, state: PlaythroughState | null, started_on: string | null, finished_on: string | null, platform: string | null, };
+export type PublicPlaythrough = { id: string, author_name: string, author_id: string, game: PublicGame, presentation_on: string | null, state: PlaythroughState | null, started_on: string | null, finished_on: string | null, platform: string | null, };

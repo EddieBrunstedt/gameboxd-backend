@@ -23,6 +23,7 @@ pub enum ErrorCode {
     PreconditionRequired,
     PreconditionFailed,
     LifecycleConflict,
+    HandleUnavailable,
     RequestRejected,
     InternalError,
     DatabaseUnavailable,
@@ -35,7 +36,7 @@ pub enum ErrorCode {
 impl ErrorCode {
     /// Every variant, so a test can assert the documented list is complete.
     /// A new code added above without a line in `docs/api.md` fails there.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::ValidationError,
         Self::InvalidJson,
         Self::NotFound,
@@ -43,6 +44,7 @@ impl ErrorCode {
         Self::PreconditionRequired,
         Self::PreconditionFailed,
         Self::LifecycleConflict,
+        Self::HandleUnavailable,
         Self::RequestRejected,
         Self::InternalError,
         Self::DatabaseUnavailable,
@@ -61,6 +63,7 @@ impl ErrorCode {
             Self::MethodNotAllowed => "method_not_allowed",
             Self::PreconditionRequired => "precondition_required",
             Self::PreconditionFailed => "precondition_failed",
+            Self::HandleUnavailable => "handle_unavailable",
             Self::LifecycleConflict => "lifecycle_conflict",
             Self::RequestRejected => "request_rejected",
             Self::InternalError => "internal_error",

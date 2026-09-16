@@ -1,5 +1,5 @@
 //! Sharing's authorization boundary is in the public_* database views. Detail
-//! reads below and future sections/aggregates/feeds must use those views; an
+//! reads below and future aggregates/feeds must use those views; an
 //! authenticated visitor (including the owner) gets no visibility bypass.
 use super::*;
 use crate::models::Visibility;
@@ -32,6 +32,9 @@ pub(super) fn routes() -> Router<AppState> {
 #[serde(deny_unknown_fields)]
 pub struct PublicationInput {
     pub public_enabled: bool,
+    // Omission/null preserves the existing explicit bio choice.
+    #[ts(optional = nullable)]
+    pub bio_visibility: Option<Visibility>,
 }
 
 #[derive(Deserialize, TS)]
@@ -69,9 +72,10 @@ async fn set_publication(
     if !precondition.is_met_by(version) {
         return Err(stale());
     }
-    let row = sqlx::query_as("UPDATE profiles SET public_enabled=$2 WHERE user_id=$1 RETURNING *")
+    let row = sqlx::query_as("UPDATE profiles SET public_enabled=$2,bio_visibility=COALESCE($3,bio_visibility) WHERE user_id=$1 RETURNING *")
         .bind(owner)
         .bind(input.public_enabled)
+        .bind(input.bio_visibility)
         .fetch_one(&mut *tx)
         .await?;
     tx.commit().await?;
@@ -211,6 +215,7 @@ pub struct PublicGame {
 pub struct PublicLibraryEntry {
     pub id: Uuid,
     pub author_name: String,
+    pub author_id: Uuid,
     #[sqlx(flatten)]
     pub game: PublicGame,
     pub status: PlayStatus,
@@ -235,6 +240,7 @@ async fn library_item(
 pub struct PublicPlaythrough {
     pub id: Uuid,
     pub author_name: String,
+    pub author_id: Uuid,
     #[sqlx(flatten)]
     pub game: PublicGame,
     pub presentation_on: Option<NaiveDate>,
@@ -261,6 +267,7 @@ async fn summary(
 pub struct PublicRating {
     pub id: Uuid,
     pub author_name: String,
+    pub author_id: Uuid,
     #[sqlx(flatten)]
     pub game: PublicGame,
     pub presentation_on: Option<NaiveDate>,
@@ -284,6 +291,7 @@ async fn rating(
 pub struct PublicReview {
     pub id: Uuid,
     pub author_name: String,
+    pub author_id: Uuid,
     #[sqlx(flatten)]
     pub game: PublicGame,
     pub presentation_on: Option<NaiveDate>,
@@ -307,6 +315,7 @@ async fn review(
 pub struct PublicNote {
     pub id: Uuid,
     pub author_name: String,
+    pub author_id: Uuid,
     #[sqlx(flatten)]
     pub game: PublicGame,
     pub presentation_on: Option<NaiveDate>,

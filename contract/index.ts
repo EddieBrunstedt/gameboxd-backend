@@ -66,3 +66,9 @@ export type { PublicReview } from "./types/PublicReview";
 export type { PublicNote } from "./types/PublicNote";
 export type { Visibility } from "./types/Visibility";
 export type { PublicGame } from "./types/PublicGame";
+
+export type { HandleInput } from "./types/HandleInput";
+export type { PublicProfile } from "./types/PublicProfile";
+export type { PublicProfileCounts } from "./types/PublicProfileCounts";
+export type { ProfileSection } from "./types/ProfileSection";
+export type { PublicProfileSection } from "./types/PublicProfileSection";

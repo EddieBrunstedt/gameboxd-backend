@@ -215,6 +215,9 @@ pub struct Playthrough {
 #[derive(Serialize, FromRow, TS)]
 #[ts(export)]
 pub struct Profile {
+    pub public_id: Uuid,
+    pub handle: Option<String>,
+    pub bio_visibility: Visibility,
     pub public_enabled: bool,
     pub version: i32,
     pub display_name: String,

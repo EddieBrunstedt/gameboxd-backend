@@ -43,6 +43,12 @@ Base URL: `http://localhost:3000`. All bodies are JSON unless a response is `204
 | GET | `/api/public/ratings/{id}` | No | Public rating, addressed by playthrough UUID |
 | GET | `/api/public/reviews/{id}` | No | Public review, addressed by playthrough UUID |
 | GET | `/api/public/notes/{id}` | No | Public diary note |
+| PUT | `/api/me/handle` | Yes | Claim/rename a handle; requires profile `If-Match` |
+| GET | `/api/public/profiles/{id}` | No | Public profile header and selected counts |
+| GET | `/api/public/handles/{handle}` | No | Resolve current handle to public profile |
+| GET | `/api/public/profiles/{id}/{section}` | No | Paginated public profile section |
+| GET | `/api/me/public-preview` | Yes | Session owner's visitor profile, including while disabled |
+| GET | `/api/me/public-preview/{section}` | Yes | Session owner's selected visitor section |
 
 The owner-only stored game shape (authenticated import response and nested owner library game) includes `id`, `igdb_id`, `name`, `slug`, nullable `summary`, `cover_url`, `first_release_date`, arrays of `{id,name}` for `platforms`, `genres`, `developers`, nullable `game_type`, `parent_igdb_id`, `version_parent_igdb_id`, `source_url`, `imported_at` and `refreshed_at`. Taxonomy/parent IDs are upstream IGDB IDs, not local UUIDs. The `game` nested in an owner library listing is that same object, field for field. Public local game reads (`GET /api/games` and `/api/games/{igdb_id}`) instead return the descriptive catalog shape below, without local identity or import/refresh bookkeeping.
 
@@ -58,7 +64,7 @@ Catalog lookup accepts a positive signed 64-bit integer ID; malformed, overflowi
 {"display_name":"Eddie","bio":"I like RPGs."}
 ```
 
-Display name is trimmed and limited to 80 characters; bio to 1000. The response is the profile object with those fields plus `created_at`, `updated_at`, `version`, and `public_enabled` (initially false). `GET /api/me` returns `{id,email,profile}`, where `id` is the Doorman user UUID and `email` may be null.
+Display name is trimmed and limited to 80 characters; bio to 1000. The response is the profile object with those fields plus `created_at`, `updated_at`, `version`, `public_enabled` (initially false), random `public_id`, nullable `handle`, and `bio_visibility` (initially `private`). `GET /api/me` returns `{id,email,profile}`, where `id` is the Doorman user UUID and `email` may be null.
 
 `PUT /api/me/library/{igdb_id}` body:
 
@@ -208,7 +214,7 @@ Public bodies, related resources, previews, pagination metadata, ordering, count
 
 The migration converts each previous library rating and/or review into one undated playthrough, retaining the original recording/edit timestamps. It creates no playthrough for a status-only entry and invents no play dates or platform.
 
-All `/api/me` library and playthrough routes use the authenticated session as owner. Reading or updating another user's playthrough returns 404; unconditional deletion is a no-op 204. History starts private. Explicitly published items are served separately under `/api/public`; profile pages and review aggregation are not implemented.
+All `/api/me` library and playthrough routes use the authenticated session as owner. Reading or updating another user's playthrough returns 404; unconditional deletion is a no-op 204. History starts private. Explicitly published items are served separately under `/api/public`; public profiles and their sections apply the same permissions.
 
 ## Pagination
 
@@ -230,7 +236,7 @@ Catalog search returns `{data,limit,offset,next_offset}`, where `next_offset` is
 {"error":{"code":"validation_error","message":"rating must be an integer from 1 to 10, or null"}}
 ```
 
-Application error codes are exactly `validation_error`, `invalid_json`, `not_found`, `method_not_allowed`, `precondition_required`, `precondition_failed`, `lifecycle_conflict`, `request_rejected`, `internal_error`, `database_unavailable`, `igdb_not_configured`, `igdb_unavailable`, `igdb_rate_limited`, `catalog_busy` — a closed set, published as a TypeScript union and checked against this list by `tests/contract.rs`. Validation is generally 400; malformed JSON/schema/content type retains Axum's 400/422/415 status; oversized bodies return 413.
+Application error codes are exactly `validation_error`, `invalid_json`, `not_found`, `method_not_allowed`, `precondition_required`, `precondition_failed`, `lifecycle_conflict`, `handle_unavailable`, `request_rejected`, `internal_error`, `database_unavailable`, `igdb_not_configured`, `igdb_unavailable`, `igdb_rate_limited`, `catalog_busy` — a closed set, published as a TypeScript union and checked against this list by `tests/contract.rs`. Validation is generally 400; malformed JSON/schema/content type retains Axum's 400/422/415 status; oversized bodies return 413.
 
 ### Field-level errors
 
@@ -356,8 +362,8 @@ Content-Type: application/json
 Disabling it suppresses **all** public items, even direct links, without changing
 stored item choices, content, or item revisions. Re-enabling restores the selected
 presentation. The display name is public author attribution when enabled; neither
-email nor the Doorman user ID is public identity. Handles, profile sections and
-owner visitor preview remain feature 5. Lists receive visibility in feature 7.
+email nor the Doorman user ID is public identity. Stable public profile identity,
+sections and owner preview are described below. Lists receive visibility in feature 7.
 
 Visibility bodies:
 
@@ -384,7 +390,7 @@ lock protocol; note publication follows parent-before-note locking.
 
 Public routes have dedicated types, with this explicit field allowlist:
 
-| Type | Fields besides `id`, `author_name`, and `game` |
+| Type | Fields besides `id`, `author_id`, `author_name`, and `game` |
 | --- | --- |
 | `PublicLibraryEntry` | `status`, nullable `rating`, nullable `rating_id` |
 | `PublicPlaythrough` | nullable `presentation_on`, `state`, `started_on`, `finished_on`, `platform` |
@@ -414,9 +420,12 @@ The PostgreSQL views `public_library_entries`, `public_playthroughs`,
 `public_ratings`, `public_reviews`, and `public_notes` are the common eligibility
 boundary. Each includes the profile gate and only its explicit item choice.
 Direct handlers read these views into dedicated public DTOs, never owner DTOs.
-Future profile sections, related resources, search, counts and feeds must use
-these same views, applying filtering, ordering, pagination and aggregation **after**
-visibility. Their `user_id` and `game_id` columns are server-only join keys and
+Related resources, search and feeds must use these gated views or an equivalent
+authorized snapshot, applying filtering, ordering, pagination and aggregation
+**after** visibility. Profile sections and previews use the shared `selected_*`
+item projections after resolving their profile scope in a single read-only
+repeatable-read transaction. Only an authenticated session owner preview may
+resolve a disabled profile; `selected_*` alone does not authorize public reads. Their `user_id` and `game_id` columns are server-only join keys and
 must never be serialized. Views contain no write/edit timestamps or revisions.
 These are application query boundaries, not database role isolation/RLS.
 
@@ -461,3 +470,117 @@ choices are separate from visitor data. Any future response/feed cache requires
 synchronous visibility revalidation before serving, including profile disabling,
 item revocation, deletion, and later moderation restrictions. Do not introduce
 TTL-only revocation or validators derived from private bookkeeping.
+
+
+## Public profiles, stable links and visitor preview
+
+### Identity and handle policy
+
+`Profile.public_id` is a database-generated random UUID, independent of Doorman
+identity and email. `GET /api/public/profiles/{public_id}` is the canonical stable
+profile URL. It works without a handle when publication is enabled. Profile UUIDs
+and direct item URLs survive handle and display-name changes; deleting an account
+ends those identities. Nothing redirects a deleted identity to a new account.
+
+Initialize/read the owner profile via `GET /api/me`, then claim or rename:
+
+```http
+PUT /api/me/handle
+If-Match: "1"
+Content-Type: application/json
+
+{"handle":"Player_42"}
+```
+
+Handles contain 3–30 ASCII letters, digits or underscores and must start with a
+letter. Input is normalized to lowercase (`player_42`); whitespace is rejected,
+not trimmed. The namespace is separate from API route names, so there are no
+reserved route words. Handles are optional until first claimed; this operation
+requires a string and changes only the caller's handle. It returns the updated
+owner `Profile`. Invalid format returns a field error; unavailable names return
+`409 handle_unavailable`. Missing/stale revision preconditions return 428/412.
+Claims and renames are transactional and unique across concurrent requests;
+publication changes share the profile revision. Reclaiming the current canonical
+handle is a no-op and preserves revision/timestamps.
+
+`GET /api/public/handles/{handle}` case-insensitively resolves a **current** handle
+and returns the same `PublicProfile` as its UUID route. Disabled, unknown, invalid
+and retired handles return indistinguishable 404s. A rename retires the old handle
+without a redirect or public alias history. Retired handles remain reserved to
+the original profile and may be restored by that owner. Account deletion erases
+the reservation's owner reference but keeps the name unavailable to prevent
+impersonation through old links. No public reservation/availability endpoint
+exposes claim history. Broader claim throttling is part of the resource controls
+planned for feature 12.
+
+### Profile and sections
+
+`PublicProfile` contains exactly `id` (public UUID), nullable canonical `handle`,
+`display_name`, nullable `bio`, and `counts`. It exposes no profile gate, private
+identity, visibility settings, write/edit times or revisions. Counts are selected
+row counts for `current_games`, `library`, `playthroughs`, `ratings`, `reviews`, and
+`notes`, independently calculated from each section's eligible records. They are
+not total private history or counts of unique games across sections.
+
+Existing and new biographies are private by default. To include a bio, explicitly
+send `bio_visibility: "public"` with `public_enabled` in
+`PUT /api/me/publication`. `"private"` revokes it. Omission/null preserves the
+stored choice. Enabling the profile alone never shares an existing bio. A private
+bio projects as null, even in visitor preview; an explicitly shared empty bio is
+an empty string. Ordinary profile text edits preserve the choice, so editing an
+already shared bio updates that public text.
+
+`GET /api/public/profiles/{id}/{section}` accepts these section names:
+
+| Section | Selection and projection | Order |
+| --- | --- | --- |
+| `current_games` | Public library entries with status `playing`, as `PublicLibraryEntry` | Lowercase game title, IGDB ID, item UUID ascending |
+| `library` | All public library entries, as `PublicLibraryEntry` | Same title order |
+| `playthroughs` | Independently public run summaries, as `PublicPlaythrough` | Chosen day descending, unknown last, UUID descending |
+| `ratings` | Independently public ratings, as `PublicRating` | Same historical order |
+| `reviews` | Independently public reviews, as `PublicReview` | Same historical order |
+| `notes` | Independently public diary notes, as `PublicNote` | Same historical order |
+
+Current games include lightweight status tracking; the section does not expose or
+infer private current-playthrough relationships. A paused/on-hold entry is in the
+library section but not current games. Library ratings use only independently
+selected public ratings, including during disabled-profile preview. Reviews and
+notes can appear without a public library entry or parent summary. Every item
+carries its `author_id` (public profile UUID), display-name attribution and local
+game ID/title/slug/cover context. No profile read contacts or refreshes IGDB.
+
+Responses are a discriminated `{section,page}` envelope. `page` has
+`{data,limit,offset,has_more}`. Only `limit` (1–50, default 20) and `offset`
+(0–10000, default 0) are accepted. Private rows affect neither pagination nor
+counts. Public empty sections return 200 with an empty page; a missing/disabled
+profile returns 404 even for an empty section. Unknown section names and invalid
+pagination return 400. More browsing filters remain feature 6.
+
+Offset pagination has deterministic ties but is not a snapshot across separate
+requests: inserts, deletion, changed chosen dates, title changes or permission
+changes can shift page boundaries. Each request authorizes and reads from one
+consistent database snapshot. Text edits and publication times never bump an item
+in historical order; unknown dates never fall back to recording or play dates.
+
+### Stable item links and visitor preview
+
+Use `/api/public/reviews/{playthrough_id}` and `/api/public/notes/{note_id}` to
+share individual diary items independently of pagination. Existing direct summary,
+rating and library URLs remain valid. Detail and section rows have identical
+component fields and independent item permissions. A private/missing item or a
+disabled profile returns 404 even to a signed-in owner. Revocation or deletion
+removes the item from detail, sections and counts on subsequent reads.
+
+`GET /api/me/public-preview` and `GET /api/me/public-preview/{section}` require
+an authenticated session and always target that session's owner. They use exactly
+the public profile/section DTOs, counts, item choices, ordering and pagination.
+For an enabled profile, preview and anonymous reads match for the same database
+state. For a disabled profile, preview bypasses **only** the profile gate; private
+items and private bio remain hidden. No preview URL token, target user parameter
+or public query flag can grant this bypass. Read `/api/me` to label the owner's
+publication state; it is intentionally absent from the public presentation.
+
+All public and preview responses, including errors and HEAD, are `no-store` and
+omit revision ETags and Last-Modified. Reads already in flight may finish with
+their authorized snapshot; subsequent reads reflect revocation. Do not serve
+previously fetched public content from a cache after permission changes.
