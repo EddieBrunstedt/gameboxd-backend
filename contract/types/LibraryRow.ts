@@ -8,4 +8,4 @@ import type { LibraryEntry } from "./LibraryEntry";
  * `GET /api/me/library/{igdb_id}`. Public game routes deliberately use the
  * descriptive catalog type instead, omitting local bookkeeping.
  */
-export type LibraryRow = { game: Game, entry: LibraryEntry, };
+export type LibraryRow = { last_played_on: string | null, game: Game, entry: LibraryEntry, };

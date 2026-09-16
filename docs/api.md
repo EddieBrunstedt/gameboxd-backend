@@ -143,9 +143,9 @@ A `DiaryNote` returns `id`, `playthrough_id`, `igdb_id`, `game_name`, `game_slug
 
 PUT, PATCH, and DELETE require `If-Match`: missing is `428 precondition_required`, malformed is `400 validation_error`, and a stale or weak-only tag is `412 precondition_failed`. Lists of strong tags and `*` follow the playthrough precondition rules; `*` explicitly accepts whichever version exists. Missing/other-owner notes and playthroughs return `404 not_found`, including nested note lists, without revealing revisions. A deleted note returns 404 on a subsequent conditional deletion. Schema failures return `422 invalid_json`; invalid text returns field-specific `400 validation_error`.
 
-`GET /api/me/diary` lists notes across all of the owner's playthroughs. `GET /api/me/playthroughs/{id}/notes` lists that owner's notes for one run; an existing run without notes returns an empty page. Both return `{data,limit,offset,has_more}`. They accept only `limit` (1–50, default 20) and `offset` (0–10000, default 0), and fetch one extra owner-scoped row to determine `has_more`. The diary is a note collection; overall experiences/reviews remain in `/api/me/playthroughs`.
+`GET /api/me/diary` lists notes across all of the owner's playthroughs. `GET /api/me/playthroughs/{id}/notes` lists that owner's notes for one run; an existing run without notes returns an empty page. Both return `BrowsePage<DiaryNote>` with filtered totals and date cursors; see [browsing](#library-and-diary-browsing) for filters and pagination. The diary is a note collection; overall experiences/reviews remain in `/api/me/playthroughs`.
 
-Both lists use `presentation_on DESC NULLS LAST, id DESC`, exactly the [historical chronology policy](#historical-chronology-policy). Note dates are independent of parent presentation/start/end dates, with no inferred dates, range restrictions, or timezone conversion. Backdates and future dates are allowed. Text edits preserve historical position; date edits reposition the note. Unknown dates remain at the end with deterministic random-UUID ties. Actual write/edit timestamps never order notes. Offset pages reflect current data on each read, so intervening inserts, deletes, or date corrections can shift boundaries; restart paging after such changes. Text-only edits do not shift boundaries. Rich filtering/pagination belongs to feature 6.
+Both lists use `presentation_on DESC NULLS LAST, id DESC`, exactly the [historical chronology policy](#historical-chronology-policy). Note dates are independent of parent presentation/start/end dates, with no inferred dates, range restrictions, or timezone conversion. Backdates and future dates are allowed. Text edits preserve historical position; date edits reposition the note. Unknown dates remain at the end with deterministic random-UUID ties. Actual write/edit timestamps never order notes. Offset pages reflect current data on each read, so intervening inserts, deletes, or date corrections can shift boundaries; restart paging after such changes. Text-only edits do not shift boundaries. Cursor continuation and filters are described in [browsing](#library-and-diary-browsing).
 
 Notes have independent revisions: changing a note does not change the parent's revision, review, rating, lifecycle, or library status. No-op writes preserve the note's timestamps and revision. Note writes lock the parent against deletion before locking the note, so simultaneous edits merge/check against the locked revision and parent deletion cannot leave orphaned rows. They do not participate in current-run state changes.
 
@@ -220,15 +220,132 @@ All `/api/me` library and playthrough routes use the authenticated session as ow
 
 `limit` defaults to 20 and must be 1–50. `offset` defaults to zero and is capped at 10000. `q`, when supplied, must contain 1–100 characters without control characters. Local search matches case-insensitive name substrings, with `%` and `_` treated as ordinary characters rather than wildcards, over games stored here — those stored through library saves, playthrough creation, or explicit imports — while catalog search queries all of IGDB by relevance. The `status` filter applies to library listing.
 
-Local games, library, and playthrough listings return:
+Local game listings return:
 
 ```json
 {"data":[],"limit":20,"offset":0,"has_more":false}
 ```
 
-Local games sort by lowercase name then internal UUID. Library entries sort by most recently updated then internal game UUID, and each item is `{game,entry}`. Playthrough listing accepts only `limit`, `offset`, and optional positive `igdb_id`; it returns playthrough objects ordered by the chronology above. A game with no own playthroughs returns an empty page, even if it is not stored locally. Offset pagination can shift if entries change between requests.
+Local games sort by lowercase name then internal UUID. Library, playthrough, note, and public-section collections use the browsing contract below. A game with no own playthroughs returns an empty page, even if it is not stored locally.
 
 Catalog search returns `{data,limit,offset,next_offset}`, where `next_offset` is null on the last page. A full upstream page sets the next offset (until the offset cap); it does not guarantee another result exists. No total-count query is made. Being read-only, it is safe to retry and cache. A successful import returns a single stored game and HTTP 200 whether newly created or refreshed.
+
+## Library and diary browsing
+
+Owner library (`/api/me/library`), experiences (`/api/me/playthroughs`), notes
+(`/api/me/diary` and `/api/me/playthroughs/{id}/notes`), public profile sections,
+and visitor-preview sections return `BrowsePage<T>`:
+
+```json
+{"data":[],"limit":20,"offset":0,"has_more":false,"total":0,"next_cursor":null,"status_counts":null}
+```
+
+`total` counts all matching records **before** offset/cursor pagination, including
+when the requested page is empty. Rows, totals, library status facets, and public
+profile authorization use one read-only repeatable-read snapshot per request.
+`has_more` comes from fetching one extra matching row. All filters combine with
+AND. Unknown query parameters, unsupported filters/sorts, malformed dates,
+nonpositive game IDs, and invalid bounds return 400.
+
+| Filter | Meaning and availability |
+| --- | --- |
+| `q` | Literal case-insensitive game-name substring on every collection; trimmed, 1–100 characters, no controls. `%`, `_`, and backslash are literal. |
+| `igdb_id` | Positive exact game ID on every collection. |
+| `year` | Calendar year 1–9999 of `presentation_on`, on dated collections. |
+| `from_on`, `to_on` | Inclusive chosen-date range, either or both bounds; if both, start must not exceed end. Cannot combine with `year`. |
+| `undated` | `true` selects null chosen dates, `false` selects known dates; omission includes both. `true` cannot combine with year/range. |
+| `state` | Exact `active`, `paused`, `completed`, or `abandoned` experience state; owner experiences/notes and public summaries only. Unknown states do not match. |
+| `has_rating`, `has_review` | `true`/`false` selects presence/absence on owner experiences, their notes' parent experience, or public summaries. `has_rating` also applies to library derived ratings. |
+| `text` | Literal case-insensitive substring of note text or public review text, with the same validation/escaping as `q`. |
+| `status` | Exact library status, on owner/public library and current-games sections only. |
+
+Date filters always use the item's own chosen day, never its parent, play dates,
+or recording timestamps. Unknown dates do not match a year/range. No timezone
+conversion occurs. For example:
+
+```http
+GET /api/me/playthroughs?year=2020&has_review=true
+GET /api/me/playthroughs?state=paused&q=halo
+GET /api/me/playthroughs?state=completed&from_on=2020-01-01&to_on=2020-12-31
+GET /api/me/diary?year=2020&text=boss&has_rating=true
+GET /api/public/profiles/{id}/reviews?year=2020&q=halo
+```
+
+Public summary presence filters join only independently shared ratings/reviews.
+A private component behaves exactly like an absent one. Public note, rating,
+and review collections do not accept parent-state or component-presence filters;
+these could otherwise disclose private parent relationships. Public notes remain
+searchable by their own text/date/game even when their parent summary is private.
+Library ratings and recent-play ordering use only public inputs, including in
+owner preview. Private rows cannot affect counts, cursors, `has_more`, or ordering.
+Profile-header counts remain unfiltered section totals; section `page.total`
+reflects its query. All public and preview responses retain `no-store` and omit
+revision/date validators.
+
+### Library sorting and status facets
+
+`sort` accepts the following fixed orders; `title` is the default:
+
+| Sort | Order |
+| --- | --- |
+| `title` | Lowercase title ascending, IGDB ID ascending. |
+| `rating` | Derived rating descending, nulls last, then title and IGDB ID. |
+| `date_added` | Membership `created_at` descending, then title and IGDB ID; **owner library only**. Removing and re-adding membership starts a new date. |
+| `recently_played` | Latest explicitly recorded play day descending, nulls last, then title and IGDB ID. |
+
+One membership per game makes the final IGDB-ID tie unique. Title comparisons
+use the database's collation consistently. `date_added` is rejected publicly
+because it would disclose recording chronology, even through ordering alone.
+Owner rows are `{game,entry,last_played_on}`; the additional nullable day explains
+the recent-play sort. Public item DTOs remain unchanged.
+
+**Recorded play activity** currently means an explicit `started_on` or
+`finished_on` on a playthrough. `last_played_on` is their greatest known day across
+that owner's runs for the game. An end date records the last played day regardless
+of completion/abandonment outcome. A run with neither day contributes nothing.
+Public sorting uses only independently public summaries' play dates. Backfilling,
+correcting, clearing or deleting these dates deliberately updates the order.
+Review/rating presentation dates, review/note edits, profile edits, visibility
+write times, library status changes, and undated lifecycle actions never supply
+play activity. No automatic “today” date is inferred. An ongoing game with only
+a start day keeps that day until another explicit play day is recorded; this is
+recorded history, not a claim that every session has been logged.
+
+Library `status_counts` contains `backlog`, `playing`, `completed`, `on_hold`,
+and `dropped`, including zeroes. These facets obey all filters **except `status`**
+and ignore pagination, letting a client display alternative status tabs. `total`
+also obeys `status`. With no status filter, the five counts sum to `total`.
+The `current_games` section remains restricted to playing entries even when
+computing facets. Other collections return `status_counts: null`.
+
+### Pagination under historical edits
+
+Dated collections order by `presentation_on DESC NULLS LAST,id DESC`. Use
+`limit` (1–50, default 20), then pass `next_cursor` as URL-encoded `after` with the
+same collection and filters. A null cursor means no further matching row in that
+request's snapshot. Cursors encode only the last returned chosen date (or an
+unknown-date marker) and random item UUID; they are value boundaries, not access
+tokens or references requiring the anchor row to survive. They contain no
+recording times, revisions, publication times, or private row counts. Modified
+cursors never bypass current ownership or visibility checks.
+
+Cursor paging continues strictly after that boundary. Insertions before it and
+text-only edits do not shift subsequent pages. A new backfilled item after the
+boundary is eligible on a later page; one before it requires a refresh from the
+start. Deleting or revoking the anchor does not invalidate the cursor. All
+subsequent reads reapply current visibility. Moving an item's chosen date across
+a previously traversed boundary can still make it appear again or be missed;
+refresh after historical date edits or filter changes. This is live traversal,
+not a retained multi-request snapshot. Totals describe each request's current
+matching set, not just the remainder after the cursor.
+
+`offset` (0–10000, default 0) remains available for jumping to a bounded position;
+it cannot be nonzero with `after`. Dated offset pages also return a continuation
+cursor. Library browsing uses bounded offset paging and always returns
+`next_cursor: null`; `after` is rejected there. Its title/rating/date/play-day
+sorts are deterministic, but membership, title, rating, play-date or visibility
+changes can shift pages between requests. Reload the library from the first
+page after such edits. Catalog/local-game pagination is unchanged.
 
 ## Errors
 
@@ -446,11 +563,11 @@ page boundaries. A public rating does not require library membership or a public
 summary. If all eligible ratings are undated, the highest UUID provides the
 representative without claiming recency. With none eligible, both public library
 rating fields are null. Library sections must not sort using owner timestamps;
-title ordering is available until feature 6 defines additional public sorts.
+public sections support title, public rating, and explicitly shared play-date sorting.
 
 ### Revocation and caching
 
-Every public-content read checks current database visibility in one statement.
+Every public-content read checks current database visibility in one statement or one read-only repeatable-read transaction.
 There is no stored public response, materialized feed, or positive/negative item
 cache to invalidate. The application sends `Cache-Control: no-store` on successes,
 404s, errors and HEAD responses. Public-content middleware strips ETag and
@@ -534,8 +651,8 @@ already shared bio updates that public text.
 
 | Section | Selection and projection | Order |
 | --- | --- | --- |
-| `current_games` | Public library entries with status `playing`, as `PublicLibraryEntry` | Lowercase game title, IGDB ID, item UUID ascending |
-| `library` | All public library entries, as `PublicLibraryEntry` | Same title order |
+| `current_games` | Public library entries with status `playing`, as `PublicLibraryEntry` | Lowercase game title, IGDB ID ascending by default |
+| `library` | All public library entries, as `PublicLibraryEntry` | Same title order; optional rating/recent-play sort |
 | `playthroughs` | Independently public run summaries, as `PublicPlaythrough` | Chosen day descending, unknown last, UUID descending |
 | `ratings` | Independently public ratings, as `PublicRating` | Same historical order |
 | `reviews` | Independently public reviews, as `PublicReview` | Same historical order |
@@ -550,11 +667,11 @@ carries its `author_id` (public profile UUID), display-name attribution and loca
 game ID/title/slug/cover context. No profile read contacts or refreshes IGDB.
 
 Responses are a discriminated `{section,page}` envelope. `page` has
-`{data,limit,offset,has_more}`. Only `limit` (1–50, default 20) and `offset`
-(0–10000, default 0) are accepted. Private rows affect neither pagination nor
-counts. Public empty sections return 200 with an empty page; a missing/disabled
+`BrowsePage<T>` with filtered totals, library facets, and dated continuation
+cursors, as described in [browsing](#library-and-diary-browsing). Private rows
+affect neither pagination nor counts. Public empty sections return 200 with an empty page; a missing/disabled
 profile returns 404 even for an empty section. Unknown section names and invalid
-pagination return 400. More browsing filters remain feature 6.
+queries return 400.
 
 Offset pagination has deterministic ties but is not a snapshot across separate
 requests: inserts, deletion, changed chosen dates, title changes or permission

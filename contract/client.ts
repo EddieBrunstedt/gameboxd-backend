@@ -1,3 +1,5 @@
+import type { BrowseQuery } from "./types/BrowseQuery";
+import type { BrowsePage } from "./types/BrowsePage";
 import type { PublicProfileSection } from "./types/PublicProfileSection";
 import type { ProfileSection } from "./types/ProfileSection";
 import type { PublicProfile } from "./types/PublicProfile";
@@ -48,7 +50,6 @@ import type { LibraryEntry } from "./types/LibraryEntry";
 import type { LibraryRow } from "./types/LibraryRow";
 import type { Me } from "./types/Me";
 import type { Page } from "./types/Page";
-import type { PlayStatus } from "./types/PlayStatus";
 import type { Playthrough } from "./types/Playthrough";
 import type { PlaythroughInput } from "./types/PlaythroughInput";
 import type { PlaythroughPatch } from "./types/PlaythroughPatch";
@@ -117,7 +118,7 @@ export {
 } from "./errors";
 export type { AnyErrorCode, AuthCode, ClientCode } from "./errors";
 
-type Query = Record<string, string | number | undefined | null>;
+type Query = Record<string, string | number | boolean | undefined | null>;
 
 function url(path: string, query?: Query): string {
   const search = new URLSearchParams();
@@ -208,11 +209,16 @@ export const game = (igdbId: number): Promise<CatalogGame> => request("GET", `/a
 export const importGame = (igdbId: number): Promise<Game> =>
   request("POST", `/api/catalog/import/${igdbId}`);
 
+/** Query capabilities are documented per public section in docs/api.md. */
+export type LibraryQuery = Pick<BrowseQuery, "limit" | "offset" | "q" | "igdb_id" | "status" | "sort" | "has_rating">;
+export type PlaythroughQuery = Omit<BrowseQuery, "status" | "sort" | "text">;
+export type NoteQuery = Omit<BrowseQuery, "status" | "sort">;
+
 // --- Library --------------------------------------------------------------
 
 export const library = (
-  query: { status?: PlayStatus; q?: string; limit?: number; offset?: number } = {},
-): Promise<Page<LibraryRow>> => request("GET", "/api/me/library", { query });
+  query: LibraryQuery = {},
+): Promise<BrowsePage<LibraryRow>> => request("GET", "/api/me/library", { query });
 
 export const libraryEntry = (igdbId: number): Promise<LibraryEntry> =>
   request("GET", `/api/me/library/${igdbId}`);
@@ -235,8 +241,8 @@ export const removeLibraryEntry = (igdbId: number): Promise<void> =>
 // --- Playthroughs ---------------------------------------------------------
 
 export const playthroughs = (
-  query: { igdb_id?: number; limit?: number; offset?: number } = {},
-): Promise<Page<Playthrough>> => request("GET", "/api/me/playthroughs", { query });
+  query: PlaythroughQuery = {},
+): Promise<BrowsePage<Playthrough>> => request("GET", "/api/me/playthroughs", { query });
 
 export const playthrough = (id: string): Promise<Playthrough> =>
   request("GET", `/api/me/playthroughs/${id}`);
@@ -305,13 +311,13 @@ export const deletePlaythrough = (target: Playthrough | string): Promise<void> =
 
 /** All of the owner's notes, ordered by chosen day, unknown dates last. */
 export const diary = (
-  query: { limit?: number; offset?: number } = {},
-): Promise<Page<DiaryNote>> => request("GET", "/api/me/diary", { query });
+  query: NoteQuery = {},
+): Promise<BrowsePage<DiaryNote>> => request("GET", "/api/me/diary", { query });
 
 export const playthroughNotes = (
   playthroughId: string,
-  query: { limit?: number; offset?: number } = {},
-): Promise<Page<DiaryNote>> =>
+  query: NoteQuery = {},
+): Promise<BrowsePage<DiaryNote>> =>
   request("GET", `/api/me/playthroughs/${playthroughId}/notes`, { query });
 
 export const note = (id: string): Promise<DiaryNote> =>
@@ -373,7 +379,7 @@ export const publicProfileByHandle = (handle: string): Promise<PublicProfile> =>
   request("GET", `/api/public/handles/${encodeURIComponent(handle)}`);
 
 export const publicProfileSection = (
-  id: string, section: ProfileSection, query?: { limit?: number; offset?: number },
+  id: string, section: ProfileSection, query?: BrowseQuery,
 ): Promise<PublicProfileSection> =>
   request("GET", `/api/public/profiles/${encodeURIComponent(id)}/${section}`, { query });
 
@@ -382,6 +388,6 @@ export const publicPreview = (): Promise<PublicProfile> =>
   request("GET", "/api/me/public-preview");
 
 export const publicPreviewSection = (
-  section: ProfileSection, query?: { limit?: number; offset?: number },
+  section: ProfileSection, query?: BrowseQuery,
 ): Promise<PublicProfileSection> =>
   request("GET", `/api/me/public-preview/${section}`, { query });

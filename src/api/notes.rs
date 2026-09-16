@@ -92,55 +92,45 @@ impl IntoResponse for TaggedNote {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct NoteQuery {
-    #[serde(default = "default_limit")]
-    limit: u32,
-    #[serde(default)]
-    offset: u32,
-}
-
-fn note_query(params: Result<Query<NoteQuery>, QueryRejection>) -> ApiResult<NoteQuery> {
-    let Query(params) = params.map_err(|_| ApiError::invalid("Invalid query parameters"))?;
-    if !(1..=50).contains(&params.limit) || params.offset > 10_000 {
-        return Err(ApiError::invalid(
-            "limit must be 1–50 and offset at most 10000",
-        ));
-    }
-    Ok(params)
-}
-
 async fn note_page(
     state: &AppState,
     owner: &[u8],
     parent: Option<Uuid>,
-    params: NoteQuery,
-) -> ApiResult<Json<Page<DiaryNote>>> {
-    let rows = sqlx::query_as(
-        "SELECT * FROM diary_note_details WHERE user_id=$1
-         AND ($2::uuid IS NULL OR playthrough_id=$2)
-         ORDER BY presentation_on DESC NULLS LAST,id DESC LIMIT $3 OFFSET $4",
+    params: BrowseQuery,
+) -> ApiResult<Json<BrowsePage<DiaryNote>>> {
+    params.validate(Kind::OwnerNotes)?;
+    let mut tx = browsing::snapshot(&state.pool).await?;
+    if let Some(parent) = parent {
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM playthroughs WHERE user_id=$1 AND id=$2")
+            .bind(owner)
+            .bind(parent)
+            .fetch_optional(&mut *tx)
+            .await?
+            .ok_or_else(ApiError::not_found)?;
+    }
+    let result = browsing::read_page(
+        &mut tx,
+        owner,
+        browsing::OWNER_NOTES,
+        &params,
+        Kind::OwnerNotes,
+        parent,
     )
-    .bind(owner)
-    .bind(parent)
-    .bind(i64::from(params.limit) + 1)
-    .bind(i64::from(params.offset))
-    .fetch_all(&state.pool)
     .await?;
-    Ok(page(rows, params.limit, params.offset))
+    tx.commit().await?;
+    Ok(Json(result))
 }
 
 async fn diary(
     user: AuthUser,
     State(state): State<AppState>,
-    params: Result<Query<NoteQuery>, QueryRejection>,
-) -> ApiResult<Json<Page<DiaryNote>>> {
+    params: Result<Query<BrowseQuery>, QueryRejection>,
+) -> ApiResult<Json<BrowsePage<DiaryNote>>> {
     note_page(
         &state,
         user.0.id.0.as_bytes().as_slice(),
         None,
-        note_query(params)?,
+        BrowseQuery::parse(params)?,
     )
     .await
 }
@@ -149,18 +139,15 @@ async fn list(
     user: AuthUser,
     State(state): State<AppState>,
     id: Result<Path<Uuid>, PathRejection>,
-    params: Result<Query<NoteQuery>, QueryRejection>,
-) -> ApiResult<Json<Page<DiaryNote>>> {
-    let id = path(id)?;
-    let params = note_query(params)?;
-    let owner = user.0.id.0.as_bytes().as_slice();
-    sqlx::query_scalar::<_, Uuid>("SELECT id FROM playthroughs WHERE user_id=$1 AND id=$2")
-        .bind(owner)
-        .bind(id)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or_else(ApiError::not_found)?;
-    note_page(&state, owner, Some(id), params).await
+    params: Result<Query<BrowseQuery>, QueryRejection>,
+) -> ApiResult<Json<BrowsePage<DiaryNote>>> {
+    note_page(
+        &state,
+        user.0.id.0.as_bytes().as_slice(),
+        Some(path(id)?),
+        BrowseQuery::parse(params)?,
+    )
+    .await
 }
 
 async fn read(

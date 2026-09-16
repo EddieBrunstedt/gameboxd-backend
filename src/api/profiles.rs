@@ -1,8 +1,9 @@
 //! Profile reads resolve authorization and project selected items in one snapshot.
 //! Only the session-owned preview can bypass the profile gate, never item choices.
 use super::*;
+use browsing::snapshot;
 use sharing::{PublicLibraryEntry, PublicNote, PublicPlaythrough, PublicRating, PublicReview};
-use sqlx::{PgConnection, Postgres, Transaction};
+use sqlx::PgConnection;
 
 pub(super) fn routes() -> Router<AppState> {
     Router::new()
@@ -120,33 +121,12 @@ pub enum ProfileSection {
 #[serde(tag = "section", content = "page", rename_all = "snake_case")]
 #[ts(export)]
 pub enum PublicProfileSection {
-    CurrentGames(Page<PublicLibraryEntry>),
-    Library(Page<PublicLibraryEntry>),
-    Playthroughs(Page<PublicPlaythrough>),
-    Ratings(Page<PublicRating>),
-    Reviews(Page<PublicReview>),
-    Notes(Page<PublicNote>),
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SectionQuery {
-    #[serde(default = "default_limit")]
-    limit: u32,
-    #[serde(default)]
-    offset: u32,
-}
-
-impl SectionQuery {
-    fn parse(value: Result<Query<Self>, QueryRejection>) -> ApiResult<Self> {
-        let Query(value) = value.map_err(|_| ApiError::invalid("Invalid query parameters"))?;
-        if !(1..=50).contains(&value.limit) || value.offset > 10_000 {
-            return Err(ApiError::invalid(
-                "limit must be 1–50 and offset at most 10000",
-            ));
-        }
-        Ok(value)
-    }
+    CurrentGames(BrowsePage<PublicLibraryEntry>),
+    Library(BrowsePage<PublicLibraryEntry>),
+    Playthroughs(BrowsePage<PublicPlaythrough>),
+    Ratings(BrowsePage<PublicRating>),
+    Reviews(BrowsePage<PublicReview>),
+    Notes(BrowsePage<PublicNote>),
 }
 
 // Scope is constructed by handlers, never deserialized from visitor input.
@@ -163,14 +143,6 @@ struct SelectedProfile {
     handle: Option<String>,
     display_name: String,
     bio: Option<String>,
-}
-
-async fn snapshot(pool: &sqlx::PgPool) -> ApiResult<Transaction<'_, Postgres>> {
-    let mut tx = pool.begin().await?;
-    sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY")
-        .execute(&mut *tx)
-        .await?;
-    Ok(tx)
 }
 
 async fn resolve(conn: &mut PgConnection, scope: Scope) -> ApiResult<SelectedProfile> {
@@ -218,60 +190,31 @@ async fn selected_page<T>(
     conn: &mut PgConnection,
     owner: &[u8],
     section: &ProfileSection,
-    params: &SectionQuery,
-) -> ApiResult<Page<T>>
+    params: &BrowseQuery,
+) -> ApiResult<BrowsePage<T>>
 where
     T: for<'r> FromRow<'r, sqlx::postgres::PgRow> + Send + Unpin,
 {
-    // SQL identifiers/order are fixed server constants; all visitor values bind.
-    let (table, filter, order) = match section {
-        ProfileSection::CurrentGames => (
-            "selected_library_entries",
-            " AND status='playing'",
-            "lower(game_name),igdb_id,id",
-        ),
-        ProfileSection::Library => (
-            "selected_library_entries",
-            "",
-            "lower(game_name),igdb_id,id",
-        ),
-        ProfileSection::Playthroughs => (
-            "selected_playthroughs",
-            "",
-            "presentation_on DESC NULLS LAST,id DESC",
-        ),
-        ProfileSection::Ratings => (
-            "selected_ratings",
-            "",
-            "presentation_on DESC NULLS LAST,id DESC",
-        ),
+    let (source, kind) = match section {
+        ProfileSection::CurrentGames => (browsing::PUBLIC_CURRENT, Kind::Library { public: true }),
+        ProfileSection::Library => (browsing::PUBLIC_LIBRARY, Kind::Library { public: true }),
+        ProfileSection::Playthroughs => (browsing::PUBLIC_PLAYTHROUGHS, Kind::Playthroughs),
+        ProfileSection::Ratings => ("SELECT * FROM selected_ratings", Kind::Ratings),
         ProfileSection::Reviews => (
-            "selected_reviews",
-            "",
-            "presentation_on DESC NULLS LAST,id DESC",
+            "SELECT *,review AS text FROM selected_reviews",
+            Kind::Reviews,
         ),
-        ProfileSection::Notes => (
-            "selected_notes",
-            "",
-            "presentation_on DESC NULLS LAST,id DESC",
-        ),
+        ProfileSection::Notes => ("SELECT * FROM selected_notes", Kind::PublicNotes),
     };
-    let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
-        "SELECT * FROM {table} WHERE user_id=$1{filter} ORDER BY {order} LIMIT $2 OFFSET $3"
-    )))
-    .bind(owner)
-    .bind(i64::from(params.limit) + 1)
-    .bind(i64::from(params.offset))
-    .fetch_all(conn)
-    .await?;
-    Ok(page(rows, params.limit, params.offset).0)
+    params.validate(kind)?;
+    browsing::read_page(conn, owner, source, params, kind, None).await
 }
 
 async fn read_section(
     state: &AppState,
     scope: Scope,
     section: ProfileSection,
-    params: SectionQuery,
+    params: BrowseQuery,
 ) -> ApiResult<Json<PublicProfileSection>> {
     let mut tx = snapshot(&state.pool).await?;
     let profile = resolve(&mut tx, scope).await?;
@@ -322,14 +265,14 @@ async fn preview(user: AuthUser, State(state): State<AppState>) -> ApiResult<Jso
 async fn section(
     State(state): State<AppState>,
     id: Result<Path<(Uuid, ProfileSection)>, PathRejection>,
-    params: Result<Query<SectionQuery>, QueryRejection>,
+    params: Result<Query<BrowseQuery>, QueryRejection>,
 ) -> ApiResult<Json<PublicProfileSection>> {
     let (id, section) = path(id)?;
     read_section(
         &state,
         Scope::PublicId(id),
         section,
-        SectionQuery::parse(params)?,
+        BrowseQuery::parse(params)?,
     )
     .await
 }
@@ -338,13 +281,13 @@ async fn preview_section(
     user: AuthUser,
     State(state): State<AppState>,
     section: Result<Path<ProfileSection>, PathRejection>,
-    params: Result<Query<SectionQuery>, QueryRejection>,
+    params: Result<Query<BrowseQuery>, QueryRejection>,
 ) -> ApiResult<Json<PublicProfileSection>> {
     read_section(
         &state,
         Scope::OwnerPreview(user.0.id.0.as_bytes().to_vec()),
         path(section)?,
-        SectionQuery::parse(params)?,
+        BrowseQuery::parse(params)?,
     )
     .await
 }

@@ -72,3 +72,8 @@ export type { PublicProfile } from "./types/PublicProfile";
 export type { PublicProfileCounts } from "./types/PublicProfileCounts";
 export type { ProfileSection } from "./types/ProfileSection";
 export type { PublicProfileSection } from "./types/PublicProfileSection";
+
+export type { BrowsePage } from "./types/BrowsePage";
+export type { BrowseQuery } from "./types/BrowseQuery";
+export type { StatusCounts } from "./types/StatusCounts";
+export type { LibrarySort } from "./types/LibrarySort";

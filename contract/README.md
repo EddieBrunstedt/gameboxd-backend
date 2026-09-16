@@ -224,3 +224,24 @@ Biographies default private. `setPublication` accepts optional `bio_visibility`;
 omission/null preserves it and publishing the profile alone never publishes a
 bio. Each public item has an `author_id` linking to the stable public profile.
 See the [profile, handle and preview contract](../docs/api.md#public-profiles-stable-links-and-visitor-preview).
+
+## Library and diary browsing
+
+`library`, `playthroughs`, `diary`, `playthroughNotes`, public profile sections,
+and preview sections use generated `BrowsePage<T>` responses: data, bounded
+limit/offset, `has_more`, filtered `total`, `next_cursor`, and nullable
+`status_counts`. The owner library row adds nullable `last_played_on`. Local
+game/catalog pagination is unchanged.
+
+Use the client's `LibraryQuery`, `PlaythroughQuery`, and `NoteQuery` types for
+owner reads; generated `BrowseQuery` describes the full query vocabulary. Public
+section capabilities are validated server-side. Unsupported combinations return
+400, including public membership-date sorting or filtering public notes by
+parent state. Boolean filters serialize as `true`/`false`.
+
+Dated collections can continue with `{...filters, after: page.next_cursor}`
+(omit offset), retaining the same filters and collection. Refresh after changing
+filters or chosen dates. Totals cover the entire matching set, and library status
+facets ignore only the selected status. Review edits never affect recent-play
+sorting. See [the complete browsing policy](../docs/api.md#library-and-diary-browsing)
+for null/tie orders, date semantics, public-only inputs, and concurrent changes.

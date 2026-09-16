@@ -3887,7 +3887,13 @@ async fn diary_notes_enforce_ownership_validation_and_revision_preconditions() {
         )
         .await;
     assert_eq!(saved["text"], unicode);
-    for query in ["limit=0", "limit=51", "offset=10001", "offset=-1", "q=test"] {
+    for query in [
+        "limit=0",
+        "limit=51",
+        "offset=10001",
+        "offset=-1",
+        "unknown=test",
+    ] {
         for url in [
             format!("/api/me/diary?{query}"),
             format!("{nested}?{query}"),
@@ -5577,7 +5583,7 @@ async fn profile_chronology_pagination_and_independent_review_links_use_selected
         "limit=foo",
         "preview=true",
         "user_id=other",
-        "q=foo",
+        "unknown=foo",
     ] {
         for root in [&base, &"/api/me/public-preview".to_owned()] {
             public_body(
@@ -6015,5 +6021,567 @@ async fn public_profile_migration_preserves_choices_and_private_biographies() {
     .await;
     assert_eq!(review["presentation_on"], "1990-12-31");
     assert_eq!(review["author_id"], migrated["public_id"]);
+    f.finish().await;
+}
+
+async fn browse(f: &Fixture, owner: &str, path: &str) -> Value {
+    f.value("GET", path, owner, Value::Null, StatusCode::OK)
+        .await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn browsing_diary_filters_and_cursors_preserve_chosen_history() {
+    let f = Fixture::new().await;
+    let (_, owner) = f.user("browse-owner").await;
+    let (_, other) = f.user("browse-other").await;
+    let mut runs = Vec::new();
+    for (day, state, rating, review) in [
+        (Some("2020-12-31"), "completed", Some(8), Some("Finished")),
+        (Some("2020-02-29"), "paused", None, Some("Paused review")),
+        (Some("2020-02-29"), "completed", Some(6), None),
+        (Some("2019-12-31"), "abandoned", None, None),
+        (None, "paused", Some(5), Some("Unknown")),
+        (None, "completed", None, None),
+    ] {
+        runs.push(f.value("POST", "/api/me/playthroughs", &owner,
+            json!({"igdb_id":42,"presentation_on":day,"state":state,"rating":rating,"review":review}), StatusCode::CREATED).await);
+    }
+    for (query, count) in [
+        ("year=2020", 3),
+        ("year=2020&has_review=true", 2),
+        ("year=2020&has_rating=false", 1),
+        ("state=paused", 2),
+        ("state=completed&has_review=false", 2),
+        ("undated=true", 2),
+        ("undated=false", 4),
+        ("from_on=2020-02-29&to_on=2020-02-29", 2),
+        ("q=TeSt&igdb_id=42", 6),
+        ("q=%25", 0),
+        ("igdb_id=43", 0),
+    ] {
+        let page = browse(&f, &owner, &format!("/api/me/playthroughs?{query}")).await;
+        assert_eq!(page["total"], count, "{query}");
+        assert_eq!(
+            page["data"].as_array().unwrap().len(),
+            count as usize,
+            "{query}"
+        );
+        assert_eq!(page["has_more"], false);
+    }
+    assert_eq!(
+        browse(&f, &other, "/api/me/playthroughs?year=2020").await["total"],
+        0
+    );
+    let first = browse(&f, &owner, "/api/me/playthroughs?limit=1").await;
+    assert_eq!(first["data"][0]["id"], runs[0]["id"]);
+    let cursor = first["next_cursor"].as_str().unwrap();
+    // Editing the anchor, even deleting it, does not invalidate its value cursor.
+    f.edit(
+        "PATCH",
+        &run_path(&runs[0]),
+        &owner,
+        &tag(&runs[0]),
+        json!({"review":"Corrected"}),
+        StatusCode::OK,
+    )
+    .await;
+    f.value(
+        "DELETE",
+        &run_path(&runs[0]),
+        &owner,
+        Value::Null,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    // A new row ahead of the cursor cannot duplicate a previously read item.
+    f.value(
+        "POST",
+        "/api/me/playthroughs",
+        &owner,
+        json!({"igdb_id":42,"presentation_on":"2021-01-01"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let backfill = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &owner,
+            json!({"igdb_id":42,"presentation_on":"2020-06-01"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let mut after = cursor.to_owned();
+    let mut seen = Vec::new();
+    loop {
+        let page = browse(
+            &f,
+            &owner,
+            &format!("/api/me/playthroughs?limit=1&after={after}"),
+        )
+        .await;
+        assert_eq!(page["total"], 7);
+        seen.push(page["data"][0]["id"].clone());
+        if page["next_cursor"].is_null() {
+            assert_eq!(page["has_more"], false);
+            break;
+        }
+        after = page["next_cursor"].as_str().unwrap().to_owned();
+    }
+    let mut expected = runs[1..].to_vec();
+    expected.sort_by(|a, b| b["id"].as_str().cmp(&a["id"].as_str()));
+    expected.sort_by(|a, b| {
+        b["presentation_on"]
+            .as_str()
+            .cmp(&a["presentation_on"].as_str())
+    });
+    let mut expected_ids = vec![backfill["id"].clone()];
+    expected_ids.extend(expected.iter().map(|row| row["id"].clone()));
+    assert_eq!(seen, expected_ids);
+    let note = f
+        .note(
+            &owner,
+            &runs[1],
+            "Reached 50%_ of the game",
+            Some("2020-02-29"),
+        )
+        .await;
+    f.note(&owner, &runs[2], "Other note", Some("2020-02-29"))
+        .await;
+    f.note(&owner, &runs[1], "Unknown day", None).await;
+    let notes = browse(
+        &f,
+        &owner,
+        "/api/me/diary?year=2020&state=paused&has_review=true&has_rating=false&q=TEST&text=50%25_",
+    )
+    .await;
+    assert_eq!(notes["total"], 1);
+    assert_eq!(notes["data"][0]["id"], note["id"]);
+    let nested = format!("{}/notes?undated=true", run_path(&runs[1]));
+    assert_eq!(browse(&f, &owner, &nested).await["total"], 1);
+    let page = browse(&f, &owner, "/api/me/diary?limit=1").await;
+    let next = browse(
+        &f,
+        &owner,
+        &format!(
+            "/api/me/diary?limit=1&after={}",
+            page["next_cursor"].as_str().unwrap()
+        ),
+    )
+    .await;
+    assert_ne!(page["data"][0]["id"], next["data"][0]["id"]);
+    assert_eq!(next["total"], 3);
+    for query in [
+        "year=0",
+        "year=10000",
+        "year=2020&from_on=2020-01-01",
+        "undated=true&year=2020",
+        "from_on=2021-01-01&to_on=2020-01-01",
+        "year=abc",
+        "has_rating=1",
+        "state=bad",
+        "after=bad",
+        "text=%00",
+        "q=%0A",
+        "unknown=x",
+    ] {
+        f.value(
+            "GET",
+            &format!("/api/me/diary?{query}"),
+            &owner,
+            Value::Null,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    f.value(
+        "GET",
+        &format!("/api/me/diary?offset=1&after={cursor}"),
+        &owner,
+        Value::Null,
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn browsing_library_sorts_totals_and_play_activity_are_independent_of_edits() {
+    let f = Fixture::new().await;
+    let (owner_id, owner) = f.user("browse-library").await;
+    let (_, other) = f.user("browse-library-other").await;
+    for (id, name) in [(43, "alpha"), (44, "Alpha"), (45, "Zulu"), (46, "Undated")] {
+        sqlx::query("INSERT INTO games(id,igdb_id,name,slug,source_url) VALUES ($1,$2,$3,$3,'https://example.test')")
+            .bind(Uuid::new_v4()).bind(id as i64).bind(name).execute(&f.database.app).await.unwrap();
+    }
+    for (id, status) in [
+        (42, "backlog"),
+        (43, "playing"),
+        (44, "on_hold"),
+        (45, "completed"),
+        (46, "dropped"),
+    ] {
+        f.value(
+            "PUT",
+            &format!("/api/me/library/{id}"),
+            &owner,
+            json!({"status":status}),
+            StatusCode::OK,
+        )
+        .await;
+    }
+    // Equal recording dates exercise deterministic title/IGDB ties.
+    sqlx::query("UPDATE library_entries SET created_at='2020-01-01' WHERE user_id=$1")
+        .bind(owner_id.0.as_bytes().as_slice())
+        .execute(&f.database.app)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE library_entries SET created_at='2022-01-01' WHERE user_id=$1 AND game_id=(SELECT id FROM games WHERE igdb_id=45)")
+        .bind(owner_id.0.as_bytes().as_slice()).execute(&f.database.app).await.unwrap();
+    let mut runs = Vec::new();
+    for (id, rating, start, end) in [
+        (42, Some(9), Some("2010-01-01"), Some("2010-12-31")),
+        (43, Some(8), Some("2021-01-01"), None),
+        (44, Some(8), None, Some("2020-06-01")),
+        (45, None, None, None),
+    ] {
+        runs.push(f.value("POST", "/api/me/playthroughs", &owner, json!({"igdb_id":id,"rating":rating,"review":"History","started_on":start,"finished_on":end}), StatusCode::CREATED).await);
+    }
+    for (sort, expected) in [
+        ("title", vec![43, 44, 42, 46, 45]),
+        ("rating", vec![42, 43, 44, 46, 45]),
+        ("date_added", vec![45, 43, 44, 42, 46]),
+        ("recently_played", vec![43, 44, 42, 46, 45]),
+    ] {
+        let page = browse(&f, &owner, &format!("/api/me/library?sort={sort}")).await;
+        assert_eq!(page["total"], 5);
+        assert_eq!(
+            page["data"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|row| row["game"]["igdb_id"].as_i64().unwrap())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        assert_eq!(
+            page["status_counts"],
+            json!({"backlog":1,"playing":1,"on_hold":1,"completed":1,"dropped":1})
+        );
+    }
+    let filtered = browse(&f, &owner, "/api/me/library?q=alpha&status=playing&limit=1").await;
+    assert_eq!(filtered["total"], 1);
+    assert_eq!(
+        filtered["status_counts"],
+        json!({"backlog":0,"playing":1,"on_hold":1,"completed":0,"dropped":0})
+    );
+    let empty = browse(&f, &owner, "/api/me/library?has_rating=true&offset=20").await;
+    assert_eq!(empty["total"], 3);
+    assert_eq!(empty["data"], json!([]));
+    assert_eq!(empty["has_more"], false);
+    assert_eq!(browse(&f, &other, "/api/me/library").await["total"], 0);
+    let before = browse(&f, &owner, "/api/me/library?sort=recently_played&limit=2").await;
+    let corrected = f
+        .edit(
+            "PATCH",
+            &run_path(&runs[0]),
+            &owner,
+            &tag(&runs[0]),
+            json!({"review":"Corrected today","presentation_on":"2030-01-01"}),
+            StatusCode::OK,
+        )
+        .await;
+    share_run(&f,&owner,&corrected,json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"public"})).await;
+    publication(&f, &owner, true).await;
+    f.value(
+        "PUT",
+        "/api/me",
+        &owner,
+        json!({"display_name":"Changed","bio":"Changed"}),
+        StatusCode::OK,
+    )
+    .await;
+    let after = browse(&f, &owner, "/api/me/library?sort=recently_played&limit=2").await;
+    assert_eq!(before, after);
+    assert_eq!(after["data"][0]["last_played_on"], "2021-01-01");
+    assert_eq!(after["has_more"], true);
+    let last = browse(&f, &owner, "/api/me/library?sort=recently_played&offset=2").await;
+    assert_eq!(last["data"][0]["game"]["igdb_id"], 42);
+    assert!(last["data"][1]["last_played_on"].is_null());
+    // A deliberate play-date correction, unlike review edits, changes this sort.
+    f.edit(
+        "PATCH",
+        &run_path(&runs[1]),
+        &owner,
+        &tag(&runs[1]),
+        json!({"started_on":"2000-01-01"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        browse(&f, &owner, "/api/me/library?sort=recently_played").await["data"][0]["game"]["igdb_id"],
+        44
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn browsing_public_filters_counts_and_cursors_use_selected_components_only() {
+    let f = Fixture::new().await;
+    let (_, owner) = f.user("browse-public").await;
+    let (_, other) = f.user("browse-public-other").await;
+    let profile = publication(&f, &owner, true).await;
+    let base = format!(
+        "/api/public/profiles/{}",
+        profile["public_id"].as_str().unwrap()
+    );
+    let entry = f
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &owner,
+            json!({"status":"playing"}),
+            StatusCode::OK,
+        )
+        .await;
+    f.edit(
+        "PUT",
+        "/api/me/library/42/visibility",
+        &owner,
+        &tag(&entry),
+        json!({"visibility":"public"}),
+        StatusCode::OK,
+    )
+    .await;
+    let mut runs = Vec::new();
+    for (day, selected) in [
+        ("2020-12-31", true),
+        ("2020-01-01", true),
+        ("2030-01-01", false),
+    ] {
+        let run = f.value("POST","/api/me/playthroughs",&owner,json!({"igdb_id":42,"state":"completed","rating":10,"review":"Secret","presentation_on":day,"finished_on":day}),StatusCode::CREATED).await;
+        runs.push(if selected {share_run(&f,&owner,&run,json!({"summary_visibility":"public","rating_visibility":"private","review_visibility":"private"})).await} else {run});
+    }
+    let run = share_run(&f,&owner,&runs[1],json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"public"})).await;
+    runs[1] = run;
+    for (section, query, total) in [
+        (
+            "playthroughs",
+            "year=2020&state=completed&has_rating=false&has_review=false",
+            1,
+        ),
+        ("playthroughs", "has_rating=true&has_review=true", 1),
+        ("ratings", "year=2030", 0),
+        ("reviews", "text=Secret&year=2020", 1),
+        ("library", "has_rating=true&status=playing&sort=rating", 1),
+        ("library", "sort=recently_played", 1),
+        ("current_games", "q=TEST", 1),
+    ] {
+        let url = format!("{base}/{section}?{query}");
+        let anonymous = public_body(&f, &url, None, StatusCode::OK).await;
+        assert_eq!(anonymous["page"]["total"], total, "{url}");
+        for token in [&owner, &other] {
+            assert_eq!(
+                public_body(&f, &url, Some(token), StatusCode::OK).await,
+                anonymous
+            );
+        }
+        let preview = public_body(
+            &f,
+            &format!("/api/me/public-preview/{section}?{query}"),
+            Some(&owner),
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(preview, anonymous);
+    }
+    let note = f
+        .note(&owner, &runs[2], "Public note", Some("1999-12-31"))
+        .await;
+    share_note(&f, &owner, &note).await;
+    f.note(&owner, &runs[0], "Private note", Some("1999-12-31"))
+        .await;
+    assert_eq!(
+        public_body(
+            &f,
+            &format!("{base}/notes?year=1999&text=note"),
+            None,
+            StatusCode::OK
+        )
+        .await["page"]["total"],
+        1
+    );
+    for (section, query) in [
+        ("notes", "state=completed"),
+        ("reviews", "has_rating=true"),
+        ("ratings", "state=completed"),
+        ("library", "sort=date_added"),
+        ("library", "year=2020"),
+        ("playthroughs", "status=playing"),
+    ] {
+        public_body(
+            &f,
+            &format!("{base}/{section}?{query}"),
+            None,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    let first = public_body(
+        &f,
+        &format!("{base}/playthroughs?year=2020&limit=1"),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(first["page"]["total"], 2);
+    let cursor = first["page"]["next_cursor"].as_str().unwrap();
+    assert!(!cursor.contains("2030"));
+    let next_url = format!("{base}/playthroughs?year=2020&limit=1&after={cursor}");
+    let next = public_body(&f, &next_url, None, StatusCode::OK).await;
+    assert_eq!(next["page"]["data"][0]["id"], runs[1]["id"]);
+    // Another public game establishes an ordering that the newer private run
+    // must not change. Private membership must not enter totals or status facets.
+    for id in [43_i64, 44] {
+        sqlx::query("INSERT INTO games(id,igdb_id,name,slug,source_url) VALUES ($1,$2,'Other','other','https://example.test')")
+            .bind(Uuid::new_v4()).bind(id).execute(&f.database.app).await.unwrap();
+        let entry = f
+            .value(
+                "PUT",
+                &format!("/api/me/library/{id}"),
+                &owner,
+                json!({"status":"backlog"}),
+                StatusCode::OK,
+            )
+            .await;
+        if id == 43 {
+            f.edit(
+                "PUT",
+                &format!("/api/me/library/{id}/visibility"),
+                &owner,
+                &tag(&entry),
+                json!({"visibility":"public"}),
+                StatusCode::OK,
+            )
+            .await;
+            let run = f
+                .value(
+                    "POST",
+                    "/api/me/playthroughs",
+                    &owner,
+                    json!({"igdb_id":43,"started_on":"2025-01-01"}),
+                    StatusCode::CREATED,
+                )
+                .await;
+            share_run(&f,&owner,&run,json!({"summary_visibility":"public","rating_visibility":"private","review_visibility":"private"})).await;
+        }
+    }
+    // Private rating/play dates and text changes do not perturb public metadata.
+    let before = public_body(
+        &f,
+        &format!("{base}/library?sort=recently_played"),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(before["page"]["total"], 2);
+    assert_eq!(before["page"]["status_counts"]["backlog"], 1);
+    assert_eq!(before["page"]["data"][0]["game"]["igdb_id"], 43);
+    f.edit(
+        "PATCH",
+        &run_path(&runs[2]),
+        &owner,
+        &tag(&runs[2]),
+        json!({"finished_on":"2099-01-01","rating":1,"review":"Changed"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        public_body(
+            &f,
+            &format!("{base}/library?sort=recently_played"),
+            None,
+            StatusCode::OK
+        )
+        .await,
+        before
+    );
+    share_run(&f, &owner, &runs[1], private_parts()).await;
+    let revoked = public_body(&f, &next_url, None, StatusCode::OK).await;
+    assert_eq!(revoked["page"]["total"], 1);
+    assert_eq!(revoked["page"]["data"], json!([]));
+    assert_eq!(revoked["page"]["has_more"], false);
+    publication(&f, &owner, false).await;
+    public_body(&f, &next_url, None, StatusCode::NOT_FOUND).await;
+    let preview = public_body(
+        &f,
+        "/api/me/public-preview/playthroughs?year=2020",
+        Some(&owner),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(preview["page"]["total"], 1);
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn browsing_pages_and_totals_share_a_snapshot_during_concurrent_writes() {
+    let f = Fixture::new().await;
+    let (owner_id, owner) = f.user("browse-snapshot").await;
+    let entry = f
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &owner,
+            json!({"status":"playing"}),
+            StatusCode::OK,
+        )
+        .await;
+    f.edit(
+        "PUT",
+        "/api/me/library/42/visibility",
+        &owner,
+        &tag(&entry),
+        json!({"visibility":"public"}),
+        StatusCode::OK,
+    )
+    .await;
+    let profile = publication(&f, &owner, true).await;
+    let public = format!(
+        "/api/public/profiles/{}/library?status=playing",
+        profile["public_id"].as_str().unwrap()
+    );
+    let ((), ()) = tokio::join!(
+        async {
+            for _ in 0..40 {
+                sqlx::query("UPDATE library_entries SET status=CASE WHEN status='playing' THEN 'backlog' ELSE 'playing' END WHERE user_id=$1")
+                    .bind(owner_id.0.as_bytes().as_slice()).execute(&f.database.app).await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        },
+        async {
+            for _ in 0..20 {
+                let private = browse(&f, &owner, "/api/me/library?status=playing").await;
+                let public = public_body(&f, &public, None, StatusCode::OK).await;
+                for page in [&private, &public["page"]] {
+                    assert_eq!(
+                        page["total"].as_u64().unwrap(),
+                        page["data"].as_array().unwrap().len() as u64
+                    );
+                    assert_eq!(page["total"], page["status_counts"]["playing"]);
+                    assert_eq!(
+                        page["status_counts"]["playing"].as_i64().unwrap()
+                            + page["status_counts"]["backlog"].as_i64().unwrap(),
+                        1
+                    );
+                    assert_eq!(page["has_more"], false);
+                }
+            }
+        }
+    );
     f.finish().await;
 }

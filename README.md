@@ -38,6 +38,8 @@ The first `/api/me` request creates the user's app profile. Authenticated users 
 
 See [docs/api.md](docs/api.md) for routes, request bodies, errors and the frontend contract. [contract/](contract/) publishes that contract as TypeScript: wire types generated from the Rust structs, a typed client for the application routes, and the browser adapter for Doorman's passkey flows.
 
+Library and diary browsing supports game/date/year/state and rating/review filters, note text search, snapshot-consistent totals, and library status facets. Libraries sort by title, rating, membership date, or explicit recorded play dates; review edits never count as play. Dated collections offer cursor continuation across backfills. Public sections and owner preview filter only shared components and approved dates. See [browsing semantics](docs/api.md#library-and-diary-browsing).
+
 ## Verify
 
 ```sh
@@ -66,6 +68,7 @@ Provider tests use a local mock HTTP server, so tests do not require Twitch cred
 - `src/igdb.rs`, `src/models.rs`: provider client and stable local game records.
 - `src/refresh.rs`: background metadata refresh, so saves do not wait on the provider.
 - `src/api.rs`: game, owner profile, library and playthrough endpoints.
+- `src/api/browsing.rs`: validated collection filters, explicit sort policies, snapshot totals/facets, and historical cursor paging.
 - `src/api/profiles.rs`: public identity, profile sections and authenticated visitor preview.
 - `src/api/sharing.rs`: item publication controls and dedicated public projections.
 - `src/lib.rs`, `src/main.rs`: routing, middleware, startup and shutdown.

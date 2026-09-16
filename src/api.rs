@@ -16,7 +16,9 @@ use sqlx::FromRow;
 use ts_rs::TS;
 use uuid::Uuid;
 
+mod browsing;
 mod notes;
+use browsing::{BrowsePage, BrowseQuery, Kind};
 mod profiles;
 mod sharing;
 
@@ -455,6 +457,7 @@ async fn update_profile(
 #[derive(Serialize, FromRow, TS)]
 #[ts(export)]
 pub struct LibraryRow {
+    last_played_on: Option<NaiveDate>,
     #[sqlx(flatten)]
     game: Game,
     #[sqlx(flatten)]
@@ -464,27 +467,23 @@ pub struct LibraryRow {
 async fn library(
     user: AuthUser,
     State(state): State<AppState>,
-    params: Result<Query<PageQuery>, QueryRejection>,
-) -> ApiResult<Json<Page<LibraryRow>>> {
-    let params = query(params)?;
-    let name = params.name_pattern();
-    let data: Vec<LibraryRow> = sqlx::query_as(
-        "SELECT g.id,g.igdb_id,g.name,g.slug,g.summary,g.cover_url,g.first_release_date,
-            g.platforms,g.genres,g.developers,g.game_type,g.parent_igdb_id,g.version_parent_igdb_id,
-            g.source_url,g.imported_at,g.refreshed_at,
-            e.status,e.rating,e.rating_playthrough_id,e.current_playthrough_id,e.created_at,e.updated_at,e.public_id,e.visibility,e.version
-        FROM library_entry_details e JOIN games g ON g.id=e.game_id WHERE e.user_id=$1
-        AND ($2::text IS NULL OR e.status=$2) AND ($3::text IS NULL OR lower(g.name) LIKE lower($3))
-        ORDER BY e.updated_at DESC,e.game_id LIMIT $4 OFFSET $5",
+    params: Result<Query<BrowseQuery>, QueryRejection>,
+) -> ApiResult<Json<BrowsePage<LibraryRow>>> {
+    let params = BrowseQuery::parse(params)?;
+    let kind = Kind::Library { public: false };
+    params.validate(kind)?;
+    let mut tx = browsing::snapshot(&state.pool).await?;
+    let result = browsing::read_page(
+        &mut tx,
+        user.0.id.0.as_bytes().as_slice(),
+        browsing::OWNER_LIBRARY,
+        &params,
+        kind,
+        None,
     )
-    .bind(user.0.id.0.as_bytes().as_slice())
-    .bind(params.status)
-    .bind(name)
-    .bind(i64::from(params.limit) + 1)
-    .bind(i64::from(params.offset))
-    .fetch_all(&state.pool)
     .await?;
-    Ok(page(data, params.limit, params.offset))
+    tx.commit().await?;
+    Ok(Json(result))
 }
 
 async fn entry(
@@ -1015,42 +1014,25 @@ impl IntoResponse for Tagged {
     }
 }
 
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PlaythroughQuery {
-    #[serde(default = "default_limit")]
-    limit: u32,
-    #[serde(default)]
-    offset: u32,
-    igdb_id: Option<i64>,
-}
-
 async fn playthroughs(
     user: AuthUser,
     State(state): State<AppState>,
-    params: Result<Query<PlaythroughQuery>, QueryRejection>,
-) -> ApiResult<Json<Page<Playthrough>>> {
-    let Query(params) = params.map_err(|_| ApiError::invalid("Invalid query parameters"))?;
-    if !(1..=50).contains(&params.limit) || params.offset > 10_000 {
-        return Err(ApiError::invalid(
-            "limit must be 1–50 and offset at most 10000",
-        ));
-    }
-    if params.igdb_id.is_some_and(|id| id <= 0) {
-        return Err(ApiError::invalid("IGDB ID must be positive"));
-    }
-    let rows = sqlx::query_as(
-        "SELECT p.*,g.igdb_id FROM playthroughs p JOIN games g ON g.id=p.game_id
-         WHERE p.user_id=$1 AND ($2::bigint IS NULL OR g.igdb_id=$2)
-         ORDER BY p.presentation_on DESC NULLS LAST,p.id DESC LIMIT $3 OFFSET $4",
+    params: Result<Query<BrowseQuery>, QueryRejection>,
+) -> ApiResult<Json<BrowsePage<Playthrough>>> {
+    let params = BrowseQuery::parse(params)?;
+    params.validate(Kind::Playthroughs)?;
+    let mut tx = browsing::snapshot(&state.pool).await?;
+    let result = browsing::read_page(
+        &mut tx,
+        user.0.id.0.as_bytes().as_slice(),
+        browsing::OWNER_PLAYTHROUGHS,
+        &params,
+        Kind::Playthroughs,
+        None,
     )
-    .bind(user.0.id.0.as_bytes().as_slice())
-    .bind(params.igdb_id)
-    .bind(i64::from(params.limit) + 1)
-    .bind(i64::from(params.offset))
-    .fetch_all(&state.pool)
     .await?;
-    Ok(page(rows, params.limit, params.offset))
+    tx.commit().await?;
+    Ok(Json(result))
 }
 
 async fn playthrough(
