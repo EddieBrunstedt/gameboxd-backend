@@ -9302,3 +9302,1002 @@ async fn safety_report_quota_retention_deletion_and_migration_preserve_private_d
     );
     f.finish().await;
 }
+
+// Transfer fixtures use legal stored content, including whitespace and dates
+// that must survive without the normal UI's trimming or inferred timestamps.
+async fn transfer_archive(f: &Fixture, owner: UserId, token: &str) -> Value {
+    list_games_fixture(f).await;
+    let profile = owner_profile(f, token).await;
+    sqlx::query("UPDATE profiles SET display_name='Archive owner',bio=E' Full biography\n雪 ',public_enabled=true,bio_visibility='public',statistics_visibility='public',handle='archive_owner' WHERE user_id=$1")
+        .bind(owner.0.as_bytes().as_slice()).execute(&f.database.app).await.unwrap();
+    sqlx::query("INSERT INTO library_entries(user_id,game_id,status,visibility) SELECT $1,id,'playing','public' FROM games WHERE igdb_id=42")
+        .bind(owner.0.as_bytes().as_slice()).execute(&f.database.app).await.unwrap();
+    for (id, day, rating, state, current) in [
+        (
+            10_u128,
+            Some("2020-02-29"),
+            Some(8_i16),
+            Some("completed"),
+            false,
+        ),
+        (30, Some("2020-02-29"), Some(6), Some("abandoned"), false),
+        (50, None, Some(10), None, false),
+        (70, None, None, Some("active"), true),
+    ] {
+        sqlx::query("INSERT INTO playthroughs(id,user_id,game_id,state,is_current,rating,review,presentation_on,platform,summary_visibility,rating_visibility,review_visibility,created_at,updated_at)
+            SELECT $1,$2,id,$3,$4,$5,E' Full review\n雪 🕹️ ', $6::text::date,'PC','public',CASE WHEN $5::smallint IS NULL THEN 'private' ELSE 'public' END,'public','2001-01-01','2002-01-01' FROM games WHERE igdb_id=42")
+            .bind(Uuid::from_u128(id)).bind(owner.0.as_bytes().as_slice()).bind(state).bind(current).bind(rating).bind(day)
+            .execute(&f.database.app).await.unwrap();
+    }
+    for (id, parent, day) in [(20_u128, 10_u128, Some("2020-02-29")), (40, 30, None)] {
+        sqlx::query("INSERT INTO diary_notes(id,user_id,playthrough_id,text,presentation_on,visibility) VALUES($1,$2,$3,$4,$5::text::date,'public')")
+            .bind(Uuid::from_u128(id)).bind(owner.0.as_bytes().as_slice()).bind(Uuid::from_u128(parent))
+            .bind(format!("  Note {id}\n{}", "雪🕹️".repeat(100))).bind(day).execute(&f.database.app).await.unwrap();
+    }
+    for (id, kind, members) in [
+        (90_u128, "custom", vec![44_i64, 42, 43]),
+        (110, "favorites", vec![43, 42]),
+    ] {
+        let id = Uuid::from_u128(id);
+        sqlx::query("INSERT INTO game_lists(id,user_id,kind,title,description,visibility) VALUES($1,$2,$3,' Play next 雪 ',E' full\n description ','public')")
+            .bind(id).bind(owner.0.as_bytes().as_slice()).bind(kind).execute(&f.database.app).await.unwrap();
+        sqlx::query("INSERT INTO game_list_members(list_id,game_id,position) SELECT $1,g.id,(u.n-1)::int FROM unnest($2::bigint[]) WITH ORDINALITY u(igdb_id,n) JOIN games g USING(igdb_id)")
+            .bind(id).bind(members).execute(&f.database.app).await.unwrap();
+    }
+    let archive = f
+        .value("GET", "/api/me/export", token, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(archive["profile"]["id"], profile["public_id"]);
+    archive
+}
+
+fn transfer_input(archive: &Value) -> Value {
+    json!({"archive":archive,"profile_policy":"restore"})
+}
+fn transfer_target(report: &Value, kind: &str, source: &Value) -> String {
+    report["mappings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|m| m["kind"] == kind && m["source_id"] == *source)
+        .unwrap()["target_id"]
+        .as_str()
+        .unwrap()
+        .into()
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn personal_transfer_round_trip_preserves_content_relationships_order_and_private_defaults() {
+    let f = Fixture::new().await;
+    let (source_id, source) = f.user("transfer-source").await;
+    let (dest_id, dest) = f.user("transfer-dest").await;
+    let (_, other) = f.user("transfer-other").await;
+    let archive = transfer_archive(&f, source_id, &source).await;
+    for path in ["/api/me/export", "/api/me/import/preview", "/api/me/import"] {
+        let method = if path.ends_with("export") {
+            "GET"
+        } else {
+            "POST"
+        };
+        assert_eq!(
+            f.call(method, path, None, transfer_input(&archive))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let response = f
+        .call("GET", "/api/me/export", Some(&source), Value::Null)
+        .await;
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert!(!response.headers().contains_key("etag"));
+    let text = archive.to_string();
+    for secret in [
+        "user_id",
+        "email",
+        "credentials",
+        "sessions",
+        "token",
+        "moderation",
+        "operator",
+        "password",
+    ] {
+        assert!(!text.contains(secret), "unexpected field: {secret}");
+    }
+    assert!(!text.contains(&source_id.0.to_string()));
+    let input = transfer_input(&archive);
+    let preview = f
+        .value(
+            "POST",
+            "/api/me/import/preview",
+            &dest,
+            input.clone(),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(preview["valid"], true);
+    assert_eq!(preview["create_count"], 10);
+    assert_eq!(preview["applied"], false);
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM profiles WHERE user_id=$1")
+        .bind(dest_id.0.as_bytes().as_slice())
+        .fetch_one(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(count, 0, "preview must not initialize a profile");
+    let report = f
+        .value("POST", "/api/me/import", &dest, input, StatusCode::OK)
+        .await;
+    assert_eq!(report["applied"], true);
+    assert_eq!(report["mappings"].as_array().unwrap().len(), 10);
+    let imported = f
+        .value("GET", "/api/me/export", &dest, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(imported["games"], archive["games"]);
+    assert_eq!(
+        imported["profile"]["display_name"],
+        archive["profile"]["display_name"]
+    );
+    assert_eq!(imported["profile"]["bio"], archive["profile"]["bio"]);
+    assert_ne!(imported["profile"]["id"], archive["profile"]["id"]);
+    assert_eq!(imported["profile"]["public_enabled"], false);
+    assert!(imported["profile"]["handle"].is_null());
+    assert_eq!(imported["profile"]["statistics_visibility"], "private");
+    assert_eq!(imported["profile"]["bio_visibility"], "private");
+    for (collection, kind) in [
+        ("library", "library"),
+        ("playthroughs", "playthrough"),
+        ("notes", "note"),
+        ("lists", "list"),
+    ] {
+        assert_eq!(
+            imported[collection].as_array().unwrap().len(),
+            archive[collection].as_array().unwrap().len()
+        );
+        for (original, restored) in archive[collection]
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(imported[collection].as_array().unwrap())
+        {
+            assert_eq!(
+                restored["id"],
+                transfer_target(&report, kind, &original["id"])
+            );
+            assert_ne!(restored["id"], original["id"]);
+            assert_eq!(restored["bookkeeping"]["version"], 1);
+            for (key, value) in original.as_object().unwrap() {
+                match key.as_str() {
+                    "id" | "bookkeeping" => {}
+                    "playthrough_id" => assert_eq!(
+                        restored[key],
+                        transfer_target(&report, "playthrough", value)
+                    ),
+                    k if k.ends_with("visibility") => assert_eq!(restored[key], "private"),
+                    _ => assert_eq!(&restored[key], value, "{collection}.{key}"),
+                }
+            }
+        }
+    }
+    assert_ne!(
+        imported["playthroughs"][0]["bookkeeping"]["created_at"],
+        archive["playthroughs"][0]["bookkeeping"]["created_at"]
+    );
+    // UUID tie ordering must survive across notes and runs as well as within runs.
+    let p0 = transfer_target(&report, "playthrough", &archive["playthroughs"][0]["id"]);
+    let n0 = transfer_target(&report, "note", &archive["notes"][0]["id"]);
+    let p1 = transfer_target(&report, "playthrough", &archive["playthroughs"][1]["id"]);
+    assert!(p0 < n0 && n0 < p1);
+    let entry = f
+        .value(
+            "GET",
+            "/api/me/library/42",
+            &dest,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        entry["rating"], 6,
+        "dated tie uses the same rating after remapping"
+    );
+    assert_eq!(
+        entry["current_playthrough_id"],
+        transfer_target(&report, "playthrough", &archive["playthroughs"][3]["id"])
+    );
+    assert_eq!(
+        f.call(
+            "GET",
+            &format!("/api/me/playthroughs/{p0}"),
+            Some(&other),
+            Value::Null
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        f.call(
+            "GET",
+            &format!("/api/public/reviews/{p0}"),
+            None,
+            Value::Null
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    assert!(
+        f.server.received_requests().await.unwrap().is_empty(),
+        "stored game round trip must not contact IGDB"
+    );
+    let empty = f
+        .value("GET", "/api/me/export", &other, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(empty["playthroughs"], json!([]));
+    assert_eq!(
+        f.value(
+            "GET",
+            "/api/me/export",
+            &source,
+            Value::Null,
+            StatusCode::OK
+        )
+        .await,
+        archive
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn personal_transfer_retries_merge_conflicts_and_deleted_parent_tombstones_are_owner_scoped()
+{
+    let f = Fixture::new().await;
+    let (source_id, source) = f.user("transfer-source").await;
+    let (_, dest) = f.user("transfer-dest").await;
+    let (_, other) = f.user("transfer-other").await;
+    let archive = transfer_archive(&f, source_id, &source).await;
+    let input = transfer_input(&archive);
+    let (a, b) = tokio::join!(
+        f.call("POST", "/api/me/import", Some(&dest), input.clone()),
+        f.call("POST", "/api/me/import", Some(&dest), input.clone())
+    );
+    let a = json_body(a, StatusCode::OK).await;
+    let b = json_body(b, StatusCode::OK).await;
+    assert_eq!(
+        a["create_count"].as_u64().unwrap() + b["create_count"].as_u64().unwrap(),
+        10
+    );
+    let report = if a["create_count"] == 10 { a } else { b };
+    let p0 = transfer_target(&report, "playthrough", &archive["playthroughs"][0]["id"]);
+    f.edit(
+        "PATCH",
+        &format!("/api/me/playthroughs/{p0}"),
+        &dest,
+        "\"1\"",
+        json!({"review":"Local correction"}),
+        StatusCode::OK,
+    )
+    .await;
+    let note = transfer_target(&report, "note", &archive["notes"][0]["id"]);
+    assert_eq!(
+        f.send(
+            "DELETE",
+            &format!("/api/me/notes/{note}"),
+            Some(&dest),
+            &[("If-Match", "\"1\"")],
+            Value::Null
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    let replay = f
+        .value(
+            "POST",
+            "/api/me/import",
+            &dest,
+            input.clone(),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(replay["create_count"], 0);
+    assert_eq!(replay["skip_count"], 10);
+    let restored = f
+        .value("GET", "/api/me/export", &dest, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(restored["playthroughs"][0]["review"], "Local correction");
+    assert_eq!(restored["notes"].as_array().unwrap().len(), 1);
+    let mut changed = input.clone();
+    changed["archive"]["playthroughs"][0]["review"] = json!("Changed source");
+    let report = f
+        .value(
+            "POST",
+            "/api/me/import/preview",
+            &dest,
+            changed.clone(),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(report["valid"], false);
+    assert_eq!(report["errors"][0]["field"], "archive.playthroughs[0]");
+    assert_eq!(
+        f.value(
+            "POST",
+            "/api/me/import",
+            &dest,
+            changed,
+            StatusCode::CONFLICT
+        )
+        .await["error"]["code"],
+        "import_conflict"
+    );
+    // A later export with identical content but new bookkeeping/permissions is a retry.
+    let mut bookkeeping = input.clone();
+    bookkeeping["archive"]["playthroughs"][0]["bookkeeping"]["version"] = json!(987);
+    bookkeeping["archive"]["playthroughs"][0]["review_visibility"] = json!("private");
+    assert_eq!(
+        f.value("POST", "/api/me/import", &dest, bookkeeping, StatusCode::OK)
+            .await["create_count"],
+        0
+    );
+    // Incremental new children use the previous mapping, not the source UUID.
+    let mut more = input.clone();
+    let mut extra = archive["notes"][0].clone();
+    extra["id"] = json!(Uuid::new_v4());
+    extra["text"] = json!("New note");
+    more["archive"]["notes"].as_array_mut().unwrap().push(extra);
+    assert_eq!(
+        f.value(
+            "POST",
+            "/api/me/import",
+            &dest,
+            more.clone(),
+            StatusCode::OK
+        )
+        .await["create_count"],
+        1
+    );
+    let deleted = f
+        .value(
+            "GET",
+            &format!("/api/me/playthroughs/{p0}"),
+            &dest,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        f.send(
+            "DELETE",
+            &format!("/api/me/playthroughs/{p0}"),
+            Some(&dest),
+            &[("If-Match", &tag(&deleted))],
+            Value::Null
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    more["archive"]["notes"][2]["id"] = json!(Uuid::new_v4());
+    assert_eq!(
+        f.value(
+            "POST",
+            "/api/me/import/preview",
+            &dest,
+            more,
+            StatusCode::OK
+        )
+        .await["valid"],
+        false
+    );
+    let own = f
+        .value(
+            "POST",
+            "/api/me/import/preview",
+            &source,
+            input.clone(),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        own["valid"], false,
+        "self-import cannot duplicate its own history"
+    );
+    // Merge into a published account keeps its profile and unrelated history,
+    // while provenance remains isolated and every new item remains private.
+    f.value(
+        "PUT",
+        "/api/me",
+        &other,
+        json!({"display_name":"Existing owner","bio":"Keep biography"}),
+        StatusCode::OK,
+    )
+    .await;
+    publication(&f, &other, true).await;
+    let kept = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &other,
+            json!({"igdb_id":44,"review":"Keep history"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let mut keep = input;
+    keep["profile_policy"] = json!("keep");
+    assert_eq!(
+        f.value("POST", "/api/me/import", &other, keep, StatusCode::OK)
+            .await["create_count"],
+        9
+    );
+    let merged = f
+        .value("GET", "/api/me/export", &other, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(merged["profile"]["display_name"], "Existing owner");
+    assert_eq!(merged["profile"]["bio"], "Keep biography");
+    assert_eq!(merged["profile"]["public_enabled"], true);
+    assert_eq!(merged["playthroughs"].as_array().unwrap().len(), 5);
+    assert!(
+        merged["playthroughs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|p| p["id"] == kept["id"] && p["review"] == "Keep history")
+    );
+    for p in merged["playthroughs"].as_array().unwrap() {
+        assert_eq!(p["review_visibility"], "private");
+    }
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn personal_transfer_validation_preview_and_destination_conflicts_are_actionable() {
+    let f = Fixture::new().await;
+    let (source_id, source) = f.user("transfer-source").await;
+    let (_, dest) = f.user("transfer-dest").await;
+    let archive = transfer_archive(&f, source_id, &source).await;
+    let input = transfer_input(&archive);
+    let mut invalid = input.clone();
+    invalid["archive"]["version"] = json!(2);
+    invalid["archive"]["profile"]["bio"] = json!("x".repeat(1001));
+    invalid["archive"]["playthroughs"][0]["rating"] = json!(11);
+    invalid["archive"]["playthroughs"][0]["started_on"] = json!("2021-01-01");
+    invalid["archive"]["playthroughs"][0]["finished_on"] = json!("2020-01-01");
+    invalid["archive"]["playthroughs"][3]["state"] = Value::Null;
+    invalid["archive"]["notes"][0]["text"] = json!("\0");
+    invalid["archive"]["notes"][0]["playthrough_id"] = json!(Uuid::new_v4());
+    invalid["archive"]["notes"][1]["id"] = invalid["archive"]["notes"][0]["id"].clone();
+    invalid["archive"]["lists"][0]["igdb_ids"] = json!([42, 42]);
+    let preview = f
+        .value(
+            "POST",
+            "/api/me/import/preview",
+            &dest,
+            invalid.clone(),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(preview["valid"], false);
+    assert!(preview["errors"].as_array().unwrap().len() >= 9);
+    assert_eq!(
+        f.value(
+            "POST",
+            "/api/me/import",
+            &dest,
+            invalid,
+            StatusCode::BAD_REQUEST
+        )
+        .await["error"]["code"],
+        "validation_error"
+    );
+    for (key, value) in [("operator", json!(true)), ("user_id", json!(source_id.0))] {
+        let mut bad = input.clone();
+        bad["archive"][key] = value;
+        let error = f
+            .value(
+                "POST",
+                "/api/me/import/preview",
+                &dest,
+                bad,
+                StatusCode::UNPROCESSABLE_ENTITY,
+            )
+            .await;
+        assert_eq!(
+            error["error"]["fields"][0]["field"],
+            format!("archive.{key}")
+        );
+    }
+    let mut missing = input.clone();
+    missing["archive"]["playthroughs"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("presentation_on");
+    let error = f
+        .value(
+            "POST",
+            "/api/me/import/preview",
+            &dest,
+            missing,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+    assert_eq!(
+        error["error"]["fields"][0]["field"],
+        "archive.playthroughs[0].presentation_on"
+    );
+    let mut bad_date = input.clone();
+    bad_date["archive"]["notes"][0]["presentation_on"] = json!("2023-02-29");
+    let error = f
+        .value(
+            "POST",
+            "/api/me/import/preview",
+            &dest,
+            bad_date,
+            StatusCode::UNPROCESSABLE_ENTITY,
+        )
+        .await;
+    assert_eq!(
+        error["error"]["fields"][0]["field"],
+        "archive.notes[0].presentation_on"
+    );
+    assert_eq!(
+        f.raw(
+            "/api/me/import",
+            &dest,
+            "application/json",
+            &format!("{} {{}}", input)
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        f.raw("/api/me/import", &dest, "text/plain", &input.to_string())
+            .await
+            .status(),
+        StatusCode::UNSUPPORTED_MEDIA_TYPE
+    );
+    let mut large = input.clone();
+    large["archive"]["profile"]["bio"] = json!("x".repeat(32 * 1024 * 1024));
+    assert_eq!(
+        f.call("POST", "/api/me/import/preview", Some(&dest), large)
+            .await
+            .status(),
+        StatusCode::PAYLOAD_TOO_LARGE
+    );
+    f.value(
+        "PUT",
+        "/api/me",
+        &dest,
+        json!({"display_name":"Keep me","bio":"Existing bio"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        f.value(
+            "POST",
+            "/api/me/import/preview",
+            &dest,
+            input.clone(),
+            StatusCode::OK
+        )
+        .await["valid"],
+        false
+    );
+    let mut keep = input.clone();
+    keep["profile_policy"] = json!("keep");
+    assert_eq!(
+        f.value(
+            "POST",
+            "/api/me/import/preview",
+            &dest,
+            keep.clone(),
+            StatusCode::OK
+        )
+        .await["valid"],
+        true
+    );
+    f.value(
+        "PUT",
+        "/api/me/library/42",
+        &dest,
+        json!({"status":"backlog"}),
+        StatusCode::OK,
+    )
+    .await;
+    f.value(
+        "POST",
+        "/api/me/lists",
+        &dest,
+        json!({"kind":"favorites","title":"Existing"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let conflict = f
+        .value(
+            "POST",
+            "/api/me/import/preview",
+            &dest,
+            keep.clone(),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(conflict["valid"], false);
+    assert_eq!(conflict["errors"].as_array().unwrap().len(), 2);
+    f.value("POST", "/api/me/import", &dest, keep, StatusCode::CONFLICT)
+        .await;
+    let after = f
+        .value("GET", "/api/me/export", &dest, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(after["profile"]["display_name"], "Keep me");
+    assert_eq!(after["playthroughs"], json!([]));
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn personal_transfer_provider_and_database_failures_roll_back_and_large_archives_retry() {
+    let f = Fixture::new().await;
+    let (_, source) = f.user("transfer-source").await;
+    let (dest_id, dest) = f.user("transfer-dest").await;
+    let mut archive = f
+        .value(
+            "GET",
+            "/api/me/export",
+            &source,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    let bookkeeping = archive["profile"]["bookkeeping"].clone();
+    let parent = Uuid::new_v4();
+    archive["games"] = json!([{"igdb_id":42,"name":"Forged metadata","slug":"forged"}]);
+    archive["playthroughs"] = json!([{
+        "id":parent,"igdb_id":42,"state":null,"is_current":false,"rating":9,"review":"Full review",
+        "presentation_on":null,"started_on":null,"finished_on":null,"platform":null,
+        "summary_visibility":"public","rating_visibility":"public","review_visibility":"public","bookkeeping":bookkeeping
+    }]);
+    archive["notes"] = json!((0..10).map(|_| json!({"id":Uuid::new_v4(),"playthrough_id":parent,"text":"雪".repeat(10000),"presentation_on":null,"visibility":"public","bookkeeping":bookkeeping})).collect::<Vec<_>>());
+    let input = transfer_input(&archive);
+    assert!(input.to_string().len() > 64 * 1024);
+    let unavailable = Mock::given(path("/games"))
+        .respond_with(ResponseTemplate::new(503))
+        .with_priority(1)
+        .mount_as_scoped(&f.server)
+        .await;
+    let preview = f
+        .value(
+            "POST",
+            "/api/me/import/preview",
+            &dest,
+            input.clone(),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(preview["valid"], true);
+    assert_eq!(preview["missing_game_ids"], json!([42]));
+    assert!(
+        f.server.received_requests().await.unwrap().is_empty(),
+        "preview does not contact IGDB"
+    );
+    let error = f
+        .value(
+            "POST",
+            "/api/me/import",
+            &dest,
+            input.clone(),
+            StatusCode::BAD_GATEWAY,
+        )
+        .await;
+    assert!(
+        error["error"]["fields"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("42")
+    );
+    drop(unavailable);
+    f.server.reset().await;
+    Mock::given(path("/token"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"access_token":"test-provider-token","expires_in":3600})),
+        )
+        .mount(&f.server)
+        .await;
+    Mock::given(path("/games"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"id":42,"name":"Test Game","slug":"test-game"}])),
+        )
+        .mount(&f.server)
+        .await;
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM profiles WHERE user_id=$1")
+        .bind(dest_id.0.as_bytes().as_slice())
+        .fetch_one(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    sqlx::raw_sql("CREATE FUNCTION reject_transfer_note() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected transfer failure'; END $$;
+        CREATE TRIGGER reject_transfer_note BEFORE INSERT ON diary_notes FOR EACH ROW EXECUTE FUNCTION reject_transfer_note();")
+        .execute(&f.database.app).await.unwrap();
+    f.value(
+        "POST",
+        "/api/me/import",
+        &dest,
+        input.clone(),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await;
+    let count: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM games)+(SELECT count(*) FROM playthroughs)+(SELECT count(*) FROM diary_notes)+(SELECT count(*) FROM personal_import_records)+(SELECT count(*) FROM profiles WHERE user_id=$1)")
+        .bind(dest_id.0.as_bytes().as_slice()).fetch_one(&f.database.app).await.unwrap();
+    assert_eq!(
+        count, 0,
+        "catalog, parent, profile and retry ledger must all roll back"
+    );
+    sqlx::raw_sql(
+        "DROP TRIGGER reject_transfer_note ON diary_notes; DROP FUNCTION reject_transfer_note();",
+    )
+    .execute(&f.database.app)
+    .await
+    .unwrap();
+    let result = f
+        .value(
+            "POST",
+            "/api/me/import",
+            &dest,
+            input.clone(),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(result["create_count"], 12);
+    let stored = f
+        .value("GET", "/api/games/42", &dest, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(
+        stored["name"], "Test Game",
+        "archive metadata cannot poison the catalog"
+    );
+    let after = f
+        .value("GET", "/api/me/export", &dest, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(after["notes"].as_array().unwrap().len(), 10);
+    assert_eq!(after["notes"][0]["text"], "雪".repeat(10000));
+    assert_eq!(
+        f.value("POST", "/api/me/import", &dest, input, StatusCode::OK)
+            .await["create_count"],
+        0
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn personal_transfer_concurrent_lifecycle_and_favorites_keep_whole_import_atomic() {
+    let f = Fixture::new().await;
+    let (source_id, source) = f.user("transfer-source").await;
+    let (_, dest) = f.user("transfer-current").await;
+    let (_, favorites) = f.user("transfer-favorites").await;
+    let archive = transfer_archive(&f, source_id, &source).await;
+    let input = transfer_input(&archive);
+    let (import, start) = tokio::join!(
+        f.call("POST", "/api/me/import", Some(&dest), input.clone()),
+        f.call(
+            "POST",
+            "/api/me/playthroughs/start",
+            Some(&dest),
+            json!({"igdb_id":42})
+        )
+    );
+    assert!(
+        matches!(
+            (import.status(), start.status()),
+            (StatusCode::OK, StatusCode::CONFLICT) | (StatusCode::CONFLICT, StatusCode::CREATED)
+        ),
+        "import={}, start={}",
+        import.status(),
+        start.status()
+    );
+    let entry = f
+        .value(
+            "GET",
+            "/api/me/library/42",
+            &dest,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(entry["status"], "playing");
+    assert!(!entry["current_playthrough_id"].is_null());
+    let after = f
+        .value("GET", "/api/me/export", &dest, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(
+        after["playthroughs"].as_array().unwrap().len(),
+        if import.status() == StatusCode::OK {
+            4
+        } else {
+            1
+        }
+    );
+    assert_eq!(
+        after["notes"].as_array().unwrap().len(),
+        if import.status() == StatusCode::OK {
+            2
+        } else {
+            0
+        }
+    );
+    let (import, create) = tokio::join!(
+        f.call("POST", "/api/me/import", Some(&favorites), input),
+        f.call(
+            "POST",
+            "/api/me/lists",
+            Some(&favorites),
+            json!({"kind":"favorites","title":"Concurrent favorites"})
+        )
+    );
+    assert!(
+        matches!(
+            (import.status(), create.status()),
+            (StatusCode::OK, StatusCode::CONFLICT) | (StatusCode::CONFLICT, StatusCode::CREATED)
+        ),
+        "import={}, create={}",
+        import.status(),
+        create.status()
+    );
+    let after = f
+        .value(
+            "GET",
+            "/api/me/export",
+            &favorites,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        after["playthroughs"].as_array().unwrap().len(),
+        if import.status() == StatusCode::OK {
+            4
+        } else {
+            0
+        }
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn personal_transfer_snapshot_migration_moderation_and_account_deletion_preserve_boundaries()
+{
+    let f = Fixture::new().await;
+    let (source_id, source) = f.user("transfer-source").await;
+    let (dest_id, dest) = f.user("transfer-dest").await;
+    let archive = transfer_archive(&f, source_id, &source).await;
+    // Migration does not alter any existing content or permissions.
+    sqlx::raw_sql("DROP TABLE personal_import_records; DELETE FROM _sqlx_migrations WHERE version=202609170003;").execute(&f.database.app).await.unwrap();
+    sqlx::migrate!("./migrations")
+        .run(&f.database.app)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations")
+        .run(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.value(
+            "GET",
+            "/api/me/export",
+            &source,
+            Value::Null,
+            StatusCode::OK
+        )
+        .await,
+        archive
+    );
+    let target = owner_profile(&f, &dest).await;
+    let (_, operator) = safety_operator(&f).await;
+    restriction(&f, &operator, "profile", &target["public_id"], true, 0).await;
+    let input = transfer_input(&archive);
+    f.value(
+        "POST",
+        "/api/me/import",
+        &dest,
+        input.clone(),
+        StatusCode::OK,
+    )
+    .await;
+    let restrictions = f
+        .value(
+            "GET",
+            "/api/me/restrictions",
+            &dest,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(restrictions.as_array().unwrap().len(), 1);
+    assert_eq!(
+        f.call("GET", "/api/operator/reports", Some(&dest), Value::Null)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    // Export sees one committed snapshot across profile, parent and note reads.
+    let pool = f.database.app.clone();
+    let writer = tokio::spawn(async move {
+        for i in 0..30 {
+            let value = format!("Snapshot {i}");
+            let mut tx = pool.begin().await.unwrap();
+            sqlx::query("UPDATE profiles SET bio=$2 WHERE user_id=$1")
+                .bind(source_id.0.as_bytes().as_slice())
+                .bind(&value)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE playthroughs SET review=$2 WHERE user_id=$1")
+                .bind(source_id.0.as_bytes().as_slice())
+                .bind(&value)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE diary_notes SET text=$2 WHERE user_id=$1")
+                .bind(source_id.0.as_bytes().as_slice())
+                .bind(&value)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            tx.commit().await.unwrap();
+            tokio::task::yield_now().await;
+        }
+    });
+    for _ in 0..15 {
+        let a = f
+            .value(
+                "GET",
+                "/api/me/export",
+                &source,
+                Value::Null,
+                StatusCode::OK,
+            )
+            .await;
+        if a["profile"]["bio"]
+            .as_str()
+            .unwrap()
+            .starts_with("Snapshot ")
+        {
+            for p in a["playthroughs"].as_array().unwrap() {
+                assert_eq!(p["review"], a["profile"]["bio"]);
+            }
+            for n in a["notes"].as_array().unwrap() {
+                assert_eq!(n["text"], a["profile"]["bio"]);
+            }
+        }
+    }
+    writer.await.unwrap();
+    // Replaying after restart retains provenance, but account deletion removes it.
+    sqlx::migrate!("./migrations")
+        .run(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.value("POST", "/api/me/import", &dest, input, StatusCode::OK)
+            .await["create_count"],
+        0
+    );
+    sqlx::query("DELETE FROM gameboxd_auth.users WHERE id=$1")
+        .bind(dest_id.0.as_bytes().as_slice())
+        .execute(&f.database.app)
+        .await
+        .unwrap();
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM personal_import_records WHERE user_id=$1")
+            .bind(dest_id.0.as_bytes().as_slice())
+            .fetch_one(&f.database.app)
+            .await
+            .unwrap();
+    assert_eq!(count, 0);
+    f.finish().await;
+}

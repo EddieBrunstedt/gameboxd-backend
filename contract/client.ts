@@ -1,3 +1,6 @@
+import type { PersonalArchive } from "./types/PersonalArchive";
+import type { PersonalImportInput } from "./types/PersonalImportInput";
+import type { PersonalImportReport } from "./types/PersonalImportReport";
 import type { ModerationTarget } from "./types/ModerationTarget";
 import type { ReportInput } from "./types/ReportInput";
 import type { ReportReceipt } from "./types/ReportReceipt";
@@ -532,3 +535,17 @@ export const setRestriction = (
 
 export const moderationAudit = (query: ModerationQuery = {}): Promise<ModerationAudit[]> =>
   request("GET", "/api/operator/audit", { query });
+
+// --- Personal archives ----------------------------------------------------
+
+/** Complete owner archive; contains private diary text and labeled bookkeeping. */
+export const exportPersonalData = (): Promise<PersonalArchive> =>
+  request("GET", "/api/me/export");
+
+/** Read-only validation and create/skip/conflict report; does not reserve a plan. */
+export const previewPersonalImport = (input: PersonalImportInput): Promise<PersonalImportReport> =>
+  request("POST", "/api/me/import/preview", { body: input });
+
+/** Atomic create-only merge. Imported content is private; conflicts throw ApiError. */
+export const importPersonalData = (input: PersonalImportInput): Promise<PersonalImportReport> =>
+  request("POST", "/api/me/import", { body: input });

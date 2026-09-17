@@ -25,6 +25,7 @@ mod profiles;
 mod sharing;
 mod social;
 mod statistics;
+mod transfer;
 
 use crate::{
     AppState,
@@ -45,6 +46,7 @@ pub fn routes() -> Router<AppState> {
         .merge(statistics::routes())
         .merge(social::routes())
         .merge(moderation::routes())
+        .merge(transfer::routes())
         .route("/api/me", get(me).put(update_profile))
         .route("/api/games", get(games))
         .route("/api/games/{igdb_id}", get(game))
@@ -210,9 +212,16 @@ where
                 )
             })?;
         let mut deserializer = serde_json::Deserializer::from_slice(&bytes);
-        serde_path_to_error::deserialize(&mut deserializer)
-            .map(Body)
-            .map_err(|error| schema_error(&error))
+        let value = serde_path_to_error::deserialize(&mut deserializer)
+            .map_err(|error| schema_error(&error))?;
+        deserializer.end().map_err(|_| {
+            ApiError::new(
+                StatusCode::BAD_REQUEST,
+                ErrorCode::InvalidJson,
+                "Unexpected data after the JSON document",
+            )
+        })?;
+        Ok(Body(value))
     }
 }
 
@@ -258,22 +267,31 @@ fn schema_error(error: &serde_path_to_error::Error<serde_json::Error>) -> ApiErr
 
 /// Names the field a schema failure belongs to.
 ///
-/// A wrong type reaches us with a path to the value. A missing or unknown key
-/// does not: the path stops at the struct, because the key serde is complaining
-/// about is precisely the one that is not in the document. For those two, the
-/// name appears only in serde's message, whose wording is fixed by serde itself
-/// and is pinned here by unit tests.
+/// Wrong types and unknown keys carry the offending path. For missing keys,
+/// the path stops at the containing object; append the name from serde's
+/// message so nested archive errors identify the exact record and field.
 fn schema_field(path: &str, message: &str) -> Option<FieldError> {
+    let qualified = |name: &str| {
+        if path.is_empty() || path == "." {
+            name.to_owned()
+        } else {
+            format!("{path}.{name}")
+        }
+    };
     if let Some(name) = quoted_after(message, "missing field ") {
         return Some(FieldError::new(
-            name,
+            qualified(name),
             FieldErrorCode::Required,
             "This field is required",
         ));
     }
     if let Some(name) = quoted_after(message, "unknown field ") {
         return Some(FieldError::new(
-            name,
+            if path.is_empty() || path == "." {
+                name
+            } else {
+                path
+            },
             FieldErrorCode::UnknownField,
             "This route does not accept this field",
         ));

@@ -305,3 +305,13 @@ and a nonblank reason. A 412 requires rereading before reconciliation. Private
 evidence is untrusted `unknown | null`; inspect its target kind and render text
 safely. Operator functions always require a live database-provisioned grant.
 See [blocking and moderation semantics](../docs/api.md#blocking-reporting-and-operator-moderation).
+
+Personal transfer uses generated `PersonalArchive`, `Archive*`,
+`PersonalImportInput` and `PersonalImportReport` types. `exportPersonalData`,
+`previewPersonalImport` and `importPersonalData` expose the authenticated routes.
+Pass an explicit `profile_policy` (`restore` into a blank private profile, or
+`keep` to retain the destination profile). Preview reports all semantic conflicts;
+apply revalidates, imports privately and returns source-to-destination mappings.
+`import_conflict` errors use the normal `ApiError.fields` contract. Identical
+retries skip records, including after local edits/deletion. See the backend's
+[format, limits and recovery policy](../docs/api.md#personal-export-and-round-trip-import).

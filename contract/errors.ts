@@ -157,6 +157,7 @@ export function isRecoveryCooldown(error: unknown): boolean {
 export const ERROR_GUIDANCE: Record<string, string> = {
   favorites_exists: "Your favorites list already exists. Edit that list instead.",
   handle_unavailable: "That handle is unavailable. Choose another name.",
+  import_conflict: "Nothing was imported. Resolve the reported conflicts and preview the archive again.",
   lifecycle_conflict: "Reload the current run and choose an action allowed in its current state.",
   recovery_cooldown_active:
     "This action is blocked during the 24-hour recovery cool-down. You can still add a passkey and sign out of this session.",

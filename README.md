@@ -124,3 +124,10 @@ uses separate restrictions, preserves private diaries and gates all public
 projections and previews. Operator grants require trusted database administration;
 no account has them by default. Evidence expires after 90 days and is scrubbed
 on reported-account deletion. See the [safety API and operations policy](docs/api.md#blocking-reporting-and-operator-moderation).
+
+Complete private diary archives are available at `GET /api/me/export` in the
+versioned `gameboxd.personal` JSON format. `/api/me/import/preview` validates and
+reports conflicts; `/api/me/import` performs an atomic create-only merge with
+owner-scoped duplicate protection, ID remapping and private import defaults.
+Existing history is never silently overwritten. See the
+[transfer contract](docs/api.md#personal-export-and-round-trip-import).

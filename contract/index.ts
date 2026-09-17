@@ -111,3 +111,17 @@ export type { ReportResolutionInput } from "./types/ReportResolutionInput";
 export type { ModerationReport } from "./types/ModerationReport";
 export type { ModerationAudit } from "./types/ModerationAudit";
 export type { ModerationQuery } from "./types/ModerationQuery";
+
+export type { ArchiveBookkeeping } from "./types/ArchiveBookkeeping";
+export type { ArchiveProfile } from "./types/ArchiveProfile";
+export type { ArchiveLibraryEntry } from "./types/ArchiveLibraryEntry";
+export type { ArchivePlaythrough } from "./types/ArchivePlaythrough";
+export type { ArchiveNote } from "./types/ArchiveNote";
+export type { ArchiveList } from "./types/ArchiveList";
+export type { ArchiveGame } from "./types/ArchiveGame";
+export type { PersonalArchive } from "./types/PersonalArchive";
+export type { ImportProfilePolicy } from "./types/ImportProfilePolicy";
+export type { PersonalImportInput } from "./types/PersonalImportInput";
+export type { ImportRecordKind } from "./types/ImportRecordKind";
+export type { ImportMapping } from "./types/ImportMapping";
+export type { PersonalImportReport } from "./types/PersonalImportReport";

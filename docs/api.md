@@ -1211,3 +1211,169 @@ and operational accountability, without a public API. Do not copy evidence into
 logs or external messages. Backup access and retention remain part of the
 public-launch operations package; deletion from the live database cannot erase
 an older backup or a visitor's previously saved public copy.
+
+## Personal export and round-trip import
+
+All three routes require the importing/exporting owner's session, use the normal
+CSRF policy, and return `Cache-Control: no-store`, including errors. There are no
+public archive URLs. Treat downloaded files as private: they contain complete
+reviews, notes and biography text, including content hidden by moderation.
+
+| Route | Result |
+| --- | --- |
+| `GET /api/me/export` | Complete `PersonalArchive` JSON, without pagination or truncation |
+| `POST /api/me/import/preview` | Read-only `PersonalImportReport`; no provider calls, inserts, reservations or profile initialization |
+| `POST /api/me/import` | Revalidates and atomically merges; returns the committed report and ID mappings |
+
+The two POST bodies are `{ "archive": <PersonalArchive>, "profile_policy":
+"restore" | "keep" }`. The policy is required. `restore` restores display name
+and biography only into a blank private profile (or a new account); it refuses
+to overwrite a name, biography, handle or sharing choices. `keep` explicitly
+preserves the entire destination profile and imports only the other records.
+It supports adding history to an existing account. An archive from the destination
+account itself is rejected, preventing self-import from duplicating its history.
+
+### Version 1 archive
+
+The generated [PersonalArchive type](../contract/types/PersonalArchive.ts) and
+its referenced `Archive*` types are the exact wire schema. The top-level object
+contains only:
+
+- `format: "gameboxd.personal"`, `version: 1`.
+- `profile`: source public UUID as `id`, display name, biography, current handle,
+  profile publication flag, biography/statistics permissions and `bookkeeping`.
+- `games`: each referenced IGDB ID exactly once, with descriptive `name` and
+  `slug`. Includes games mentioned only by a list or historical run.
+- `library`: record `id`, `igdb_id`, current status, visibility and `bookkeeping`.
+- `playthroughs`: record `id`, `igdb_id`, explicit state and `is_current`, rating,
+  full review, `presentation_on`, `started_on`, `finished_on`, platform, three
+  independent permissions and `bookkeeping`.
+- `notes`: record `id`, source `playthrough_id`, full text, `presentation_on`,
+  visibility and `bookkeeping`.
+- `lists`: record `id`, custom/favorites kind, full title and description,
+  ordered `igdb_ids`, visibility and `bookkeeping`. Array order defines membership
+  order. Favorites remain the same kind of collection, with at most one per account.
+
+`bookkeeping` explicitly labels actual `created_at`, `updated_at` and `version`
+values. These are archival information, not dates of play. The export uses one
+read-only repeatable-read snapshot for every collection, including ordered list
+membership and game context. It initializes a missing ordinary private profile,
+like `/api/me`, before taking the snapshot. It never contacts IGDB. It reads owner
+tables, so private/restricted records are included completely.
+
+Credentials, email/authentication identity, passkeys, sessions, secrets, follows,
+blocks, reports, operator grants, moderation restrictions/audits and import
+provenance are outside this personal-diary format. No operational privileges or
+moderation state can be applied by import. Unknown object fields are rejected,
+including attempts to supply a destination owner or authentication material.
+Unknown format versions are rejected, not guessed. Nullable archive fields must
+be present explicitly (use `null` for unknown); missing fields are not silently
+converted to unknown values.
+
+### Restoration, privacy and ordering
+
+All new content belongs to the authenticated importer. File-supplied source IDs
+are relationship keys, never destination ownership or permission claims. New
+random UUIDs replace profile/item identities, and notes are attached through the
+owner-scoped playthrough mapping. Existing destination profile identity is kept;
+handles are exported for reference but never claimed, renamed or reserved by
+import. Return mappings describe every processed source record, including skips.
+
+**Every newly imported component is private.** All file-supplied publication
+flags and visibility selections are ignored, even when the destination profile
+is already enabled. `restore` leaves the profile disabled and biography/statistics
+private; `keep` leaves its existing choices untouched. Import does not restore
+sharing or lift moderation restrictions. Publishing imported content requires
+separate explicit, revision-protected publication operations afterwards.
+
+Text, Unicode, whitespace, chosen calendar dates, unknown (`null`) dates, states,
+ratings, list order, favorites and current-run relationships are preserved without
+normalization. Current runs require an active/paused state, no finish date, and a
+matching playing/on_hold library membership. No history is inferred from library
+status. Source bookkeeping is never installed: destination creation/update times
+and revisions describe the actual import. Consequently private date-added sorting
+starts at import time. Public chronology still uses chosen dates only. New IDs
+preserve relative source UUID ordering within an import batch, including across
+notes and runs, so tied and undated records and derived-rating selection retain
+their order in a fresh full round trip. Existing destination records and later
+import batches participate using their own destination UUIDs; relative ties
+between batches are not promised.
+
+Game identity is the IGDB ID, not the archived name/slug. Existing stored games
+are reused without provider access or metadata changes. For missing games, preview
+reports sorted `missing_game_ids`; apply obtains trusted metadata from IGDB before
+acquiring write locks. Archived names/slugs never modify the shared catalog. If a
+game cannot be resolved (including a provider outage or retired identifier), the
+whole import fails with the ordinary provider error plus the failing ID in
+`error.fields`; fix that problem and retry. No partial diary or catalog is saved.
+
+### Create-only merge and duplicates
+
+Version 1 supports a **create-only merge**, with no destructive replace mode.
+Existing library membership for an incoming new entry, an existing favorites
+collection for incoming new favorites, or a competing current run is a conflict;
+none is overwritten, cleared, merged implicitly or made private. Historical runs
+and custom lists may be added alongside unrelated existing history. Use the
+ordinary revision-protected APIs for intentional edits/reordering after resolving
+conflicts. Preview is advisory, not an authorization token or reservation; apply
+checks the current destination again under transaction locks.
+
+The durable duplicate key is `(importing owner, source profile UUID, record kind,
+source record UUID)`. A SHA-256 fingerprint covers that record's personal content
+and relationships, including list order, but excludes bookkeeping, handle and
+publication choices. An identical previously imported record is skipped, including
+on simultaneous retries or after a lost response. Changing object/collection order
+or ignored metadata does not make a new record. Changing content under an already
+imported key produces `409 import_conflict`, with the record's JSON path in
+`error.fields`. New source records can be added in a later archive; previously
+imported parents can support new notes if the destination parent still exists.
+
+Retries never undo destination edits, overwrite later publication decisions or
+resurrect deleted content. Provenance keeps only the key, destination ID and hash,
+not a second copy of private text. It remains until account deletion; target IDs
+in skip mappings can therefore refer to deleted records. Deleting a record does
+not erase its duplicate protection. Do not regenerate source identities to retry:
+changing source IDs declares new content, and separately exported accounts are
+separate sources. Equal review text alone is not a duplicate, since repeat
+experiences can legitimately contain identical text. Ordinary creation retry
+keys in feature 12 should coexist with this durable import provenance.
+
+### Validation, reports and failure recovery
+
+A preview report contains `valid`, `applied: false`, `create_count`, `skip_count`,
+`missing_game_ids`, `errors` (field paths/codes/messages) and `mappings` for already
+imported records. A successful apply has `applied: true`, an empty missing-game
+list and mappings for both newly committed and skipped records. Counts describe
+profile restoration as one record. `keep` omits that profile record. Fresh UUIDs
+are not exposed or reserved by preview.
+
+Malformed JSON returns `400 invalid_json`; wrong types, impossible date syntax
+and unknown fields return `422 invalid_json`, using the standard error envelope
+with field details where possible. Both endpoints reject trailing data after the JSON document. Preview
+collects semantic errors into a `200` report with `valid: false`; apply returns
+`400 validation_error` for invalid data and `409 import_conflict` for destination
+or provenance conflicts. Clients can use the existing `ApiError.fields` mechanism.
+All text/domain limits from the ordinary APIs apply, with no import-time trimming.
+The graph must have distinct non-nil IDs per collection, one library row per game,
+one current run per game, at most one favorites collection, valid parent references
+within the archive, and at most 500 distinct games per ordered list.
+
+Import requests have a dedicated 32 MiB body limit and at most 20,000 records
+combined across games/library/playthroughs/notes/lists. Other routes retain their
+64 KiB limit. Oversized bodies return 413; excess records are a validation error.
+Export remains complete even above these import limits. Large archives can be
+partitioned into smaller graph-complete batches: retain the same source profile
+and record IDs, include each note's parent, and include exactly the games referenced
+by that batch. Repeated parents/profile are skipped. Preserve whole lists; a list's
+ordered membership is one record. Batch imports are independently atomic, so
+preview each batch and resolve any earlier-import changes before continuing.
+
+Each apply commits profile changes, catalog insertions, all personal records,
+list membership and provenance in one database transaction. Per-owner import
+locks serialize retries; existing per-game lifecycle locks and database constraints
+arbitrate ordinary concurrent writes. A collision detected during insertion rolls
+back everything and returns `import_conflict`; rerun preview. Provider errors,
+injected database failures and cancellation before commit leave no partial import
+or in-progress receipt. A lost response can safely be retried with the same archive.
+Account deletion cascades to provenance as well as imported content. No background
+job, external notifications, automatic sharing or authentication changes occur.
