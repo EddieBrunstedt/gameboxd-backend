@@ -10,7 +10,7 @@ use axum::{
     routing::{get, post},
 };
 use chrono::NaiveDate;
-use doorman::prelude::AuthUser;
+use doorman::prelude::{AuthUser, OptionalAuthUser};
 use serde::{Deserialize, Deserializer, Serialize, de::DeserializeOwned};
 use sqlx::FromRow;
 use ts_rs::TS;
@@ -18,6 +18,7 @@ use uuid::Uuid;
 
 mod browsing;
 mod lists;
+mod moderation;
 mod notes;
 use browsing::{BrowsePage, BrowseQuery, Kind};
 mod profiles;
@@ -43,6 +44,7 @@ pub fn routes() -> Router<AppState> {
         .merge(profiles::routes())
         .merge(statistics::routes())
         .merge(social::routes())
+        .merge(moderation::routes())
         .route("/api/me", get(me).put(update_profile))
         .route("/api/games", get(games))
         .route("/api/games/{igdb_id}", get(game))

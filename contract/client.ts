@@ -1,3 +1,14 @@
+import type { ModerationTarget } from "./types/ModerationTarget";
+import type { ReportInput } from "./types/ReportInput";
+import type { ReportReceipt } from "./types/ReportReceipt";
+import type { BlockedProfile } from "./types/BlockedProfile";
+import type { OwnerRestriction } from "./types/OwnerRestriction";
+import type { ModerationRestriction } from "./types/ModerationRestriction";
+import type { RestrictionInput } from "./types/RestrictionInput";
+import type { ReportResolutionInput } from "./types/ReportResolutionInput";
+import type { ModerationReport } from "./types/ModerationReport";
+import type { ModerationAudit } from "./types/ModerationAudit";
+import type { ModerationQuery } from "./types/ModerationQuery";
 import type { FeedItem } from "./types/FeedItem";
 import type { FeedQuery } from "./types/FeedQuery";
 import type { FollowedProfile } from "./types/FollowedProfile";
@@ -479,3 +490,45 @@ export const unfollow = (profileId: string): Promise<void> =>
 /** Live public components in chosen-date order; identity is (kind, item.id). */
 export const feed = (query: FeedQuery = {}): Promise<SocialPage<FeedItem>> =>
   request("GET", "/api/me/feed", { query });
+
+// --- Blocking, reporting and operator moderation ---------------------------
+
+export const blocks = (query: ModerationQuery = {}): Promise<BlockedProfile[]> =>
+  request("GET", "/api/me/blocks", { query });
+
+/** Removes both follow directions; unblocking never restores them. */
+export const block = (profileId: string): Promise<void> =>
+  request("PUT", `/api/me/blocks/${encodeURIComponent(profileId)}`);
+
+export const unblock = (profileId: string): Promise<void> =>
+  request("DELETE", `/api/me/blocks/${encodeURIComponent(profileId)}`);
+
+/** Active restrictions only; no report evidence, reporter identity or operator reasons. */
+export const ownRestrictions = (query: ModerationQuery = {}): Promise<OwnerRestriction[]> =>
+  request("GET", "/api/me/restrictions", { query });
+
+/** One case per reporter/target, including resolved cases; 20 new cases per 24 hours. */
+export const report = (input: ReportInput): Promise<ReportReceipt> =>
+  request("POST", "/api/me/reports", { body: input });
+
+// Every operator request requires a live, administrator-provisioned role grant.
+export const moderationReports = (query: ModerationQuery = {}): Promise<ModerationReport[]> =>
+  request("GET", "/api/operator/reports", { query });
+
+export const moderationReport = (id: string): Promise<ModerationReport> =>
+  request("GET", `/api/operator/reports/${encodeURIComponent(id)}`);
+
+export const resolveReport = (id: string, input: ReportResolutionInput): Promise<ModerationReport> =>
+  request("PUT", `/api/operator/reports/${encodeURIComponent(id)}`, { body: input });
+
+export const moderationRestrictions = (query: ModerationQuery = {}): Promise<ModerationRestriction[]> =>
+  request("GET", "/api/operator/restrictions", { query });
+
+/** expected_version is zero for a new target, otherwise the last fetched version. */
+export const setRestriction = (
+  kind: ModerationTarget, id: string, input: RestrictionInput,
+): Promise<ModerationRestriction> =>
+  request("PUT", `/api/operator/restrictions/${kind}/${encodeURIComponent(id)}`, { body: input });
+
+export const moderationAudit = (query: ModerationQuery = {}): Promise<ModerationAudit[]> =>
+  request("GET", "/api/operator/audit", { query });

@@ -296,3 +296,12 @@ Milestones represent one current chosen summary per run, not lifecycle audit
 events. All reads are live/no-store; refresh after date changes or changes to
 the followed set. See [the social API policy](../docs/api.md#private-following-and-chronological-gaming-life-feed)
 for hidden targets, null dates, cursor semantics and revocation.
+
+Safety client functions include `block`, `unblock`, `blocks`, `report`, and
+`ownRestrictions`, plus operator-only report inspection/resolution, restrictions
+and audit functions. Types are generated from the backend. Operator decisions
+carry `expected_version` (0 for a new restriction, otherwise the fetched version)
+and a nonblank reason. A 412 requires rereading before reconciliation. Private
+evidence is untrusted `unknown | null`; inspect its target kind and render text
+safely. Operator functions always require a live database-provisioned grant.
+See [blocking and moderation semantics](../docs/api.md#blocking-reporting-and-operator-moderation).

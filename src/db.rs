@@ -41,3 +41,15 @@ async fn pool(url: &str, search_path: &'static str) -> Result<PgPool, sqlx::Erro
         .connect(url)
         .await
 }
+
+/// Scrub private moderation evidence after 90 days; retain only minimal case
+/// metadata for deduplication and action history. Reads enforce the same cutoff.
+pub async fn purge_moderation(pool: &PgPool) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("UPDATE moderation_reports SET evidence=NULL,details='' WHERE created_at<=now()-interval '90 days' AND (evidence IS NOT NULL OR details<>'')")
+        .execute(&mut *tx).await?;
+    sqlx::query("UPDATE moderation_audit SET reason='Expired' WHERE created_at<=now()-interval '90 days' AND reason<>'Expired'")
+        .execute(&mut *tx).await?;
+    tx.commit().await?;
+    Ok(())
+}

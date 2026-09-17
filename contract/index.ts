@@ -97,3 +97,17 @@ export type { FeedQuery } from "./types/FeedQuery";
 export type { FollowedProfile } from "./types/FollowedProfile";
 export type { FollowingQuery } from "./types/FollowingQuery";
 export type { SocialPage } from "./types/SocialPage";
+
+export type { ModerationTarget } from "./types/ModerationTarget";
+export type { ReportReason } from "./types/ReportReason";
+export type { ReportStatus } from "./types/ReportStatus";
+export type { ReportInput } from "./types/ReportInput";
+export type { ReportReceipt } from "./types/ReportReceipt";
+export type { BlockedProfile } from "./types/BlockedProfile";
+export type { OwnerRestriction } from "./types/OwnerRestriction";
+export type { ModerationRestriction } from "./types/ModerationRestriction";
+export type { RestrictionInput } from "./types/RestrictionInput";
+export type { ReportResolutionInput } from "./types/ReportResolutionInput";
+export type { ModerationReport } from "./types/ModerationReport";
+export type { ModerationAudit } from "./types/ModerationAudit";
+export type { ModerationQuery } from "./types/ModerationQuery";

@@ -228,14 +228,18 @@ pub struct PublicLibraryEntry {
 }
 
 async fn library_item(
+    viewer: OptionalAuthUser,
     State(state): State<AppState>,
     id: Result<Path<Uuid>, PathRejection>,
 ) -> ApiResult<Json<PublicLibraryEntry>> {
-    let row = sqlx::query_as("SELECT * FROM public_library_entries WHERE id=$1")
-        .bind(path(id)?)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or_else(ApiError::not_found)?;
+    let row = sqlx::query_as(
+        "SELECT * FROM public_library_entries WHERE id=$1 AND public_view_allowed($2,user_id)",
+    )
+    .bind(path(id)?)
+    .bind(viewer.0.map(|u| u.id.0.as_bytes().to_vec()))
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
     Ok(Json(row))
 }
 
@@ -255,14 +259,18 @@ pub struct PublicPlaythrough {
 }
 
 async fn summary(
+    viewer: OptionalAuthUser,
     State(state): State<AppState>,
     id: Result<Path<Uuid>, PathRejection>,
 ) -> ApiResult<Json<PublicPlaythrough>> {
-    let row = sqlx::query_as("SELECT * FROM public_playthroughs WHERE id=$1")
-        .bind(path(id)?)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or_else(ApiError::not_found)?;
+    let row = sqlx::query_as(
+        "SELECT * FROM public_playthroughs WHERE id=$1 AND public_view_allowed($2,user_id)",
+    )
+    .bind(path(id)?)
+    .bind(viewer.0.map(|u| u.id.0.as_bytes().to_vec()))
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
     Ok(Json(row))
 }
 
@@ -279,14 +287,18 @@ pub struct PublicRating {
 }
 
 async fn rating(
+    viewer: OptionalAuthUser,
     State(state): State<AppState>,
     id: Result<Path<Uuid>, PathRejection>,
 ) -> ApiResult<Json<PublicRating>> {
-    let row = sqlx::query_as("SELECT * FROM public_ratings WHERE id=$1")
-        .bind(path(id)?)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or_else(ApiError::not_found)?;
+    let row = sqlx::query_as(
+        "SELECT * FROM public_ratings WHERE id=$1 AND public_view_allowed($2,user_id)",
+    )
+    .bind(path(id)?)
+    .bind(viewer.0.map(|u| u.id.0.as_bytes().to_vec()))
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
     Ok(Json(row))
 }
 
@@ -303,14 +315,18 @@ pub struct PublicReview {
 }
 
 async fn review(
+    viewer: OptionalAuthUser,
     State(state): State<AppState>,
     id: Result<Path<Uuid>, PathRejection>,
 ) -> ApiResult<Json<PublicReview>> {
-    let row = sqlx::query_as("SELECT * FROM public_reviews WHERE id=$1")
-        .bind(path(id)?)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or_else(ApiError::not_found)?;
+    let row = sqlx::query_as(
+        "SELECT * FROM public_reviews WHERE id=$1 AND public_view_allowed($2,user_id)",
+    )
+    .bind(path(id)?)
+    .bind(viewer.0.map(|u| u.id.0.as_bytes().to_vec()))
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
     Ok(Json(row))
 }
 
@@ -327,13 +343,17 @@ pub struct PublicNote {
 }
 
 async fn note(
+    viewer: OptionalAuthUser,
     State(state): State<AppState>,
     id: Result<Path<Uuid>, PathRejection>,
 ) -> ApiResult<Json<PublicNote>> {
-    let row = sqlx::query_as("SELECT * FROM public_notes WHERE id=$1")
-        .bind(path(id)?)
-        .fetch_optional(&state.pool)
-        .await?
-        .ok_or_else(ApiError::not_found)?;
+    let row = sqlx::query_as(
+        "SELECT * FROM public_notes WHERE id=$1 AND public_view_allowed($2,user_id)",
+    )
+    .bind(path(id)?)
+    .bind(viewer.0.map(|u| u.id.0.as_bytes().to_vec()))
+    .fetch_optional(&state.pool)
+    .await?
+    .ok_or_else(ApiError::not_found)?;
     Ok(Json(row))
 }

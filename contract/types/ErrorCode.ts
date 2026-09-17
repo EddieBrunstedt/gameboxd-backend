@@ -8,4 +8,4 @@
  * cannot claim a code the code base does not produce. Doorman keeps its own
  * codes on its own routes; this type deliberately does not try to mirror them.
  */
-export type ErrorCode = "validation_error" | "invalid_json" | "not_found" | "method_not_allowed" | "precondition_required" | "precondition_failed" | "lifecycle_conflict" | "handle_unavailable" | "favorites_exists" | "request_rejected" | "internal_error" | "database_unavailable" | "igdb_not_configured" | "igdb_unavailable" | "igdb_rate_limited" | "catalog_busy";
+export type ErrorCode = "validation_error" | "invalid_json" | "not_found" | "method_not_allowed" | "precondition_required" | "precondition_failed" | "lifecycle_conflict" | "handle_unavailable" | "favorites_exists" | "forbidden" | "moderation_restricted" | "report_limit" | "request_rejected" | "internal_error" | "database_unavailable" | "igdb_not_configured" | "igdb_unavailable" | "igdb_rate_limited" | "catalog_busy";

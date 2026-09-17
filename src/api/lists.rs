@@ -407,6 +407,7 @@ async fn selected_detail(
     state: &AppState,
     id: Uuid,
     preview_owner: Option<&[u8]>,
+    viewer: Option<Vec<u8>>,
 ) -> ApiResult<Json<PublicListDetail>> {
     let mut tx = browsing::snapshot(&state.pool).await?;
     // The optional owner comes only from AuthUser, never visitor input.
@@ -417,8 +418,9 @@ async fn selected_detail(
             .fetch_optional(&mut *tx)
             .await?
     } else {
-        sqlx::query_as("SELECT * FROM public_lists WHERE id=$1")
+        sqlx::query_as("SELECT * FROM public_lists WHERE id=$1 AND public_view_allowed($2,user_id)")
             .bind(id)
+            .bind(viewer)
             .fetch_optional(&mut *tx)
             .await?
     }
@@ -429,10 +431,17 @@ async fn selected_detail(
 }
 
 async fn public_read(
+    viewer: OptionalAuthUser,
     State(state): State<AppState>,
     id: Result<Path<Uuid>, PathRejection>,
 ) -> ApiResult<Json<PublicListDetail>> {
-    selected_detail(&state, path(id)?, None).await
+    selected_detail(
+        &state,
+        path(id)?,
+        None,
+        viewer.0.map(|u| u.id.0.as_bytes().to_vec()),
+    )
+    .await
 }
 
 async fn preview_read(
@@ -440,5 +449,11 @@ async fn preview_read(
     State(state): State<AppState>,
     id: Result<Path<Uuid>, PathRejection>,
 ) -> ApiResult<Json<PublicListDetail>> {
-    selected_detail(&state, path(id)?, Some(user.0.id.0.as_bytes().as_slice())).await
+    selected_detail(
+        &state,
+        path(id)?,
+        Some(user.0.id.0.as_bytes().as_slice()),
+        None,
+    )
+    .await
 }

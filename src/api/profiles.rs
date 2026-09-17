@@ -134,8 +134,8 @@ pub enum PublicProfileSection {
 
 // Scope is constructed by handlers, never deserialized from visitor input.
 pub(super) enum Scope {
-    PublicId(Uuid),
-    Handle(String),
+    PublicId(Uuid, Option<Vec<u8>>),
+    Handle(String, Option<Vec<u8>>),
     OwnerPreview(Vec<u8>),
 }
 
@@ -150,19 +150,20 @@ pub(super) struct SelectedProfile {
 }
 
 pub(super) async fn resolve(conn: &mut PgConnection, scope: Scope) -> ApiResult<SelectedProfile> {
-    let (id, handle, owner) = match scope {
-        Scope::PublicId(id) => (Some(id), None, None),
-        Scope::Handle(handle) => (None, Some(handle), None),
-        Scope::OwnerPreview(owner) => (None, None, Some(owner)),
+    let (id, handle, owner, viewer) = match scope {
+        Scope::PublicId(id, viewer) => (Some(id), None, None, viewer),
+        Scope::Handle(handle, viewer) => (None, Some(handle), None, viewer),
+        Scope::OwnerPreview(owner) => (None, None, Some(owner), None),
     };
     sqlx::query_as(
         "SELECT user_id,statistics_visibility,public_id AS id,handle,display_name,
                 CASE WHEN bio_visibility='public' THEN bio END AS bio
-         FROM profiles WHERE (public_enabled AND (public_id=$1 OR handle=$2)) OR user_id=$3",
+         FROM profiles WHERE public_view_allowed($4,user_id) AND NOT moderation_hidden('profile',public_id) AND ((public_enabled AND (public_id=$1 OR handle=$2)) OR user_id=$3)",
     )
     .bind(id)
     .bind(handle)
     .bind(owner)
+    .bind(viewer)
     .fetch_optional(conn)
     .await?
     .ok_or_else(ApiError::not_found)
@@ -253,18 +254,28 @@ async fn read_section(
 }
 
 async fn profile(
+    viewer: OptionalAuthUser,
     State(state): State<AppState>,
     id: Result<Path<Uuid>, PathRejection>,
 ) -> ApiResult<Json<PublicProfile>> {
-    read_profile(&state, Scope::PublicId(path(id)?)).await
+    read_profile(
+        &state,
+        Scope::PublicId(path(id)?, viewer.0.map(|u| u.id.0.as_bytes().to_vec())),
+    )
+    .await
 }
 
 async fn by_handle(
+    viewer: OptionalAuthUser,
     State(state): State<AppState>,
     handle: Result<Path<String>, PathRejection>,
 ) -> ApiResult<Json<PublicProfile>> {
     let handle = canonical_handle(&path(handle)?).map_err(|_| ApiError::not_found())?;
-    read_profile(&state, Scope::Handle(handle)).await
+    read_profile(
+        &state,
+        Scope::Handle(handle, viewer.0.map(|u| u.id.0.as_bytes().to_vec())),
+    )
+    .await
 }
 
 async fn preview(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<PublicProfile>> {
@@ -272,6 +283,7 @@ async fn preview(user: AuthUser, State(state): State<AppState>) -> ApiResult<Jso
 }
 
 async fn section(
+    viewer: OptionalAuthUser,
     State(state): State<AppState>,
     id: Result<Path<(Uuid, ProfileSection)>, PathRejection>,
     params: Result<Query<BrowseQuery>, QueryRejection>,
@@ -279,7 +291,7 @@ async fn section(
     let (id, section) = path(id)?;
     read_section(
         &state,
-        Scope::PublicId(id),
+        Scope::PublicId(id, viewer.0.map(|u| u.id.0.as_bytes().to_vec())),
         section,
         BrowseQuery::parse(params)?,
     )

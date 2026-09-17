@@ -1038,3 +1038,176 @@ copies. Feature 10 must extend the relationship write checks and feed source
 scope for both directions of blocking, remove existing blocked relationships,
 and apply moderation gates through the shared public sources. Blocking and
 moderation are not introduced by this feature.
+
+## Blocking, reporting and operator moderation
+
+Safety state is separate from owner visibility choices. All safety routes require
+an authenticated session, use the normal CSRF/origin policy, and return
+`Cache-Control: no-store`. No report, block or moderation chronology becomes a
+public event. Public responses still omit recording/edit timestamps and revisions.
+
+### Blocking
+
+- `PUT /api/me/blocks/{public_id}` blocks an existing profile, including a disabled
+  or restricted one, and atomically removes follows in **both** directions.
+  It is idempotent and returns 204. Self-blocking is a 400 validation error;
+  unknown/deleted targets return 404.
+- `DELETE /api/me/blocks/{public_id}` removes only the caller's block and returns
+  204, including for already removed/deleted targets. It never restores follows.
+  A reciprocal block still applies.
+- `GET /api/me/blocks` returns the caller's blocked profile UUIDs only, including
+  disabled profiles, ordered by UUID. It reveals no blocker lists, counts or
+  chronology to another user. Account deletion cascades relationships.
+
+An active block in either direction prevents following (404), excludes both
+accounts from one another's following/feed sources, and makes authenticated
+public profile/handle, section, statistics and direct-item reads return 404.
+Owners retain their private reads and visitor previews. Pair-scoped database
+locks serialize follow/unfollow/block/unblock across both directions and app
+processes; reads independently enforce blocks rather than trusting deleted follows.
+
+**Blocking is not privacy.** A logged-out visitor can still read otherwise public
+content, as can a different account. Use item visibility or disable the public
+profile to remove public access. Reporting remains possible after blocking:
+it is a private safety operation, not an interaction delivered to the target.
+
+### Reports and evidence
+
+`POST /api/me/reports` accepts `ReportInput`:
+
+```json
+{"kind":"review","target_id":"<public item UUID>","reason":"harassment","details":"Context for the operator"}
+```
+
+`kind` is `profile`, `review`, `note` or `list`. `reason` is `spam`, `harassment`,
+`hate`, `sexual`, `violence` or `other`. Optional `details` defaults to empty;
+it is plain text, at most 2,000 Unicode characters, with no NUL. Only currently
+public, unmoderated targets are reportable; unavailable/private/deleted targets
+return indistinguishable 404s. Self-reporting returns 400. No attachment, arbitrary
+URL fetch, email, notification, or automatic moderation action is performed.
+
+A successful response is 200 `ReportReceipt` (`{"id":"<case UUID>"}`). There is
+one case per reporter/kind/target for the lifetime of that reporter account,
+including resolved/dismissed cases. Repeated or concurrent submissions return
+the same receipt and do not overwrite the first reason, details or evidence.
+The public-target check still applies to retries after removal. Each account
+may create at most 20 distinct cases per rolling 24 hours; new cases over this
+bound return 429 `report_limit`. Retries do not consume quota. Deduplication and
+quota checking are serialized in PostgreSQL, including across processes.
+
+Evidence captures the public representation at report time: selected profile
+identity/bio, an independently public review/note and game context, or list text
+and its ordered public members. It contains no private diary context, library
+membership, hidden rating, private biography, actual content timestamps or
+revisions. Evidence is a snapshot and can differ from the subsequently edited
+content. Reporter details and evidence are untrusted plain text/data; clients
+must escape them, never render them as HTML. Evidence is typed as `unknown | null`
+in the contract because its object shape depends on the target kind.
+
+There is no user report-read route or report status notification. Other users,
+including the reported owner, cannot access cases or learn who reported them.
+Operator DTOs also omit reporter/account authentication identifiers. These are
+retained privately in storage for deduplication, authorization and audit.
+
+### Operator access and decisions
+
+Operator access requires a live row in `gameboxd.moderation_operators` for the
+session's authentication user ID. There are no default operators, email-based
+privileges, self-promotion routes or client-provided role claims. Provision and
+revoke grants through trusted database administration. For an operator who has
+initialized their app profile, an administrator can bind their verified public
+UUID as `$1` in either statement:
+
+```sql
+INSERT INTO gameboxd.moderation_operators(user_id)
+SELECT user_id FROM gameboxd.profiles WHERE public_id=$1
+ON CONFLICT DO NOTHING;
+
+DELETE FROM gameboxd.moderation_operators
+WHERE user_id=(SELECT user_id FROM gameboxd.profiles WHERE public_id=$1);
+```
+
+Every operator operation checks and locks the grant for its transaction;
+revocation waits for already authorized operations and takes effect for subsequent
+requests, even with an existing session. Anonymous access returns 401; ordinary
+sessions return 403 `forbidden`. Operator credentials and database grants must
+be limited to trusted administrators.
+
+| Route | Behavior |
+| --- | --- |
+| `GET /api/operator/reports` | Cases in `created_at,id` ascending order, with status and evidence. |
+| `GET /api/operator/reports/{id}` | One case, including its private version and reporting timestamp. |
+| `PUT /api/operator/reports/{id}` | Set `status` (`open`, `resolved`, `dismissed`), with `expected_version` and nonblank `reason`. |
+| `GET /api/operator/restrictions` | Current restriction states (including restored states), ordered by `kind,target_id`. |
+| `PUT /api/operator/restrictions/{kind}/{id}` | Set `active` with `expected_version` and nonblank `reason`. Kinds match report targets. |
+| `GET /api/operator/audit` | Private decisions in `created_at,id` ascending order. |
+| `GET /api/me/restrictions` | The caller's active `kind,target_id` pairs only; no case evidence or operator reasons. |
+
+All list routes in this section, including blocks and owner restrictions, accept
+only `limit` (1–50, default 20) and `offset` (0–10,000, default 0), and return arrays.
+These are live bounded offset pages; refresh after mutations. Unknown parameters
+are rejected. Operator reasons are plain text, nonblank, at most 2,000 Unicode
+characters and contain no NUL.
+
+A new restriction starts at version 0. Send `expected_version: 0` for its first
+decision; subsequent decisions require the fetched version. A report starts at
+version 1. A successful operator decision increments its version and appends a
+private audit row atomically, including explicit reaffirmations of a decision.
+Stale/concurrent decisions return 412 `precondition_failed`, with no partial
+state or audit write. Resolving a report and restricting content are deliberate
+separate operations: resolution never implicitly hides/restores anything.
+A lost response requires rereading the state before another decision.
+
+A `review`, `note` or `list` restriction hides just that component. For example,
+hiding a review leaves an independently public rating or playthrough summary
+eligible. A `profile` restriction suppresses **all** that account's public
+content, profile/handle access, statistics and public participation (following
+in either direction). Existing follows are retained but ineligible until the
+restriction is lifted; blocks, unlike restrictions, remove follows permanently.
+Restricted callers attempting to follow receive 403 `moderation_restricted`;
+unavailable targets still receive 404.
+
+Restrictions are enforced by the shared selected/public sources, so direct
+links, profile sections/counts, rating derivation, filter presence checks,
+statistics, feed payloads/page metadata and visitor previews agree. Preview may
+bypass only profile publication, never moderation. Hiding a profile makes its
+preview unavailable; hiding an item removes it from preview. Subsequent reads
+reflect decisions immediately, with no cached public copies. A read already in
+progress can complete against its authorized statement/transaction snapshot.
+
+Private owner reads, corrections, deletion and statistics remain available;
+moderation never deletes the diary or changes its visibility choices, timestamps
+or revision. `GET /api/me/restrictions` explains which selections are suppressed.
+Explicit visibility/publication writes selecting restricted public content
+return 403 `moderation_restricted`. Owners can turn selections private, but
+cannot clear restrictions or make a restricted component public through edits.
+Under an account restriction, a playthrough visibility write must select all
+components private; to revise profile publication choices, disable the profile.
+Private content edits may retain their stored public selection while remaining
+suppressed. Restoration makes content eligible only if its owner still selects
+it and the profile is enabled; it creates no public chronology event. New copies
+have new identities: use an account restriction when item-level moderation is
+insufficient to stop repeated public abuse.
+
+### Deletion and retention
+
+Reports and audit records are private operational data. Deleting an item keeps
+its already captured public evidence for review; its restriction remains as a
+private identity tombstone until account deletion. Deleted targets cannot receive
+new restrictions, but their cases can still be resolved. Reporter deletion sets
+its private identity reference to null and leaves evidence about the reported
+account intact. Deleting the reported account immediately scrubs all its report
+evidence/details and operator free-text reasons, removes active/restored
+restrictions, and clears private owner references. This happens in the database
+account-deletion transaction, including during racing reports/decisions.
+Deleting an operator clears its private audit identity reference.
+
+Evidence, reporter details and operator reasons expire 90 days after their
+respective report/action creation. Operator reads suppress expired text even
+before cleanup; the existing five-minute maintenance loop physically scrubs it.
+Minimal case/action metadata (IDs, target kind/UUID, reason category, case status,
+private chronology and remaining account references) is retained for deduplication
+and operational accountability, without a public API. Do not copy evidence into
+logs or external messages. Backup access and retention remain part of the
+public-launch operations package; deletion from the live database cannot erase
+an older backup or a visitor's previously saved public copy.

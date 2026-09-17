@@ -39,11 +39,15 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(config.bind_addr).await?;
     tracing::info!(address = %listener.local_addr()?, "Backend listening");
 
+    let moderation_pool = database.app.clone();
     let purge = tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(300));
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             interval.tick().await;
+            if let Err(error) = gameboxd_backend::db::purge_moderation(&moderation_pool).await {
+                tracing::error!(%error, "Moderation evidence cleanup failed");
+            }
             if let Err(error) = auth.purge_expired(chrono::Utc::now()).await {
                 tracing::error!(%error, "Expired authentication data cleanup failed");
             }

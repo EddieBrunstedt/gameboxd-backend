@@ -25,6 +25,9 @@ pub enum ErrorCode {
     LifecycleConflict,
     HandleUnavailable,
     FavoritesExists,
+    Forbidden,
+    ModerationRestricted,
+    ReportLimit,
     RequestRejected,
     InternalError,
     DatabaseUnavailable,
@@ -37,7 +40,7 @@ pub enum ErrorCode {
 impl ErrorCode {
     /// Every variant, so a test can assert the documented list is complete.
     /// A new code added above without a line in `docs/api.md` fails there.
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 19] = [
         Self::ValidationError,
         Self::InvalidJson,
         Self::NotFound,
@@ -47,6 +50,9 @@ impl ErrorCode {
         Self::LifecycleConflict,
         Self::HandleUnavailable,
         Self::FavoritesExists,
+        Self::Forbidden,
+        Self::ModerationRestricted,
+        Self::ReportLimit,
         Self::RequestRejected,
         Self::InternalError,
         Self::DatabaseUnavailable,
@@ -66,6 +72,9 @@ impl ErrorCode {
             Self::PreconditionRequired => "precondition_required",
             Self::PreconditionFailed => "precondition_failed",
             Self::HandleUnavailable => "handle_unavailable",
+            Self::Forbidden => "forbidden",
+            Self::ModerationRestricted => "moderation_restricted",
+            Self::ReportLimit => "report_limit",
             Self::FavoritesExists => "favorites_exists",
             Self::LifecycleConflict => "lifecycle_conflict",
             Self::RequestRejected => "request_rejected",
@@ -230,6 +239,16 @@ impl IntoResponse for ApiError {
 
 impl From<sqlx::Error> for ApiError {
     fn from(error: sqlx::Error) -> Self {
+        if error
+            .as_database_error()
+            .is_some_and(|e| e.constraint() == Some("moderation_restricted"))
+        {
+            return Self::new(
+                StatusCode::FORBIDDEN,
+                ErrorCode::ModerationRestricted,
+                "Public participation is restricted; private editing remains available",
+            );
+        }
         tracing::error!(%error, "Database operation failed");
         Self::new(
             StatusCode::INTERNAL_SERVER_ERROR,

@@ -1,5 +1,4 @@
-//! Private follow relationships and live public-component feed reads. Future
-//! blocking must constrain relationship writes and this shared source scope.
+//! Private relationships and live visibility-, moderation- and block-aware feeds.
 use super::*;
 use sharing::{PublicGame, PublicNote, PublicPlaythrough, PublicReview};
 use sqlx::{Postgres, QueryBuilder};
@@ -60,7 +59,7 @@ async fn following(
     let mut data: Vec<FollowedProfile> = sqlx::query_as(
         "SELECT p.public_id,p.display_name,p.handle FROM follows f
          JOIN profiles p ON p.user_id=f.followed_id AND p.public_enabled
-         WHERE f.follower_id=$1 AND ($2::uuid IS NULL OR p.public_id>$2)
+         WHERE f.follower_id=$1 AND social_allowed(f.follower_id,f.followed_id) AND ($2::uuid IS NULL OR p.public_id>$2)
          ORDER BY p.public_id LIMIT $3",
     )
     .bind(user.0.id.0.as_bytes().as_slice())
@@ -90,9 +89,23 @@ async fn set_follow(
     enabled: bool,
 ) -> ApiResult<StatusCode> {
     let mut tx = state.pool.begin().await?;
-    // All operations on a target serialize with one another and with its
-    // publication/deletion. In particular, a racing unfollow cannot miss an
-    // uncommitted follow insertion. The FK handles account-deletion cascades.
+    let initial: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT user_id FROM profiles WHERE public_id=$1")
+            .bind(id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if let Some(target) = &initial {
+        moderation::lock_pair(&mut tx, owner, target).await?;
+        // Lock both accounts in stable order, also serializing participation
+        // restrictions in either direction. Followers need no app profile.
+        sqlx::query(
+            "SELECT user_id FROM profiles WHERE user_id IN ($1,$2) ORDER BY user_id FOR UPDATE",
+        )
+        .bind(owner)
+        .bind(target)
+        .fetch_all(&mut *tx)
+        .await?;
+    }
     let target: Option<(Vec<u8>, bool)> =
         sqlx::query_as("SELECT user_id,public_enabled FROM profiles WHERE public_id=$1 FOR UPDATE")
             .bind(id)
@@ -105,6 +118,24 @@ async fn set_follow(
             }
             if target == owner {
                 return Err(ApiError::invalid("You cannot follow yourself"));
+            }
+            let allowed: bool = sqlx::query_scalar("SELECT social_allowed($1,$2)")
+                .bind(owner)
+                .bind(&target)
+                .fetch_one(&mut *tx)
+                .await?;
+            if !allowed {
+                let restricted: bool=sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM moderation_restrictions WHERE owner_id=$1 AND kind='profile' AND active)")
+                    .bind(owner).fetch_one(&mut *tx).await?;
+                return Err(if restricted {
+                    ApiError::new(
+                        StatusCode::FORBIDDEN,
+                        ErrorCode::ModerationRestricted,
+                        "Public participation is restricted",
+                    )
+                } else {
+                    ApiError::not_found()
+                });
             }
             sqlx::query(
                 "INSERT INTO follows(follower_id,followed_id) VALUES($1,$2) ON CONFLICT DO NOTHING",
@@ -311,7 +342,7 @@ async fn feed(
     // content and the extra pagination row. No precomputed events survive a
     // revocation. Each arm starts from a public-safe, gated component view.
     let mut sql = QueryBuilder::<Postgres>::new(
-        "WITH sources AS (SELECT followed_id FROM follows WHERE follower_id=",
+        "WITH sources AS (SELECT followed_id FROM follows WHERE social_allowed(follower_id,followed_id) AND follower_id=",
     );
     sql.push_bind(user.0.id.0.as_bytes().to_vec()).push(
         "), items AS (

@@ -7882,6 +7882,7 @@ async fn statistics_snapshots_keep_metrics_consistent_during_concurrent_history_
 }
 
 async fn undo_following(pool: &PgPool) {
+    undo_moderation(pool).await;
     sqlx::raw_sql("DROP TABLE follows; DELETE FROM _sqlx_migrations WHERE version=202609170001;")
         .execute(pool)
         .await
@@ -8446,6 +8447,858 @@ async fn feed_snapshot_never_mixes_following_visibility_and_component_edits() {
                 }
             }
         }
+    );
+    f.finish().await;
+}
+
+async fn undo_moderation(pool: &PgPool) {
+    let profile_sql = include_str!("../migrations/202609160001_public_profiles.sql");
+    let views = profile_sql
+        .split("CREATE VIEW selected_reviews")
+        .nth(1)
+        .unwrap();
+    let views = format!("CREATE VIEW selected_reviews{views}")
+        .replace("CREATE VIEW", "CREATE OR REPLACE VIEW");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(views))
+        .execute(pool)
+        .await
+        .unwrap();
+    let list_sql = include_str!("../migrations/202609160002_game_lists.sql");
+    let views = list_sql.split("CREATE VIEW selected_lists").nth(1).unwrap();
+    let views = format!("CREATE VIEW selected_lists{views}")
+        .replace("CREATE VIEW", "CREATE OR REPLACE VIEW");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(views))
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql("DROP TRIGGER gameboxd_moderation_delete ON gameboxd_auth.users;
+        DROP TRIGGER moderation_publication ON profiles;
+        DROP TRIGGER moderation_publication ON playthroughs;
+        DROP TRIGGER moderation_publication ON diary_notes;
+        DROP TRIGGER moderation_publication ON library_entries;
+        DROP TRIGGER moderation_publication ON game_lists;
+        DROP FUNCTION moderation_delete_evidence(),moderation_publication_guard(),moderation_hidden(text,uuid),social_allowed(bytea,bytea),public_view_allowed(bytea,bytea);
+        DROP TABLE account_blocks,moderation_operators,moderation_restrictions,moderation_reports,moderation_audit;
+        DELETE FROM _sqlx_migrations WHERE version=202609170002;")
+        .execute(pool).await.unwrap();
+}
+
+async fn safety_operator(f: &Fixture) -> (UserId, String) {
+    let (id, token) = f.user("safety-operator").await;
+    sqlx::query("INSERT INTO moderation_operators(user_id) VALUES($1)")
+        .bind(id.0.as_bytes().as_slice())
+        .execute(&f.database.app)
+        .await
+        .unwrap();
+    (id, token)
+}
+async fn restriction(
+    f: &Fixture,
+    operator: &str,
+    kind: &str,
+    id: &Value,
+    active: bool,
+    version: i32,
+) -> Value {
+    f.value(
+        "PUT",
+        &format!("/api/operator/restrictions/{kind}/{}", id.as_str().unwrap()),
+        operator,
+        json!({"active":active,"expected_version":version,"reason":"Reviewed public content"}),
+        StatusCode::OK,
+    )
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn safety_blocks_remove_both_follows_hide_authenticated_reads_and_serialize_races() {
+    let f = Fixture::new().await;
+    let (_, reader) = f.user("block-reader").await;
+    let (_, author) = f.user("block-author").await;
+    let (_, other) = f.user("block-other").await;
+    list_games_fixture(&f).await;
+    let reader_profile = publication(&f, &reader, true).await;
+    let author_profile = publication(&f, &author, true).await;
+    statistics_choice(&f, &author, "public").await;
+    let run = feed_run(&f, &author, Some("2001-01-01"), Some("completed")).await;
+    share_run(&f,&author,&run,json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"public"})).await;
+    let note = f.note(&author, &run, "Blockable note", None).await;
+    let note = share_note(&f, &author, &note).await;
+    let list = new_list(&f, &author, "Blockable list").await;
+    let list = edit_list(
+        &f,
+        &author,
+        &list,
+        "/visibility",
+        json!({"visibility":"public"}),
+    )
+    .await;
+    follow_request(&f, &reader, &author_profile, "PUT").await;
+    follow_request(&f, &author, &reader_profile, "PUT").await;
+    let block_url = format!(
+        "/api/me/blocks/{}",
+        author_profile["public_id"].as_str().unwrap()
+    );
+    assert_eq!(
+        f.call("PUT", &block_url, None, Value::Null).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            f.call("PUT", &block_url, Some(&reader), Value::Null)
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+    assert_eq!(feed_body(&f, &reader).await["data"], json!([]));
+    assert_eq!(
+        browse(&f, &reader, "/api/me/following").await["data"],
+        json!([])
+    );
+    assert_eq!(
+        browse(&f, &author, "/api/me/following").await["data"],
+        json!([])
+    );
+    assert_eq!(
+        browse(&f, &reader, "/api/me/blocks").await,
+        json!([{"public_id":author_profile["public_id"]}])
+    );
+    assert_eq!(browse(&f, &author, "/api/me/blocks").await, json!([]));
+    for (token, target) in [(&reader, &author_profile), (&author, &reader_profile)] {
+        assert_eq!(
+            f.call("PUT", &following_path(target), Some(token), Value::Null)
+                .await
+                .status(),
+            StatusCode::NOT_FOUND
+        );
+    }
+    let id = author_profile["public_id"].as_str().unwrap();
+    let urls = vec![
+        format!("/api/public/profiles/{id}"),
+        format!("/api/public/profiles/{id}/reviews"),
+        format!("/api/public/profiles/{id}/statistics"),
+        format!("/api/public/reviews/{}", run["id"].as_str().unwrap()),
+        format!("/api/public/ratings/{}", run["id"].as_str().unwrap()),
+        format!("/api/public/playthroughs/{}", run["id"].as_str().unwrap()),
+        format!("/api/public/notes/{}", note["id"].as_str().unwrap()),
+        format!("/api/public/lists/{}", list["list"]["id"].as_str().unwrap()),
+    ];
+    for url in &urls {
+        public_body(&f, url, Some(&reader), StatusCode::NOT_FOUND).await;
+        public_body(&f, url, None, StatusCode::OK).await;
+        public_body(&f, url, Some(&other), StatusCode::OK).await;
+    }
+    public_body(&f, "/api/me/public-preview", Some(&author), StatusCode::OK).await;
+    assert_eq!(
+        f.call("DELETE", &block_url, Some(&reader), Value::Null)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(feed_body(&f, &reader).await["data"], json!([])); // Unblock never restores follows.
+    for _ in 0..8 {
+        let follow_url = following_path(&author_profile);
+        let reverse = following_path(&reader_profile);
+        let (a, b, c) = tokio::join!(
+            f.call("PUT", &follow_url, Some(&reader), Value::Null),
+            f.call("PUT", &reverse, Some(&author), Value::Null),
+            f.call("PUT", &block_url, Some(&reader), Value::Null)
+        );
+        assert!([StatusCode::NO_CONTENT, StatusCode::NOT_FOUND].contains(&a.status()));
+        assert!([StatusCode::NO_CONTENT, StatusCode::NOT_FOUND].contains(&b.status()));
+        assert_eq!(c.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT count(*) FROM follows")
+                .fetch_one(&f.database.app)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            f.call("DELETE", &block_url, Some(&reader), Value::Null)
+                .await
+                .status(),
+            StatusCode::NO_CONTENT
+        );
+    }
+    // Reciprocal blocks are independent, including while a profile is disabled.
+    let reverse_block = format!(
+        "/api/me/blocks/{}",
+        reader_profile["public_id"].as_str().unwrap()
+    );
+    f.call("PUT", &reverse_block, Some(&author), Value::Null)
+        .await;
+    publication(&f, &author, false).await;
+    assert_eq!(
+        f.call("PUT", &block_url, Some(&reader), Value::Null)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    f.call("DELETE", &block_url, Some(&reader), Value::Null)
+        .await;
+    publication(&f, &author, true).await;
+    assert_eq!(
+        f.call(
+            "PUT",
+            &following_path(&author_profile),
+            Some(&reader),
+            Value::Null
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn safety_moderation_gates_all_surfaces_preserves_diaries_and_checks_versions() {
+    let f = Fixture::new().await;
+    let (_, operator) = safety_operator(&f).await;
+    let (_, author) = f.user("moderated-author").await;
+    let (_, reader) = f.user("moderated-reader").await;
+    list_games_fixture(&f).await;
+    publication(&f, &author, true).await;
+    let profile = statistics_choice(&f, &author, "public").await;
+    let run = feed_run(&f, &author, Some("2000-01-01"), Some("completed")).await;
+    let run=share_run(&f,&author,&run,json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"public"})).await;
+    let note = f
+        .note(&author, &run, "Selected note", Some("2000-01-01"))
+        .await;
+    let note = share_note(&f, &author, &note).await;
+    let list = new_list(&f, &author, "Selected list").await;
+    let list = edit_list(
+        &f,
+        &author,
+        &list,
+        "/visibility",
+        json!({"visibility":"public"}),
+    )
+    .await;
+    let entry = f
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &author,
+            json!({"status":"completed"}),
+            StatusCode::OK,
+        )
+        .await;
+    let entry = f
+        .edit(
+            "PUT",
+            "/api/me/library/42/visibility",
+            &author,
+            &tag(&entry),
+            json!({"visibility":"public"}),
+            StatusCode::OK,
+        )
+        .await;
+    follow_request(&f, &reader, &profile, "PUT").await;
+    let public_profile = format!(
+        "/api/public/profiles/{}",
+        profile["public_id"].as_str().unwrap()
+    );
+    let before = public_body(&f, &public_profile, None, StatusCode::OK).await;
+    let run_url = format!("/api/public/reviews/{}", run["id"].as_str().unwrap());
+    let baseline = feed_body(&f, &reader).await;
+    for (kind, id) in [
+        ("review", &run["id"]),
+        ("note", &note["id"]),
+        ("list", &list["list"]["id"]),
+    ] {
+        restriction(&f, &operator, kind, id, true, 0).await;
+    }
+    assert_eq!(
+        feed_body(&f, &reader).await["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    for (kind, id) in [
+        ("reviews", &run["id"]),
+        ("notes", &note["id"]),
+        ("lists", &list["list"]["id"]),
+    ] {
+        let url = format!("/api/public/{kind}/{}", id.as_str().unwrap());
+        for viewer in [None, Some(author.as_str()), Some(reader.as_str())] {
+            public_body(&f, &url, viewer, StatusCode::NOT_FOUND).await;
+        }
+        let section = public_body(
+            &f,
+            &format!("{public_profile}/{kind}"),
+            None,
+            StatusCode::OK,
+        )
+        .await;
+        assert_eq!(section["page"]["total"], 0);
+        assert_eq!(
+            public_body(
+                &f,
+                &format!("/api/me/public-preview/{kind}"),
+                Some(&author),
+                StatusCode::OK
+            )
+            .await,
+            section
+        );
+    }
+    let counts = public_body(&f, &public_profile, None, StatusCode::OK).await;
+    assert_eq!(counts["counts"]["reviews"], 0);
+    assert_eq!(counts["counts"]["ratings"], 1); // Independent rating and summary survive a review hide.
+    public_body(
+        &f,
+        &format!("/api/public/ratings/{}", run["id"].as_str().unwrap()),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    let public_stats = public_body(
+        &f,
+        &format!("{public_profile}/statistics"),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(public_stats["playthroughs"]["completed_playthroughs"], 1);
+    assert_eq!(
+        browse(&f, &author, "/api/me/restrictions")
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        3
+    );
+    assert_eq!(browse(&f, &reader, "/api/me/restrictions").await, json!([]));
+    let denied=f.edit("PUT",&format!("{}/visibility",run_path(&run)),&author,&tag(&run),json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"public"}),StatusCode::FORBIDDEN).await;
+    assert_eq!(denied["error"]["code"], "moderation_restricted");
+    let revised = f
+        .edit(
+            "PATCH",
+            &run_path(&run),
+            &author,
+            &tag(&run),
+            json!({"review":"Privately corrected","presentation_on":"1999-01-01"}),
+            StatusCode::OK,
+        )
+        .await;
+    public_body(&f, &run_url, None, StatusCode::NOT_FOUND).await;
+    assert_eq!(revised["review_visibility"], "public");
+    for (kind, id) in [
+        ("review", &run["id"]),
+        ("note", &note["id"]),
+        ("list", &list["list"]["id"]),
+    ] {
+        restriction(&f, &operator, kind, id, false, 1).await;
+    }
+    assert_eq!(
+        public_body(&f, &run_url, None, StatusCode::OK).await["review"],
+        "Privately corrected"
+    );
+    assert_eq!(
+        feed_body(&f, &reader).await["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        baseline["data"].as_array().unwrap().len()
+    );
+    // Account restrictions gate all components, summaries, profile lookup and preview.
+    restriction(&f, &operator, "profile", &profile["public_id"], true, 0).await;
+    for url in [
+        &public_profile,
+        &format!("{public_profile}/statistics"),
+        &run_url,
+        &format!(
+            "/api/public/library/{}",
+            entry["public_id"].as_str().unwrap()
+        ),
+        &format!("/api/public/playthroughs/{}", run["id"].as_str().unwrap()),
+        &format!("/api/public/ratings/{}", run["id"].as_str().unwrap()),
+        &format!("/api/public/notes/{}", note["id"].as_str().unwrap()),
+        &format!("/api/public/lists/{}", list["list"]["id"].as_str().unwrap()),
+    ] {
+        public_body(&f, url, None, StatusCode::NOT_FOUND).await;
+    }
+    public_body(
+        &f,
+        "/api/me/public-preview",
+        Some(&author),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    public_body(
+        &f,
+        "/api/me/public-preview/statistics",
+        Some(&author),
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    assert_eq!(feed_body(&f, &reader).await["data"], json!([]));
+    assert_eq!(
+        browse(&f, &reader, "/api/me/following").await["data"],
+        json!([])
+    );
+    assert_eq!(
+        browse(&f, &author, &run_path(&run)).await["review"],
+        "Privately corrected"
+    );
+    assert_eq!(
+        browse(&f, &author, "/api/me/statistics").await["playthroughs"]["completed_playthroughs"],
+        1
+    );
+    let denied = f
+        .edit(
+            "PUT",
+            "/api/me/publication",
+            &author,
+            &tag(&profile),
+            json!({"public_enabled":true}),
+            StatusCode::FORBIDDEN,
+        )
+        .await;
+    assert_eq!(denied["error"]["code"], "moderation_restricted");
+    let route = format!(
+        "/api/operator/restrictions/profile/{}",
+        profile["public_id"].as_str().unwrap()
+    );
+    let payload = json!({"active":false,"expected_version":1,"reason":"Appeal accepted"});
+    let (a, b) = tokio::join!(
+        f.call("PUT", &route, Some(&operator), payload.clone()),
+        f.call("PUT", &route, Some(&operator), payload)
+    );
+    assert!(
+        (a.status() == StatusCode::OK && b.status() == StatusCode::PRECONDITION_FAILED)
+            || (b.status() == StatusCode::OK && a.status() == StatusCode::PRECONDITION_FAILED)
+    );
+    assert_eq!(
+        public_body(&f, &public_profile, None, StatusCode::OK).await,
+        before
+    );
+    assert_eq!(
+        browse(&f, &operator, "/api/operator/audit")
+            .await
+            .as_array()
+            .unwrap()
+            .len(),
+        8
+    );
+    assert_eq!(browse(&f, &author, "/api/me/restrictions").await, json!([]));
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn safety_reports_are_private_bounded_deduplicated_and_preserve_only_public_evidence() {
+    let f = Fixture::new().await;
+    let (operator_id, operator) = safety_operator(&f).await;
+    let (_, author) = f.user("reported-author").await;
+    let (_, reporter) = f.user("reporter").await;
+    let (_, other) = f.user("another-reporter").await;
+    list_games_fixture(&f).await;
+    let profile = publication(&f, &author, true).await;
+    let run = feed_run(&f, &author, Some("1999-01-01"), Some("completed")).await;
+    let run=share_run(&f,&author,&run,json!({"summary_visibility":"private","rating_visibility":"private","review_visibility":"public"})).await;
+    let private_run = feed_run(&f, &author, None, None).await;
+    let note = f.note(&author, &run, "Reportable note", None).await;
+    let note = share_note(&f, &author, &note).await;
+    let list = new_list(&f, &author, "Reportable list").await;
+    let list = edit_list(&f, &author, &list, "/games", json!({"igdb_ids":[43,42]})).await;
+    let list = edit_list(
+        &f,
+        &author,
+        &list,
+        "/visibility",
+        json!({"visibility":"public"}),
+    )
+    .await;
+    let input = json!({"kind":"review","target_id":run["id"],"reason":"harassment","details":"Please inspect this public review"});
+    assert_eq!(
+        f.call("POST", "/api/me/reports", None, input.clone())
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let (a, b) = tokio::join!(
+        f.call("POST", "/api/me/reports", Some(&reporter), input.clone()),
+        f.call("POST", "/api/me/reports", Some(&reporter), input.clone())
+    );
+    assert_eq!(a.status(), StatusCode::OK);
+    assert_eq!(b.status(), StatusCode::OK);
+    let receipt = json_body(a, StatusCode::OK).await;
+    assert_eq!(json_body(b, StatusCode::OK).await, receipt);
+    assert_eq!(receipt.as_object().unwrap().len(), 1);
+    let mut receipts = vec![receipt.clone()];
+    for (kind, id) in [
+        ("profile", &profile["public_id"]),
+        ("note", &note["id"]),
+        ("list", &list["list"]["id"]),
+    ] {
+        receipts.push(
+            f.value(
+                "POST",
+                "/api/me/reports",
+                &reporter,
+                json!({"kind":kind,"target_id":id,"reason":"other"}),
+                StatusCode::OK,
+            )
+            .await,
+        );
+    }
+    for (input, expected) in [
+        (
+            json!({"kind":"rating","target_id":run["id"],"reason":"other"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"kind":"review","target_id":run["id"],"reason":"bogus"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            json!({"kind":"review","target_id":run["id"],"reason":"other","details":"a".repeat(2001)}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            json!({"kind":"review","target_id":run["id"],"reason":"other","details":"x\u{0}"}),
+            StatusCode::BAD_REQUEST,
+        ),
+    ] {
+        assert_eq!(
+            f.call("POST", "/api/me/reports", Some(&reporter), input)
+                .await
+                .status(),
+            expected
+        );
+    }
+    assert_eq!(
+        f.call("POST", "/api/me/reports", Some(&author), input.clone())
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        f.call(
+            "POST",
+            "/api/me/reports",
+            Some(&reporter),
+            json!({"kind":"review","target_id":private_run["id"],"reason":"other"})
+        )
+        .await
+        .status(),
+        StatusCode::NOT_FOUND
+    );
+    let report_url = format!("/api/operator/reports/{}", receipt["id"].as_str().unwrap());
+    let restriction_url = format!(
+        "/api/operator/restrictions/review/{}",
+        run["id"].as_str().unwrap()
+    );
+    for token in [
+        None,
+        Some(author.as_str()),
+        Some(reporter.as_str()),
+        Some(other.as_str()),
+    ] {
+        let expected = if token.is_none() {
+            StatusCode::UNAUTHORIZED
+        } else {
+            StatusCode::FORBIDDEN
+        };
+        for (method, url, payload) in [
+            ("GET", "/api/operator/reports", Value::Null),
+            ("GET", report_url.as_str(), Value::Null),
+            ("GET", "/api/operator/restrictions", Value::Null),
+            ("GET", "/api/operator/audit", Value::Null),
+            (
+                "PUT",
+                restriction_url.as_str(),
+                json!({"active":true,"expected_version":0,"reason":"Not authorized"}),
+            ),
+            (
+                "PUT",
+                report_url.as_str(),
+                json!({"status":"resolved","expected_version":1,"reason":"Not authorized"}),
+            ),
+        ] {
+            assert_eq!(
+                f.call(method, url, token, payload).await.status(),
+                expected,
+                "{method} {url}"
+            );
+        }
+    }
+    // Only operator routes can inspect a case; no reporter or reported-user read route exists.
+    assert_eq!(
+        f.call("GET", "/api/me/reports", Some(&reporter), Value::Null)
+            .await
+            .status(),
+        StatusCode::METHOD_NOT_ALLOWED
+    );
+    let queue = browse(&f, &operator, "/api/operator/reports").await;
+    assert_eq!(queue.as_array().unwrap().len(), 4);
+    for row in queue.as_array().unwrap() {
+        for key in ["reporter_id", "owner_id", "operator_id"] {
+            assert!(row.get(key).is_none());
+        }
+        let evidence = &row["evidence"];
+        for key in [
+            "user_id",
+            "game_id",
+            "version",
+            "created_at",
+            "updated_at",
+            "review_visibility",
+            "rating_visibility",
+            "summary_visibility",
+        ] {
+            assert!(evidence.get(key).is_none(), "evidence leaked {key}");
+        }
+        if row["kind"] == "review" {
+            assert_eq!(evidence["review"], "Chosen review");
+            assert_eq!(evidence["presentation_on"], "1999-01-01");
+            for key in ["platform", "rating", "state", "started_on"] {
+                assert!(evidence.get(key).is_none());
+            }
+        }
+        if row["kind"] == "list" {
+            assert_eq!(evidence["games"][0]["igdb_id"], 43);
+            assert_eq!(evidence["games"][1]["igdb_id"], 42);
+        }
+    }
+    assert_eq!(
+        browse(&f, &operator, "/api/operator/reports?limit=1&offset=1").await[0],
+        queue[1]
+    );
+    let resolution = json!({"status":"resolved","expected_version":1,"reason":"Reviewed the case"});
+    let (a, b) = tokio::join!(
+        f.call("PUT", &report_url, Some(&operator), resolution.clone()),
+        f.call("PUT", &report_url, Some(&operator), resolution)
+    );
+    assert!(
+        (a.status() == StatusCode::OK && b.status() == StatusCode::PRECONDITION_FAILED)
+            || (b.status() == StatusCode::OK && a.status() == StatusCode::PRECONDITION_FAILED)
+    );
+    assert_eq!(
+        browse(&f, &operator, &report_url).await["status"],
+        "resolved"
+    );
+    assert_eq!(
+        browse(&f, &operator, "/api/operator/audit").await[0]["action"],
+        "resolve_report"
+    );
+    // Resolution is not deletion: retries keep the same case, never overwrite evidence.
+    assert_eq!(
+        f.value(
+            "POST",
+            "/api/me/reports",
+            &reporter,
+            input.clone(),
+            StatusCode::OK
+        )
+        .await,
+        receipt
+    );
+    assert_ne!(
+        f.value("POST", "/api/me/reports", &other, input, StatusCode::OK)
+            .await,
+        receipt
+    );
+    // Stored evidence survives item deletion, but not longer than retention or account deletion.
+    f.edit(
+        "DELETE",
+        &run_path(&run),
+        &author,
+        &tag(&run),
+        Value::Null,
+        StatusCode::NO_CONTENT,
+    )
+    .await;
+    assert_eq!(
+        browse(&f, &operator, &report_url).await["evidence"]["review"],
+        "Chosen review"
+    );
+    // Revoking a DB grant immediately revokes the existing session's operator access.
+    sqlx::query("DELETE FROM moderation_operators WHERE user_id=$1")
+        .bind(operator_id.0.as_bytes().as_slice())
+        .execute(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.call("GET", &report_url, Some(&operator), Value::Null)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn safety_report_quota_retention_deletion_and_migration_preserve_private_data() {
+    let f = Fixture::new().await;
+    let (operator_id, operator) = safety_operator(&f).await;
+    let (author_id, author) = f.user("retention-author").await;
+    let (reporter_id, reporter) = f.user("retention-reporter").await;
+    list_games_fixture(&f).await;
+    let profile = publication(&f, &author, true).await;
+    let run = feed_run(&f, &author, None, None).await;
+    let run=share_run(&f,&author,&run,json!({"summary_visibility":"private","rating_visibility":"private","review_visibility":"public"})).await;
+    // Simulate upgrading a pre-safety database with already shared content.
+    undo_moderation(&f.database.app).await;
+    sqlx::migrate!("./migrations")
+        .run(&f.database.app)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations")
+        .run(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(browse(&f, &author, &run_path(&run)).await, run);
+    assert_eq!(browse(&f, &author, "/api/me").await["profile"], profile);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM moderation_restrictions")
+            .fetch_one(&f.database.app)
+            .await
+            .unwrap(),
+        0
+    );
+    // The upgrade creates no operator grants either.
+    assert_eq!(
+        f.call("GET", "/api/operator/reports", Some(&operator), Value::Null)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN
+    );
+    sqlx::query("INSERT INTO moderation_operators(user_id) VALUES($1)")
+        .bind(operator_id.0.as_bytes().as_slice())
+        .execute(&f.database.app)
+        .await
+        .unwrap();
+    let mut receipts = Vec::new();
+    let mut notes = Vec::new();
+    for _ in 0..20 {
+        let note = f.note(&author, &run, "Evidence to retain", None).await;
+        let note = share_note(&f, &author, &note).await;
+        let receipt=f.value("POST","/api/me/reports",&reporter,json!({"kind":"note","target_id":note["id"],"reason":"other","details":"Quoted evidence"}),StatusCode::OK).await;
+        receipts.push(receipt);
+        notes.push(note);
+    }
+    let payload = json!({"kind":"review","target_id":run["id"],"reason":"spam"});
+    let denied = f
+        .call("POST", "/api/me/reports", Some(&reporter), payload.clone())
+        .await;
+    assert_eq!(denied.status(), StatusCode::TOO_MANY_REQUESTS);
+    assert!(denied.headers().contains_key("retry-after"));
+    assert_eq!(
+        json_body(denied, StatusCode::TOO_MANY_REQUESTS).await["error"]["code"],
+        "report_limit"
+    );
+    let repeated = f
+        .value(
+            "POST",
+            "/api/me/reports",
+            &reporter,
+            json!({"kind":"note","target_id":notes[0]["id"],"reason":"spam"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(repeated, receipts[0]);
+    // Expiry is enforced in reads before physical cleanup runs.
+    let first = Uuid::parse_str(receipts[0]["id"].as_str().unwrap()).unwrap();
+    sqlx::query("UPDATE moderation_reports SET created_at=now()-interval '91 days' WHERE id=$1")
+        .bind(first)
+        .execute(&f.database.app)
+        .await
+        .unwrap();
+    let expired = browse(&f, &operator, &format!("/api/operator/reports/{first}")).await;
+    assert_eq!(expired["evidence"], Value::Null);
+    assert_eq!(expired["details"], "");
+    gameboxd_backend::db::purge_moderation(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, Option<Value>>(
+            "SELECT evidence FROM moderation_reports WHERE id=$1"
+        )
+        .bind(first)
+        .fetch_one(&f.database.app)
+        .await
+        .unwrap(),
+        None
+    );
+    let review = f
+        .value(
+            "POST",
+            "/api/me/reports",
+            &reporter,
+            payload,
+            StatusCode::OK,
+        )
+        .await;
+    restriction(&f, &operator, "profile", &profile["public_id"], true, 0).await;
+    let block_url = format!("/api/me/blocks/{}", profile["public_id"].as_str().unwrap());
+    assert_eq!(
+        f.call("PUT", &block_url, Some(&reporter), Value::Null)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    // Reporter deletion removes identity without destroying the reported evidence.
+    f.auth
+        .state()
+        .operator()
+        .delete_account(
+            reporter_id,
+            OperatorActor::new("safety-test", None, None, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM moderation_reports WHERE reporter_id IS NOT NULL"
+        )
+        .fetch_one(&f.database.app)
+        .await
+        .unwrap(),
+        0
+    );
+    let review_path = format!("/api/operator/reports/{}", review["id"].as_str().unwrap());
+    assert_eq!(
+        browse(&f, &operator, &review_path).await["evidence"]["review"],
+        "Chosen review"
+    );
+    f.auth
+        .state()
+        .operator()
+        .delete_account(
+            author_id,
+            OperatorActor::new("safety-test", None, None, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    let deleted = browse(&f, &operator, &review_path).await;
+    assert_eq!(deleted["evidence"], Value::Null);
+    assert_eq!(deleted["details"], "");
+    assert_eq!(
+        browse(&f, &operator, "/api/operator/audit").await[0]["reason"],
+        "Account deleted"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM moderation_restrictions")
+            .fetch_one(&f.database.app)
+            .await
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM account_blocks")
+            .fetch_one(&f.database.app)
+            .await
+            .unwrap(),
+        0
     );
     f.finish().await;
 }

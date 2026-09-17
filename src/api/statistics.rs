@@ -184,13 +184,14 @@ async fn selected(
 }
 
 async fn public(
+    viewer: OptionalAuthUser,
     State(state): State<AppState>,
     id: Result<Path<Uuid>, PathRejection>,
     query: Result<Query<StatisticsQuery>, QueryRejection>,
 ) -> ApiResult<Json<Statistics>> {
     selected(
         &state,
-        profiles::Scope::PublicId(path(id)?),
+        profiles::Scope::PublicId(path(id)?, viewer.0.map(|u| u.id.0.as_bytes().to_vec())),
         StatisticsQuery::parse(query)?,
     )
     .await
