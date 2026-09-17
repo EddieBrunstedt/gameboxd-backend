@@ -931,3 +931,110 @@ snapshot, as with other public views. Every response (including errors and HEAD)
 `Cache-Control: no-store`; public/preview responses omit ETag and Last-Modified.
 No provider request is needed. Refetch after changes; a previously delivered response
 cannot be withdrawn from a visitor's memory.
+
+## Private following and chronological gaming-life feed
+
+All social routes require authentication. A reader can keep their own profile
+private (or uninitialized). Targets use canonical **public profile UUIDs**, never
+handles, email addresses, or authentication IDs.
+
+| Method and route | Behavior |
+| --- | --- |
+| `PUT /api/me/following/{public_id}` | Follow an enabled public profile. Bodyless; returns 204, including an existing relationship. Self-follow returns 400. Disabled or missing targets return the same 404. |
+| `DELETE /api/me/following/{public_id}` | Unfollow. Bodyless, idempotent 204 even if the target is disabled, deleted, unknown, or not followed. |
+| `GET /api/me/following` | Page the session owner's currently available followed profiles. |
+| `GET /api/me/feed` | Page live eligible public components from followed profiles. |
+
+Following writes set the desired relationship, so retries cannot duplicate edges;
+no `If-Match` is needed. Concurrent operations on a target serialize, including
+follow/unfollow and profile publication/deletion. The final serialized operation
+wins; clients should serialize their own intent and reread after an uncertain
+response. No notification or public activity is created by a follow.
+
+Relationships, following lists, and follower lists/counts are private in v1.
+There is no API for inspecting another person's social graph or for notifying an
+author about followers. Following responses contain only `public_id`,
+`display_name`, and nullable current `handle`. Disabled targets disappear from
+this listing and the feed, without removing the stored relationship. Reenabling
+the profile restores eligible content under its original chosen dates. A known
+UUID can still be unfollowed while disabled. Account deletion cascades incoming
+and outgoing relationships; recreating an account does not restore them.
+
+Both collections accept only `limit` (default 20, range 1–50) and optional
+`after`. Unsupported or malformed parameters return 400. Both return
+`SocialPage<T>`: `{data, limit, has_more, next_cursor}`. There is no total count,
+recording timestamp, revision, publication timestamp, or social notification
+metadata. `next_cursor` is null at the end. Each read, including its extra row
+used for `has_more`, uses one database statement and a consistent snapshot of
+relationships, profile gates and content. The following list sorts by public
+UUID ascending; its cursor is the last returned UUID. This stable ordering
+reveals no follow chronology and is unaffected by display name/handle edits.
+
+### Feed kinds, identity and chronology
+
+Each feed row is a discriminated `{kind, item}` object:
+
+| `kind` | `item` representation and eligibility |
+| --- | --- |
+| `review` | `PublicReview`; independently selected public review text, once per playthrough. |
+| `note` | `PublicNote`; independently selected public diary note, even when its parent summary/review/rating is private. |
+| `milestone` | `PublicPlaythrough`; independently selected public summary with explicit state `active`, `paused`, `completed`, or `abandoned`. |
+
+A milestone presents the run's **current chosen historical summary**: an active
+run indicates starting/playing, a paused run indicates a pause, and completed or
+abandoned runs indicate those outcomes. There is one milestone per run, not an
+audit record per lifecycle transition. Correcting the state changes that same
+item in place. No transition date is inferred from recording time, publication,
+or a missing play date. Summaries with unknown state do not generate milestones;
+rating-only shares, library statuses, lists, favorites, profile edits and follow
+operations do not generate feed items.
+
+Identity is the pair **`(kind, item.id)`**. A run can contribute one milestone
+and one independently public review. Its milestone contains no review text or
+rating; the review is never repeated through a summary or library projection.
+Note IDs have their own kind namespace. IDs persist through text corrections,
+state changes, date changes, and unpublishing/republishing. Item payloads match
+the corresponding direct public endpoint exactly, including author identity and
+local game context; no IGDB availability is required.
+
+Order is `presentation_on DESC NULLS LAST, id DESC, kind DESC`, with numeric kind
+tie order `milestone` (2), `note` (1), `review` (0). Thus separate components
+sharing a UUID still paginate without loss or duplication. Only the explicit
+chosen presentation day is used, including for milestones: start/end dates,
+write times, follow times and publication times never supply a fallback.
+Unknown dates remain unknown and follow dated items. Calendar dates do not
+shift with viewer time zones. Historical text edits, visibility changes and
+following today do not imply activity today. A newly shared old entry appears
+at its historical position; changing its chosen date deliberately moves it.
+
+The versioned feed cursor encodes only a chosen day (or `unknown`), UUID, and
+kind, e.g. `f1:2020-02-29:<uuid>:review`. Treat it as an opaque value and pass it
+back as `after`. It is a value boundary, not an authorization token or a stored
+snapshot: every continuation checks the current session's follows and current
+visibility. Removing/unpublishing/unfollowing the anchor does not invalidate
+continuation. Backfills after the boundary can appear on later pages; newly
+eligible items before it require a refresh. Date corrections crossing an
+already traversed boundary can repeat or skip an item; refresh after such edits
+and deduplicate by `(kind, item.id)` when accumulating pages. Unknown-date
+continuations stay in the unknown-date section. Cursors must not be interpreted
+as evidence that their source item still exists or is accessible.
+
+### Revocation and future blocking
+
+The feed reads gated `public_reviews`, `public_notes`, and
+`public_playthroughs` directly, restricted to the reader's live relationship
+set. Private siblings, ratings, statuses, parent relationships and internal
+bookkeeping cannot affect eligibility, ordering, page boundaries or payloads.
+Making an item private, removing its content, deleting a note/playthrough,
+unfollowing, disabling the profile, or deleting an account removes affected
+items on subsequent reads, including cursor continuations. An in-flight read
+may finish with its authorized snapshot. Previously downloaded text cannot be
+retracted from a client's memory.
+
+Feed/following responses (including errors and HEAD) are `Cache-Control:
+no-store`, without ETag or Last-Modified. Conditional requests do not serve
+stale content. There are no push/email notifications or retained activity-event
+copies. Feature 10 must extend the relationship write checks and feed source
+scope for both directions of blocking, remove existing blocked relationships,
+and apply moderation gates through the shared public sources. Blocking and
+moderation are not introduced by this feature.

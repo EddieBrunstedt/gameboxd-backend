@@ -7295,6 +7295,7 @@ async fn list_browsing_and_migration_keep_private_data_out_of_public_counts() {
 
 // Reconstruct the pre-summary schema without changing existing profile values.
 async fn undo_statistics(pool: &PgPool) {
+    undo_following(pool).await;
     sqlx::raw_sql(
         "ALTER TABLE profiles DROP COLUMN statistics_visibility;
         DELETE FROM _sqlx_migrations WHERE version=202609160003;",
@@ -7873,6 +7874,575 @@ async fn statistics_snapshots_keep_metrics_consistent_during_concurrent_history_
                         value["rating_distribution"][1]["count"],
                         value["current_status_counts"]["dropped"]
                     );
+                }
+            }
+        }
+    );
+    f.finish().await;
+}
+
+async fn undo_following(pool: &PgPool) {
+    sqlx::raw_sql("DROP TABLE follows; DELETE FROM _sqlx_migrations WHERE version=202609170001;")
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+fn following_path(profile: &Value) -> String {
+    format!(
+        "/api/me/following/{}",
+        profile["public_id"].as_str().unwrap()
+    )
+}
+
+async fn follow_request(f: &Fixture, token: &str, profile: &Value, method: &str) {
+    let response = f
+        .call(method, &following_path(profile), Some(token), Value::Null)
+        .await;
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert!(!response.headers().contains_key("etag"));
+    assert!(!response.headers().contains_key("last-modified"));
+}
+
+async fn feed_body(f: &Fixture, token: &str) -> Value {
+    public_body(f, "/api/me/feed", Some(token), StatusCode::OK).await
+}
+
+async fn feed_run(f: &Fixture, owner: &str, date: Option<&str>, state: Option<&str>) -> Value {
+    f.value("POST", "/api/me/playthroughs", owner,
+        json!({"igdb_id":42,"presentation_on":date,"state":state,"review":"Chosen review","rating":9,
+            "platform":"Private platform","started_on":"2010-01-01"}), StatusCode::CREATED).await
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn following_is_private_idempotent_and_cascades_after_migration() {
+    let f = Fixture::new().await;
+    let (reader_id, reader) = f.user("follow-reader").await;
+    let (author_id, author) = f.user("follow-author").await;
+    let (_, other) = f.user("follow-other").await;
+    let profile = publication(&f, &author, true).await;
+    let other_profile = publication(&f, &other, true).await;
+    // Migration changes no profiles or publication choices and creates no follows.
+    undo_following(&f.database.app).await;
+    sqlx::migrate!("./migrations")
+        .run(&f.database.app)
+        .await
+        .unwrap();
+    sqlx::migrate!("./migrations")
+        .run(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(browse(&f, &author, "/api/me").await["profile"], profile);
+    assert_eq!(
+        browse(&f, &reader, "/api/me/following").await["data"],
+        json!([])
+    );
+    for (method, uri) in [
+        ("GET", "/api/me/following"),
+        ("GET", "/api/me/feed"),
+        ("PUT", following_path(&profile).as_str()),
+        ("DELETE", following_path(&profile).as_str()),
+    ] {
+        assert_eq!(
+            f.call(method, uri, None, Value::Null).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    assert_eq!(
+        f.call("PUT", &following_path(&profile), Some(&author), Value::Null)
+            .await
+            .status(),
+        StatusCode::BAD_REQUEST
+    );
+    // An unpublished follower can follow; repeated and concurrent PUTs add one edge.
+    let ((), ()) = tokio::join!(
+        follow_request(&f, &reader, &profile, "PUT"),
+        follow_request(&f, &reader, &profile, "PUT")
+    );
+    let followed = public_body(&f, "/api/me/following", Some(&reader), StatusCode::OK).await;
+    assert_eq!(followed["data"].as_array().unwrap().len(), 1);
+    assert_eq!(followed["data"][0]["public_id"], profile["public_id"]);
+    assert_eq!(
+        browse(&f, &author, "/api/me/following").await["data"],
+        json!([])
+    );
+    assert_eq!(
+        browse(&f, &other, "/api/me/following").await["data"],
+        json!([])
+    );
+    for suffix in ["followers", "following"] {
+        public_body(
+            &f,
+            &format!(
+                "/api/public/profiles/{}/{suffix}",
+                profile["public_id"].as_str().unwrap()
+            ),
+            None,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    follow_request(&f, &reader, &other_profile, "PUT").await;
+    let page = browse(&f, &reader, "/api/me/following?limit=1").await;
+    let next = browse(
+        &f,
+        &reader,
+        &format!(
+            "/api/me/following?limit=1&after={}",
+            page["next_cursor"].as_str().unwrap()
+        ),
+    )
+    .await;
+    assert_ne!(page["data"][0]["public_id"], next["data"][0]["public_id"]);
+    assert_eq!(next["has_more"], false);
+    // Disabled sources vanish from lists and cannot be newly followed. Existing
+    // edges survive toggling, but DELETE works even while the target is hidden.
+    publication(&f, &author, false).await;
+    assert_eq!(
+        browse(&f, &reader, "/api/me/following").await["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        f.call("PUT", &following_path(&profile), Some(&reader), Value::Null)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    follow_request(&f, &reader, &profile, "DELETE").await;
+    follow_request(&f, &reader, &profile, "DELETE").await;
+    publication(&f, &author, true).await;
+    assert_eq!(
+        browse(&f, &reader, "/api/me/following").await["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    // All operations lock the same target, including when no edge yet exists.
+    for _ in 0..8 {
+        let ((), ()) = timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                follow_request(&f, &reader, &profile, "PUT"),
+                follow_request(&f, &reader, &profile, "DELETE")
+            )
+        })
+        .await
+        .unwrap();
+        follow_request(&f, &reader, &profile, "PUT").await;
+    }
+    // Publication and follow requests cannot deadlock or return storage failures.
+    let hidden = publication(&f, &author, false).await;
+    let target_path = following_path(&profile);
+    let hidden_tag = tag(&hidden);
+    let headers = [("If-Match", hidden_tag.as_str())];
+    let (follow, publish) = tokio::join!(
+        f.call("PUT", &target_path, Some(&reader), Value::Null),
+        f.send(
+            "PUT",
+            "/api/me/publication",
+            Some(&author),
+            &headers,
+            json!({"public_enabled":true})
+        )
+    );
+    assert!(matches!(follow.status().as_u16(), 204 | 404));
+    assert_eq!(publish.status(), StatusCode::OK);
+    f.auth
+        .state()
+        .operator()
+        .delete_account(
+            author_id,
+            OperatorActor::new("follow-test", None, None, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    follow_request(&f, &reader, &profile, "DELETE").await;
+    assert_eq!(
+        f.call("PUT", &following_path(&profile), Some(&reader), Value::Null)
+            .await
+            .status(),
+        StatusCode::NOT_FOUND
+    );
+    let targets: i64 = sqlx::query_scalar("SELECT count(*) FROM follows WHERE followed_id=$1")
+        .bind(author_id.0.as_bytes().as_slice())
+        .fetch_one(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(targets, 0);
+    f.auth
+        .state()
+        .operator()
+        .delete_account(
+            reader_id,
+            OperatorActor::new("follow-test", None, None, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM follows")
+        .fetch_one(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn feed_projects_independent_components_and_revokes_every_source_live() {
+    let f = Fixture::new().await;
+    let (_, reader) = f.user("feed-reader").await;
+    let (author_id, author) = f.user("feed-author").await;
+    let (_, other) = f.user("feed-other").await;
+    list_games_fixture(&f).await;
+    let profile = publication(&f, &author, true).await;
+    publication(&f, &other, true).await;
+    let run = feed_run(&f, &author, Some("2020-02-02"), Some("completed")).await;
+    let run = share_run(&f, &author, &run, json!({"summary_visibility":"private","rating_visibility":"private","review_visibility":"public"})).await;
+    let note = f
+        .note(&author, &run, "Shared note", Some("2020-02-01"))
+        .await;
+    let note = f
+        .edit(
+            "PUT",
+            &format!("{}/visibility", note_path(&note)),
+            &author,
+            &tag(&note),
+            json!({"visibility":"public"}),
+            StatusCode::OK,
+        )
+        .await;
+    let other_run = feed_run(&f, &other, Some("2030-01-01"), Some("active")).await;
+    share_run(&f, &other, &other_run, json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"public"})).await;
+    assert_eq!(feed_body(&f, &reader).await["data"], json!([]));
+    follow_request(&f, &reader, &profile, "PUT").await;
+    let selected = feed_body(&f, &reader).await;
+    assert_eq!(selected["data"].as_array().unwrap().len(), 2);
+    assert_eq!(selected["data"][0]["kind"], "review");
+    assert_eq!(
+        selected["data"][0]["item"],
+        public_body(
+            &f,
+            &format!("/api/public/reviews/{}", run["id"].as_str().unwrap()),
+            None,
+            StatusCode::OK
+        )
+        .await
+    );
+    assert_eq!(selected["data"][1]["kind"], "note");
+    assert_eq!(
+        selected["data"][1]["item"],
+        public_body(
+            &f,
+            &format!("/api/public/notes/{}", note["id"].as_str().unwrap()),
+            None,
+            StatusCode::OK
+        )
+        .await
+    );
+    // Private state/platform/rating and parent identity cannot leak via reviews or notes.
+    for row in selected["data"].as_array().unwrap() {
+        for key in [
+            "platform",
+            "state",
+            "rating",
+            "started_on",
+            "finished_on",
+            "playthrough_id",
+        ] {
+            assert!(row["item"].get(key).is_none(), "leaked {key}");
+        }
+    }
+    assert_eq!(feed_body(&f, &other).await["data"], json!([]));
+    let run = share_run(&f, &author, &run, json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"public"})).await;
+    let all = feed_body(&f, &reader).await;
+    assert_eq!(all["data"].as_array().unwrap().len(), 3);
+    assert_eq!(all["data"][0]["kind"], "milestone");
+    assert!(all["data"][0]["item"].get("review").is_none());
+    assert!(all["data"][0]["item"].get("rating").is_none());
+    assert_eq!(
+        all["data"][0]["item"],
+        public_body(
+            &f,
+            &format!("/api/public/playthroughs/{}", run["id"].as_str().unwrap()),
+            None,
+            StatusCode::OK
+        )
+        .await
+    );
+    // Shared summaries lacking an explicit state and rating-only shares are not events.
+    let assessment = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &author,
+            json!({"igdb_id":42,"rating":1,"presentation_on":"2040-01-01"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    share_run(&f, &author, &assessment, json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"private"})).await;
+    let private = feed_run(&f, &author, Some("2050-01-01"), Some("completed")).await;
+    assert_eq!(feed_body(&f, &reader).await, all);
+    publication(&f, &author, false).await;
+    assert_eq!(feed_body(&f, &reader).await["data"], json!([]));
+    publication(&f, &author, true).await;
+    assert_eq!(feed_body(&f, &reader).await, all);
+    let run = share_run(&f, &author, &run, json!({"summary_visibility":"private","rating_visibility":"private","review_visibility":"private"})).await;
+    assert_eq!(
+        feed_body(&f, &reader).await["data"],
+        json!([selected["data"][1]])
+    );
+    let note = f
+        .edit(
+            "PUT",
+            &format!("{}/visibility", note_path(&note)),
+            &author,
+            &tag(&note),
+            json!({"visibility":"private"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(feed_body(&f, &reader).await["data"], json!([]));
+    f.edit(
+        "PUT",
+        &format!("{}/visibility", note_path(&note)),
+        &author,
+        &tag(&note),
+        json!({"visibility":"public"}),
+        StatusCode::OK,
+    )
+    .await;
+    follow_request(&f, &reader, &profile, "DELETE").await;
+    assert_eq!(feed_body(&f, &reader).await["data"], json!([]));
+    follow_request(&f, &reader, &profile, "PUT").await;
+    assert_eq!(
+        feed_body(&f, &reader).await["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        f.call("DELETE", &run_path(&run), Some(&author), Value::Null)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(feed_body(&f, &reader).await["data"], json!([]));
+    share_run(&f, &author, &private, json!({"summary_visibility":"public","rating_visibility":"private","review_visibility":"public"})).await;
+    assert_eq!(
+        feed_body(&f, &reader).await["data"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    f.auth
+        .state()
+        .operator()
+        .delete_account(
+            author_id,
+            OperatorActor::new("feed-test", None, None, None).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(feed_body(&f, &reader).await["data"], json!([]));
+    // All context was local; no IGDB request was made by these operations.
+    assert!(f.server.received_requests().await.unwrap().is_empty());
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn feed_cursor_orders_chosen_dates_components_unknowns_and_backfills() {
+    let f = Fixture::new().await;
+    let (_, reader) = f.user("feed-pages-reader").await;
+    let (_, author) = f.user("feed-pages-author").await;
+    list_games_fixture(&f).await;
+    let profile = publication(&f, &author, true).await;
+    follow_request(&f, &reader, &profile, "PUT").await;
+    let mut runs = Vec::new();
+    for date in [
+        Some("2020-01-01"),
+        Some("2020-01-01"),
+        Some("2019-01-01"),
+        None,
+        None,
+    ] {
+        let run = feed_run(&f, &author, date, Some("completed")).await;
+        runs.push(share_run(&f, &author, &run, json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"public"})).await);
+    }
+    let baseline = feed_body(&f, &reader).await;
+    assert_eq!(baseline["data"].as_array().unwrap().len(), 10);
+    let mut seen = Vec::new();
+    let mut uri = "/api/me/feed?limit=1".to_string();
+    let mut cursors = Vec::new();
+    loop {
+        let page = public_body(&f, &uri, Some(&reader), StatusCode::OK).await;
+        seen.extend(page["data"].as_array().unwrap().iter().cloned());
+        if page["has_more"] == false {
+            assert!(page["next_cursor"].is_null());
+            break;
+        }
+        let cursor = page["next_cursor"].as_str().unwrap().to_string();
+        cursors.push(cursor.clone());
+        uri = format!("/api/me/feed?limit=1&after={cursor}");
+        assert!(seen.len() <= 10);
+    }
+    assert_eq!(seen, *baseline["data"].as_array().unwrap());
+    for pair in seen.chunks(2) {
+        assert_eq!(pair[0]["kind"], "milestone");
+        assert_eq!(pair[1]["kind"], "review");
+        assert_eq!(pair[0]["item"]["id"], pair[1]["item"]["id"]);
+    }
+    assert!(seen[6]["item"]["presentation_on"].is_null());
+    // Editing text keeps exactly the same position and cursors, with live text.
+    let edited = f
+        .edit(
+            "PATCH",
+            &run_path(&runs[2]),
+            &author,
+            &tag(&runs[2]),
+            json!({"review":"Revised old text"}),
+            StatusCode::OK,
+        )
+        .await;
+    let revised = feed_body(&f, &reader).await;
+    assert_eq!(revised["data"][5]["item"]["review"], "Revised old text");
+    assert_eq!(revised["data"][5]["item"]["presentation_on"], "2019-01-01");
+    // Publishing a backfill today inserts at its chosen old day, without an event date.
+    let backfill = feed_run(&f, &author, Some("2018-01-01"), Some("paused")).await;
+    share_run(&f, &author, &backfill, json!({"summary_visibility":"private","rating_visibility":"private","review_visibility":"public"})).await;
+    let continued = browse(&f, &reader, &format!("/api/me/feed?after={}", cursors[3])).await;
+    assert_eq!(continued["data"][2]["item"]["id"], backfill["id"]);
+    // A newly inserted newer item cannot shift continuation; removing the cursor
+    // anchor also cannot invalidate the value boundary.
+    let newer = feed_run(&f, &author, Some("2025-01-01"), Some("active")).await;
+    share_run(&f, &author, &newer, json!({"summary_visibility":"public","rating_visibility":"private","review_visibility":"public"})).await;
+    let anchor_id = baseline["data"][3]["item"]["id"].as_str().unwrap();
+    assert_eq!(
+        f.call(
+            "DELETE",
+            &format!("/api/me/playthroughs/{anchor_id}"),
+            Some(&author),
+            Value::Null
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        browse(&f, &reader, &format!("/api/me/feed?after={}", cursors[3])).await,
+        continued
+    );
+    // Changing the chosen date deliberately changes its position.
+    f.edit(
+        "PATCH",
+        &run_path(&edited),
+        &author,
+        &tag(&edited),
+        json!({"presentation_on":"2026-01-01"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        feed_body(&f, &reader).await["data"][0]["item"]["id"],
+        edited["id"]
+    );
+    for query in [
+        "limit=0",
+        "limit=51",
+        "limit=-1",
+        "offset=1",
+        "after=garbage",
+        "year=2020",
+        "after=f1:unknown:00000000-0000-0000-0000-000000000000:rating",
+    ] {
+        public_body(
+            &f,
+            &format!("/api/me/feed?{query}"),
+            Some(&reader),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    for query in [
+        "limit=0",
+        "limit=51",
+        "after=bad",
+        "user_id=someone",
+        "offset=1",
+    ] {
+        public_body(
+            &f,
+            &format!("/api/me/following?{query}"),
+            Some(&reader),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    for uri in ["/api/me/feed", "/api/me/following"] {
+        let response = f.call("HEAD", uri, Some(&reader), Value::Null).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(!response.headers().contains_key("etag"));
+        assert!(!response.headers().contains_key("last-modified"));
+    }
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn feed_snapshot_never_mixes_following_visibility_and_component_edits() {
+    let f = Fixture::new().await;
+    let (reader_id, reader) = f.user("feed-snapshot-reader").await;
+    let (author_id, author) = f.user("feed-snapshot-author").await;
+    list_games_fixture(&f).await;
+    let profile = publication(&f, &author, true).await;
+    follow_request(&f, &reader, &profile, "PUT").await;
+    let run = feed_run(&f, &author, Some("2020-01-01"), Some("completed")).await;
+    share_run(&f, &author, &run, json!({"summary_visibility":"public","rating_visibility":"private","review_visibility":"public"})).await;
+    let ((), ()) = tokio::join!(
+        async {
+            for n in 0..40 {
+                let mut tx = f.database.app.begin().await.unwrap();
+                let visible = n % 2 == 1;
+                sqlx::query("UPDATE profiles SET public_enabled=$2 WHERE user_id=$1")
+                    .bind(author_id.0.as_bytes().as_slice())
+                    .bind(visible)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE playthroughs SET review=$2,summary_visibility=$3,review_visibility=$3 WHERE user_id=$1")
+                .bind(author_id.0.as_bytes().as_slice()).bind(if visible {"Chosen review"} else {"Never visible"})
+                .bind(if visible {"public"} else {"private"}).execute(&mut *tx).await.unwrap();
+                if visible {
+                    sqlx::query("INSERT INTO follows(follower_id,followed_id) VALUES($1,$2) ON CONFLICT DO NOTHING")
+                    .bind(reader_id.0.as_bytes().as_slice()).bind(author_id.0.as_bytes().as_slice()).execute(&mut *tx).await.unwrap();
+                } else {
+                    sqlx::query("DELETE FROM follows WHERE follower_id=$1")
+                        .bind(reader_id.0.as_bytes().as_slice())
+                        .execute(&mut *tx)
+                        .await
+                        .unwrap();
+                }
+                tx.commit().await.unwrap();
+                tokio::task::yield_now().await;
+            }
+        },
+        async {
+            for _ in 0..30 {
+                let feed = feed_body(&f, &reader).await;
+                let rows = feed["data"].as_array().unwrap();
+                assert!(rows.is_empty() || rows.len() == 2);
+                if rows.len() == 2 {
+                    assert_eq!(rows[0]["kind"], "milestone");
+                    assert_eq!(rows[1]["item"]["review"], "Chosen review");
+                    assert_eq!(rows[0]["item"]["id"], rows[1]["item"]["id"]);
                 }
             }
         }

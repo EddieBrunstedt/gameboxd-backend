@@ -101,6 +101,9 @@ async fn ready(State(state): State<AppState>) -> Response {
 
 async fn response_policy(request: Request, next: Next) -> Response {
     let public_content = request.uri().path().starts_with("/api/public/")
+        || request.uri().path() == "/api/me/feed"
+        || request.uri().path() == "/api/me/following"
+        || request.uri().path().starts_with("/api/me/following/")
         || request.uri().path() == "/api/me/public-preview"
         || request.uri().path().starts_with("/api/me/public-preview/");
     let mut response = next.run(request).await;

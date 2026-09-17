@@ -107,3 +107,10 @@ filtering, recorded-run/completion/replay metrics, rating buckets and current
 library status counts. Public summaries require a separate private-by-default
 `statistics_visibility` choice and use only explicitly public inputs. Owner preview
 applies the same rules. See [the statistics contract](docs/api.md#personal-statistics-and-explicitly-shared-summaries).
+
+Private following and the historical feed are available at `/api/me/following`
+and `/api/me/feed`. Follow/unfollow use the target's public profile UUID and
+idempotent PUT/DELETE. The feed reads live public reviews, notes and explicit
+playthrough-state summaries, in chosen-date order with cursor pagination;
+publication and edits create no new activity timestamps. Relationships remain
+private. See [the social API contract](docs/api.md#private-following-and-chronological-gaming-life-feed).

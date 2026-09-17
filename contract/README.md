@@ -284,3 +284,15 @@ to opt into a summary. This choice defaults private and omission/null preserves 
 Preview bypasses only the profile gate, so first select the public summary while
 the profile is disabled to preview it before enabling. Private inputs never affect
 public statistics. See [metric definitions and privacy](../docs/api.md#personal-statistics-and-explicitly-shared-summaries).
+
+Private social reads use `following(query)` and `feed(query)`; writes use
+idempotent `follow(publicProfileId)` / `unfollow(publicProfileId)` and return
+204. The generated `SocialPage<T>` has `limit`, `has_more`, and `next_cursor`;
+pass the cursor back as `after`. Following shows only currently public targets,
+ordered by stable public UUID. `FeedItem` discriminates `review`, `note`, and
+`milestone` payloads, identical to their direct public types. Key accumulated
+items by `(kind, item.id)` and use only `item.presentation_on` for chronology.
+Milestones represent one current chosen summary per run, not lifecycle audit
+events. All reads are live/no-store; refresh after date changes or changes to
+the followed set. See [the social API policy](../docs/api.md#private-following-and-chronological-gaming-life-feed)
+for hidden targets, null dates, cursor semantics and revocation.

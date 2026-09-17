@@ -1,3 +1,8 @@
+import type { FeedItem } from "./types/FeedItem";
+import type { FeedQuery } from "./types/FeedQuery";
+import type { FollowedProfile } from "./types/FollowedProfile";
+import type { FollowingQuery } from "./types/FollowingQuery";
+import type { SocialPage } from "./types/SocialPage";
 import type { Statistics } from "./types/Statistics";
 import type { StatisticsQuery } from "./types/StatisticsQuery";
 import type { GameList } from "./types/GameList";
@@ -457,3 +462,20 @@ export const publicStatistics = (profileId: string, query: StatisticsQuery = {})
 /** Applies the summary choice and public inputs, bypassing only the profile gate. */
 export const previewStatistics = (query: StatisticsQuery = {}): Promise<Statistics> =>
   request("GET", "/api/me/public-preview/statistics", { query });
+
+// --- Private following and historical feed --------------------------------
+
+export const following = (query: FollowingQuery = {}): Promise<SocialPage<FollowedProfile>> =>
+  request("GET", "/api/me/following", { query });
+
+/** Idempotent; target must be public. Your own profile can remain private. */
+export const follow = (profileId: string): Promise<void> =>
+  request("PUT", `/api/me/following/${encodeURIComponent(profileId)}`);
+
+/** Also succeeds for disabled, deleted, or already-unfollowed profiles. */
+export const unfollow = (profileId: string): Promise<void> =>
+  request("DELETE", `/api/me/following/${encodeURIComponent(profileId)}`);
+
+/** Live public components in chosen-date order; identity is (kind, item.id). */
+export const feed = (query: FeedQuery = {}): Promise<SocialPage<FeedItem>> =>
+  request("GET", "/api/me/feed", { query });

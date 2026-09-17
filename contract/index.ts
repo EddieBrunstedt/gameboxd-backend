@@ -91,3 +91,9 @@ export type { Statistics } from "./types/Statistics";
 export type { StatisticsQuery } from "./types/StatisticsQuery";
 export type { PlaythroughStatistics } from "./types/PlaythroughStatistics";
 export type { RatingBucket } from "./types/RatingBucket";
+
+export type { FeedItem } from "./types/FeedItem";
+export type { FeedQuery } from "./types/FeedQuery";
+export type { FollowedProfile } from "./types/FollowedProfile";
+export type { FollowingQuery } from "./types/FollowingQuery";
+export type { SocialPage } from "./types/SocialPage";
