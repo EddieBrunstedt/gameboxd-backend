@@ -1,7 +1,12 @@
 #!/usr/bin/env bash
 # Runs the same checks as CI. Pass --database to include the PostgreSQL
 # integration tests, which need TEST_DATABASE_URL (see .env.example).
+# --restore runs the separate backup drill and requires PostgreSQL 17 clients.
 set -euo pipefail
+case "${1:-}" in
+    ""|--database|--restore) ;;
+    *) echo "Usage: scripts/verify.sh [--database|--restore]" >&2; exit 2 ;;
+esac
 cd "$(dirname "$0")/.."
 
 cargo fmt --all -- --check
@@ -20,5 +25,9 @@ else
 fi
 
 if [ "${1:-}" = "--database" ]; then
-    cargo test --locked --test backend -- --ignored
+    cargo test --locked --test backend -- --ignored --skip launch_backup_restore
+fi
+
+if [ "${1:-}" = "--restore" ]; then
+    cargo test --locked --test backend launch_backup_restore -- --ignored
 fi

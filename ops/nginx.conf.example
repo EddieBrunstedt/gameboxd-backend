@@ -1,0 +1,51 @@
+# Template inside nginx http {}; replace host, cert paths and SPA root.
+# ONE internet-facing edge on the backend host. No CDN/LB in front of this.
+# Backend: BIND_ADDR=127.0.0.1:3000 TRUSTED_PROXY_IPS=127.0.0.1
+# FRONTEND_ORIGIN=https://gameboxd.example RP_ID=gameboxd.example APP_ENV=production
+# Logs deliberately omit query strings (email verification tokens), headers, bodies.
+log_format gameboxd '$time_iso8601 $request_method $uri $status $request_time';
+limit_req_zone $binary_remote_addr zone=gameboxd_edge:10m rate=10r/s;
+limit_conn_zone $binary_remote_addr zone=gameboxd_connections:10m;
+server {
+    listen 443 ssl;
+    server_name gameboxd.example;
+    ssl_certificate /etc/gameboxd/tls/fullchain.pem;
+    ssl_certificate_key /etc/gameboxd/tls/privkey.pem;
+    access_log /var/log/nginx/gameboxd.log gameboxd;
+    # nginx request error messages can contain the full token-bearing URL.
+    # Monitor access-log status/latency and application errors instead.
+    error_log /dev/null;
+    add_header Cache-Control "no-store" always;
+    add_header Strict-Transport-Security "max-age=31536000" always;
+    add_header Referrer-Policy "no-referrer" always;
+    client_max_body_size 64k;
+    client_body_timeout 15s;
+    limit_req zone=gameboxd_edge burst=30 nodelay;
+    limit_req_status 429;
+    limit_conn gameboxd_connections 32;
+    limit_conn_status 429;
+    root /srv/gameboxd/frontend;
+    location / { try_files $uri /index.html; }
+    # Temporary acceptance harness: expose only in controlled staging, remove after.
+    # location /acceptance/ { alias /srv/gameboxd/acceptance/; }
+    location ~ ^/(api|auth|health)(/|$) {
+        location ~ ^/api/me/import(/preview)?$ {
+            client_max_body_size 32m;
+            proxy_pass http://127.0.0.1:3000;
+        }
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $remote_addr;
+        proxy_set_header Forwarded "";
+        proxy_set_header X-Real-IP "";
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header Connection "";
+        proxy_hide_header Cache-Control;
+        proxy_cache off;
+        proxy_no_cache 1;
+        proxy_cache_bypass 1;
+        proxy_read_timeout 120s;
+        proxy_send_timeout 30s;
+    }
+}

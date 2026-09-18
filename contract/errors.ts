@@ -155,6 +155,7 @@ export function isRecoveryCooldown(error: unknown): boolean {
 // (wording, localisation). The server keys are the codes doorman-axum emits;
 // the rest are the browser-side ceremony outcomes above.
 export const ERROR_GUIDANCE: Record<string, string> = {
+  invalid_client_ip: "The server proxy is misconfigured. Contact the operator.",
   favorites_exists: "Your favorites list already exists. Edit that list instead.",
   handle_unavailable: "That handle is unavailable. Choose another name.",
   import_conflict: "Nothing was imported. Resolve the reported conflicts and preview the archive again.",

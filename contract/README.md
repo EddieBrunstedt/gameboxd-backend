@@ -334,3 +334,9 @@ starting a new operation. Do not automatically choose a fresh key after either
 409. Retry matching-key contention (`database_unavailable`, 503) with backoff and
 the same key. Import source-record deduplication persists beyond receipt expiry.
 See [the complete recovery contract](../docs/api.md#retry-safe-creation-and-request-recovery).
+
+Admission errors include `rate_limited` (429, respect `Retry-After`) and
+`invalid_client_ip` (400, operator proxy configuration issue). Preserve the same
+idempotency key and original input when retrying uncertain writes. The temporary
+browser acceptance harness in `ops/acceptance` compiles the real auth adapter;
+see [launch operations](../docs/operations.md).

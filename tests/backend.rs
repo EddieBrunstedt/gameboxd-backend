@@ -34,6 +34,14 @@ use tower::ServiceExt;
 use uuid::Uuid;
 use wiremock::{Mock, MockServer, ResponseTemplate, matchers::path};
 
+// Domain tests deliberately use distinct transport clients so burst traffic
+// does not obscure transactional assertions. Admission tests below use fixed IPs.
+fn test_peer() -> SocketAddr {
+    static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+    let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    SocketAddr::new(std::net::IpAddr::V4((0x0a00_0000 | n).into()), 12345)
+}
+
 struct Fixture {
     name: String,
     admin: PgPool,
@@ -58,6 +66,10 @@ impl Fixture {
     }
 
     async fn build(refresh: bool) -> Self {
+        Self::build_with_proxies(refresh, vec![]).await
+    }
+
+    async fn build_with_proxies(refresh: bool, trusted_proxy_ips: Vec<std::net::IpAddr>) -> Self {
         dotenvy::dotenv().ok();
         let url = std::env::var("TEST_DATABASE_URL").expect(
             "Set TEST_DATABASE_URL to a PostgreSQL account with CREATE DATABASE permission",
@@ -84,6 +96,7 @@ impl Fixture {
         restarted.app.close().await;
         restarted.auth.pool().close().await;
         let config = Config {
+            trusted_proxy_ips,
             bind_addr: "127.0.0.1:3000".parse().unwrap(),
             database_url: test_url.to_string(),
             frontend_origin: "http://localhost:5173".parse().unwrap(),
@@ -187,9 +200,7 @@ impl Fixture {
         let mut request = Request::builder()
             .method(method)
             .uri(path)
-            .extension(ConnectInfo(
-                "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
-            ))
+            .extension(ConnectInfo(test_peer()))
             .header("Content-Type", "application/json");
         if let Some(token) = token {
             request = request.header("Authorization", format!("Bearer {token}"));
@@ -211,9 +222,7 @@ impl Fixture {
         let request = Request::builder()
             .method("POST")
             .uri(path)
-            .extension(ConnectInfo(
-                "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
-            ))
+            .extension(ConnectInfo(test_peer()))
             .header("Content-Type", content_type)
             .header("Authorization", format!("Bearer {token}"))
             .body(Body::from(body.to_owned()))
@@ -1566,6 +1575,7 @@ async fn browser_security_validation_and_account_deletion_cascade() {
     let (id, token) = fixture.user("browser").await;
     for origin in [None, Some("https://evil.example")] {
         let mut request = Request::builder()
+            .extension(ConnectInfo(test_peer()))
             .method("PUT")
             .uri("/api/me")
             .header("Cookie", format!("gameboxd_session={token}"))
@@ -1587,6 +1597,7 @@ async fn browser_security_validation_and_account_deletion_cascade() {
         assert_eq!(body["error"]["code"], "csrf_origin_mismatch");
     }
     let request = Request::builder()
+        .extension(ConnectInfo(test_peer()))
         .method("PUT")
         .uri("/api/me")
         .header("Cookie", format!("gameboxd_session={token}"))
@@ -1617,6 +1628,7 @@ async fn browser_security_validation_and_account_deletion_cascade() {
 
     // Conditional and retry-protected writes must survive browser preflight.
     let preflight = Request::builder()
+        .extension(ConnectInfo(test_peer()))
         .method("OPTIONS")
         .uri("/api/me/playthroughs/00000000-0000-0000-0000-000000000000")
         .header("Origin", "http://localhost:5173")
@@ -1637,6 +1649,7 @@ async fn browser_security_validation_and_account_deletion_cascade() {
     assert!(headers.contains("idempotency-key"), "{headers}");
 
     let preflight = Request::builder()
+        .extension(ConnectInfo(test_peer()))
         .method("OPTIONS")
         .uri("/api/me")
         .header("Origin", "http://localhost:5173")
@@ -10967,5 +10980,426 @@ async fn retry_contention_is_bounded_and_cancelled_requests_release_reservations
         .await
         .unwrap();
     assert_eq!(count, 2);
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL and local sockets"]
+async fn launch_trusted_proxy_socket_limits_and_audit_use_verified_client() {
+    let f = Fixture::build_with_proxies(false, vec!["127.0.0.1".parse().unwrap()]).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let app = f.app.clone();
+    let (shutdown, stopping) = tokio::sync::oneshot::channel();
+    let serving = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async {
+            stopping.await.ok();
+        })
+        .await
+        .unwrap();
+    });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    // Broken proxy headers fail before any provider or auth operation.
+    for header in [None, Some("203.0.113.1, 127.0.0.1"), Some("unknown")] {
+        let mut request = client.get(format!("{base}/api/catalog/games/42"));
+        if let Some(h) = header {
+            request = request.header("x-forwarded-for", h);
+        }
+        let response = request.send().await.unwrap();
+        assert_eq!(response.status(), 400);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert_eq!(
+            response.json::<Value>().await.unwrap()["error"]["code"],
+            "invalid_client_ip"
+        );
+    }
+    assert!(f.server.received_requests().await.unwrap().is_empty());
+    let started = Instant::now();
+    for number in 0..6 {
+        // Two genuine provider reads and invalid requests consume one budget.
+        let route = if number < 2 {
+            "/api/catalog/games/42"
+        } else {
+            "/api/catalog/search?q="
+        };
+        let response = client
+            .get(format!("{base}{route}"))
+            .header(
+                "x-forwarded-for",
+                if number % 2 == 0 {
+                    "203.0.113.1"
+                } else {
+                    "::ffff:203.0.113.1"
+                },
+            )
+            .header("forwarded", format!("for=198.51.100.{number}"))
+            .send()
+            .await
+            .unwrap();
+        if number == 5 {
+            assert_eq!(response.status(), 429);
+            assert_eq!(response.headers()["cache-control"], "no-store");
+            assert!(!response.headers().contains_key("etag"));
+            assert!(
+                response.headers()["retry-after"]
+                    .to_str()
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+                    > 0
+            );
+            assert_eq!(
+                response.json::<Value>().await.unwrap()["error"]["code"],
+                "rate_limited"
+            );
+        } else {
+            assert_eq!(response.status(), if number < 2 { 200 } else { 400 });
+        }
+    }
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "must finish before catalog token replenishes"
+    );
+    let calls = f.server.received_requests().await.unwrap();
+    assert_eq!(calls.iter().filter(|r| r.url.path() == "/games").count(), 2);
+    assert_eq!(
+        client
+            .get(format!("{base}/api/catalog/games/42"))
+            .header("x-forwarded-for", "203.0.113.2")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    // The same typed IP reaches Doorman's own limiter and persisted audit sink.
+    for number in 0..61 {
+        let response = client
+            .post(format!("{base}{AUTHENTICATE_START}"))
+            .header("x-forwarded-for", "203.0.113.3")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), if number < 60 { 200 } else { 429 });
+    }
+    assert_eq!(
+        client
+            .post(format!("{base}{AUTHENTICATE_START}"))
+            .header("x-forwarded-for", "203.0.113.4")
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    assert_eq!(
+        client
+            .post(format!("{base}/auth/signup/request"))
+            .header("x-forwarded-for", "203.0.113.5")
+            .header("user-agent", "trusted-edge-acceptance")
+            .json(&json!({"email":"launch-acceptance@example.test"}))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        204
+    );
+    let events: Vec<sqlx::types::Json<doorman::core::audit::AuditEvent>> =
+        sqlx::query_scalar("SELECT event FROM auth_audit_events")
+            .fetch_all(&f.database.app)
+            .await
+            .unwrap();
+    assert!(
+        events.iter().any(
+            |e| matches!(&e.0.actor, Actor::Subject { ip: Some(ip), .. } if ip == "203.0.113.5")
+        )
+    );
+    // More expensive writes are gated even when authentication fails.
+    for (route, burst) in [
+        ("/api/me/reports", 5),
+        ("/api/me/import/preview", 2),
+        ("/api/me/publication", 120),
+    ] {
+        for number in 0..=burst {
+            let response = client
+                .request(
+                    if burst == 120 {
+                        reqwest::Method::PUT
+                    } else {
+                        reqwest::Method::POST
+                    },
+                    format!("{base}{route}"),
+                )
+                .header("x-forwarded-for", format!("203.0.113.{}", burst + 10))
+                .json(&json!({}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                if number < burst { 401 } else { 429 },
+                "{route}, {number}"
+            );
+        }
+    }
+    assert_eq!(
+        client
+            .get(format!("{base}/health/ready"))
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        200
+    );
+    shutdown.send(()).unwrap();
+    serving.await.unwrap();
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn launch_auth_audit_retention_is_bounded_and_preserves_recent_events() {
+    let f = Fixture::new().await;
+    sqlx::raw_sql("INSERT INTO auth_audit_events(occurred_at,event) VALUES (now()-interval '91 days','{}'),(now()-interval '89 days','{}'),(now(),'{}')").execute(&f.database.app).await.unwrap();
+    gameboxd_backend::db::purge_auth_audit(&f.database.app)
+        .await
+        .unwrap();
+    gameboxd_backend::db::purge_auth_audit(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM auth_audit_events")
+            .fetch_one(&f.database.app)
+            .await
+            .unwrap(),
+        2
+    );
+    f.finish().await;
+}
+
+/// Invoked separately by verify.sh --restore; needs PostgreSQL 17 client tools.
+#[tokio::test]
+#[ignore = "requires PostgreSQL and pg_dump/pg_restore/psql/createdb/dropdb on PATH"]
+async fn launch_backup_restore_preserves_all_tables_and_application_behavior() {
+    let f = Fixture::new().await;
+    let (owner, token) = f.user("backup-owner").await;
+    let archive = transfer_archive(&f, owner, &token).await;
+    let (_, imported) = f.user("backup-imported").await;
+    f.value(
+        "POST",
+        "/api/me/import",
+        &imported,
+        transfer_input(&archive),
+        StatusCode::OK,
+    )
+    .await;
+    let input = json!({"title":"Backup receipt","description":"private","kind":"custom"});
+    let response = f
+        .send(
+            "POST",
+            "/api/me/lists",
+            Some(&token),
+            &[("Idempotency-Key", "backup-receipt")],
+            input,
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let original_response = to_bytes(response.into_body(), 1_000_000).await.unwrap();
+    sqlx::raw_sql("INSERT INTO auth_audit_events(occurred_at,event) VALUES(now(),'{}')")
+        .execute(&f.database.app)
+        .await
+        .unwrap();
+    // Fingerprints compare ALL restored rows, including auth, revisions, receipt
+    // bodies, import tombstones and both migration histories, without logging data.
+    let tables: Vec<(String, String)> = sqlx::query_as("SELECT schemaname,tablename FROM pg_tables WHERE schemaname IN ('gameboxd','gameboxd_auth') ORDER BY 1,2")
+        .fetch_all(&f.database.app).await.unwrap();
+    let mut fingerprints = Vec::new();
+    for (schema, table) in &tables {
+        let query = format!(
+            "SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text),'[]'::jsonb) FROM \"{schema}\".\"{table}\" t"
+        );
+        let rows: Value = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
+            .fetch_one(&f.database.app)
+            .await
+            .unwrap();
+        fingerprints.push(rows);
+    }
+    let dir =
+        std::env::temp_dir().join(format!("gameboxd_backup_test_{}", Uuid::new_v4().simple()));
+    std::fs::create_dir(&dir).unwrap();
+    let options = url::Url::parse(&std::env::var("TEST_DATABASE_URL").unwrap()).unwrap();
+    let command = |name: &str| {
+        let mut cmd = std::process::Command::new(name);
+        cmd.env("PGHOST", options.host_str().unwrap())
+            .env("PGPORT", options.port().unwrap_or(5432).to_string())
+            .env("PGUSER", options.username())
+            .env("PGPASSWORD", options.password().unwrap_or(""))
+            .env("PGDATABASE", &f.name);
+        cmd
+    };
+    let backup = command("scripts/backup.sh").arg(&dir).output().unwrap();
+    assert!(
+        backup.status.success(),
+        "backup failed: {}",
+        String::from_utf8_lossy(&backup.stderr)
+    );
+    let dump = String::from_utf8(backup.stdout).unwrap().trim().to_owned();
+    let check = command("scripts/restore-check.sh")
+        .arg(&dump)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "restore check failed: {}",
+        String::from_utf8_lossy(&check.stderr)
+    );
+    // A corrupted artifact must be rejected before any restore is attempted.
+    let original_dump = std::fs::read(&dump).unwrap();
+    let mut corrupted = original_dump.clone();
+    corrupted.push(0);
+    std::fs::write(&dump, corrupted).unwrap();
+    let rejected = command("scripts/restore-check.sh")
+        .arg(&dump)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success(), "corrupted backup was accepted");
+    std::fs::write(&dump, original_dump).unwrap();
+    let name = format!("gameboxd_restore_test_{}", Uuid::new_v4().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {name} TEMPLATE template0"
+    )))
+    .execute(&f.admin)
+    .await
+    .unwrap();
+    let restore = command("pg_restore")
+        .args([
+            "--exit-on-error",
+            "--single-transaction",
+            "--no-owner",
+            "--no-acl",
+            "--dbname",
+            &name,
+            &dump,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        restore.status.success(),
+        "restore failed: {}",
+        String::from_utf8_lossy(&restore.stderr)
+    );
+    let mut restored_url = options.clone();
+    restored_url.set_path(&name);
+    let restored = Database::connect(restored_url.as_str()).await.unwrap();
+    for ((schema, table), expected) in tables.iter().zip(fingerprints) {
+        let query = format!(
+            "SELECT coalesce(jsonb_agg(to_jsonb(t) ORDER BY to_jsonb(t)::text),'[]'::jsonb) FROM \"{schema}\".\"{table}\" t"
+        );
+        let actual: Value = sqlx::query_scalar(sqlx::AssertSqlSafe(query))
+            .fetch_one(&restored.app)
+            .await
+            .unwrap();
+        assert!(actual == expected, "restored {schema}.{table} differs");
+    }
+    // Application startup reapplies no migrations; stored public reads and private
+    // exports work offline, and original session + receipt recovery still work.
+    let config = Config {
+        trusted_proxy_ips: vec![],
+        bind_addr: "127.0.0.1:3000".parse().unwrap(),
+        database_url: restored_url.to_string(),
+        frontend_origin: "http://localhost:5173".parse().unwrap(),
+        rp_id: "localhost".into(),
+        cookie_same_site: cookie::SameSite::Lax,
+        production: false,
+        igdb_credentials: None,
+        smtp: None,
+    };
+    let auth = auth::build(&config, &restored.auth, restored.app.clone()).unwrap();
+    let app = router(
+        &config,
+        AppState {
+            pool: restored.app.clone(),
+            igdb: IgdbClient::new(None, Endpoints::default()).unwrap(),
+            refresher: Refresher::disabled(),
+        },
+        &auth,
+    );
+    for (route, expected) in [
+        ("/api/me/export".to_owned(), Some(archive)),
+        (format!("/api/public/reviews/{}", Uuid::from_u128(10)), None),
+    ] {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(route)
+                    .extension(ConnectInfo(test_peer()))
+                    .header("Authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let body = json_body(response, StatusCode::OK).await;
+        if let Some(mut expected) = expected {
+            // The additional list is deliberately created after the reference export.
+            let mut body = body;
+            expected["lists"]
+                .as_array_mut()
+                .unwrap()
+                .sort_by_key(|v| v["id"].to_string());
+            body["lists"]
+                .as_array_mut()
+                .unwrap()
+                .retain(|v| v["title"] != "Backup receipt");
+            body["lists"]
+                .as_array_mut()
+                .unwrap()
+                .sort_by_key(|v| v["id"].to_string());
+            assert_eq!(body, expected);
+        } else {
+            assert_eq!(body["presentation_on"], "2020-02-29");
+            assert!(body.get("revision").is_none());
+        }
+    }
+    let response = app
+        .clone()
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/api/me/lists")
+                .extension(ConnectInfo(test_peer()))
+                .header("Authorization", format!("Bearer {token}"))
+                .header("Content-Type", "application/json")
+                .header("Idempotency-Key", "backup-receipt")
+                .body(Body::from(
+                    r#"{"title":"Backup receipt","description":"private","kind":"custom"}"#,
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    assert_eq!(
+        to_bytes(response.into_body(), 1_000_000).await.unwrap(),
+        original_response
+    );
+    drop(app);
+    drop(auth);
+    restored.app.close().await;
+    restored.auth.pool().close().await;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP DATABASE {name}")))
+        .execute(&f.admin)
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(dir).unwrap();
     f.finish().await;
 }

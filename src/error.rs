@@ -38,12 +38,14 @@ pub enum ErrorCode {
     IgdbUnavailable,
     IgdbRateLimited,
     CatalogBusy,
+    RateLimited,
+    InvalidClientIp,
 }
 
 impl ErrorCode {
     /// Every variant, so a test can assert the documented list is complete.
     /// A new code added above without a line in `docs/api.md` fails there.
-    pub const ALL: [Self; 22] = [
+    pub const ALL: [Self; 24] = [
         Self::ValidationError,
         Self::InvalidJson,
         Self::NotFound,
@@ -66,6 +68,8 @@ impl ErrorCode {
         Self::IgdbUnavailable,
         Self::IgdbRateLimited,
         Self::CatalogBusy,
+        Self::RateLimited,
+        Self::InvalidClientIp,
     ];
 
     /// The wire spelling, for logs and for tests that assert on a code.
@@ -93,6 +97,8 @@ impl ErrorCode {
             Self::IgdbUnavailable => "igdb_unavailable",
             Self::IgdbRateLimited => "igdb_rate_limited",
             Self::CatalogBusy => "catalog_busy",
+            Self::RateLimited => "rate_limited",
+            Self::InvalidClientIp => "invalid_client_ip",
         }
     }
 }

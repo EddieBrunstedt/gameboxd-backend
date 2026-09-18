@@ -1,4 +1,7 @@
-use std::{env, net::SocketAddr};
+use std::{
+    env,
+    net::{IpAddr, SocketAddr},
+};
 
 use anyhow::{Context, bail};
 use cookie::SameSite;
@@ -6,6 +9,8 @@ use url::Url;
 
 #[derive(Clone)]
 pub struct Config {
+    /// Exact peers allowed to supply a single overwritten X-Forwarded-For.
+    pub trusted_proxy_ips: Vec<IpAddr>,
     pub bind_addr: SocketAddr,
     pub database_url: String,
     pub frontend_origin: Url,
@@ -62,6 +67,15 @@ impl Config {
             }
         };
         let config = Self {
+            trusted_proxy_ips: optional("TRUSTED_PROXY_IPS")
+                .map(|s| {
+                    s.split(',')
+                        .map(|v| v.trim().parse::<IpAddr>())
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .transpose()
+                .context("TRUSTED_PROXY_IPS must be comma-separated IP addresses (no CIDRs)")?
+                .unwrap_or_default(),
             bind_addr: env::var("BIND_ADDR")
                 .unwrap_or("127.0.0.1:3000".into())
                 .parse()?,

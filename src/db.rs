@@ -61,3 +61,11 @@ pub async fn purge_request_receipts(pool: &PgPool) -> Result<(), sqlx::Error> {
         .execute(pool).await?;
     Ok(())
 }
+
+/// Auth audit events contain IPs and identifiers; keep a bounded 90-day window.
+pub async fn purge_auth_audit(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM auth_audit_events WHERE occurred_at <= now() - interval '90 days'")
+        .execute(pool)
+        .await?;
+    Ok(())
+}

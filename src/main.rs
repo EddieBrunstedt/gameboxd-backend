@@ -52,9 +52,13 @@ async fn main() -> anyhow::Result<()> {
             {
                 tracing::error!(%error, "Request receipt cleanup failed");
             }
+            if let Err(error) = gameboxd_backend::db::purge_auth_audit(&moderation_pool).await {
+                tracing::error!(%error, "Authentication audit cleanup failed");
+            }
             if let Err(error) = auth.purge_expired(chrono::Utc::now()).await {
                 tracing::error!(%error, "Expired authentication data cleanup failed");
             }
+            tracing::info!("Maintenance cycle completed");
         }
     });
     // Doorman requires this socket metadata for rate limits and recorded client IPs.

@@ -1,0 +1,19 @@
+# Install only after configuring an encrypted destination and offsite copy job.
+[Unit]
+Description=Gameboxd whole-database backup
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=gameboxd-backup
+Group=gameboxd-backup
+EnvironmentFile=/etc/gameboxd/backup.env
+UMask=0077
+ExecStart=/srv/gameboxd/backend/scripts/backup.sh /var/backups/gameboxd
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/backups/gameboxd
+TimeoutStartSec=1h

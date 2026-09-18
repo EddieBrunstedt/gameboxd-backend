@@ -6,6 +6,7 @@ pub mod error;
 pub mod igdb;
 pub mod models;
 pub mod refresh;
+pub mod traffic;
 
 use axum::{
     Json, Router,
@@ -77,6 +78,7 @@ pub fn router(config: &Config, state: AppState, auth: &AuthService) -> Router {
         .fallback(|| async { ApiError::not_found() })
         .method_not_allowed_fallback(|| async { ApiError::new(StatusCode::METHOD_NOT_ALLOWED, ErrorCode::MethodNotAllowed, "Method not allowed") })
         .layer(DefaultBodyLimit::max(64 * 1024))
+        .layer(middleware::from_fn_with_state(traffic::Traffic::new(config.trusted_proxy_ips.clone()), traffic::admit))
         .layer(middleware::from_fn(response_policy))
         .layer(cors)
         .layer(PropagateRequestIdLayer::new(request_id.clone()))
@@ -101,6 +103,12 @@ async fn ready(State(state): State<AppState>) -> Response {
 }
 
 async fn response_policy(request: Request, next: Next) -> Response {
+    let started = std::time::Instant::now();
+    let route = request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map(|p| p.as_str().to_owned())
+        .unwrap_or_else(|| "unmatched".into());
     let public_content = request.uri().path().starts_with("/api/public/")
         || request.uri().path() == "/api/me/feed"
         || request.uri().path() == "/api/me/following"
@@ -108,6 +116,12 @@ async fn response_policy(request: Request, next: Next) -> Response {
         || request.uri().path() == "/api/me/public-preview"
         || request.uri().path().starts_with("/api/me/public-preview/");
     let mut response = next.run(request).await;
+    tracing::info!(
+        route,
+        status = response.status().as_u16(),
+        duration_ms = started.elapsed().as_millis() as u64,
+        "Request completed"
+    );
     // Normalize Axum's text rejections (including those inside Doorman) without
     // rewriting Doorman's existing JSON machine-readable error codes.
     let json = response

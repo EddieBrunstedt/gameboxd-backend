@@ -362,7 +362,7 @@ page after such edits. Catalog/local-game pagination is unchanged.
 {"error":{"code":"validation_error","message":"rating must be an integer from 1 to 10, or null"}}
 ```
 
-Application error codes are exactly `validation_error`, `invalid_json`, `not_found`, `method_not_allowed`, `precondition_required`, `precondition_failed`, `lifecycle_conflict`, `import_conflict`, `idempotency_conflict`, `idempotency_expired`, `forbidden`, `moderation_restricted`, `report_limit`, `handle_unavailable`, `favorites_exists`, `request_rejected`, `internal_error`, `database_unavailable`, `igdb_not_configured`, `igdb_unavailable`, `igdb_rate_limited`, `catalog_busy` — a closed set, published as a TypeScript union and checked against this list by `tests/contract.rs`. Validation is generally 400; malformed JSON/schema/content type retains Axum's 400/422/415 status; oversized bodies return 413.
+Application error codes are exactly `validation_error`, `invalid_json`, `not_found`, `method_not_allowed`, `precondition_required`, `precondition_failed`, `lifecycle_conflict`, `import_conflict`, `idempotency_conflict`, `idempotency_expired`, `forbidden`, `moderation_restricted`, `report_limit`, `handle_unavailable`, `favorites_exists`, `request_rejected`, `internal_error`, `database_unavailable`, `igdb_not_configured`, `igdb_unavailable`, `igdb_rate_limited`, `catalog_busy`, `rate_limited`, `invalid_client_ip` — a closed set, published as a TypeScript union and checked against this list by `tests/contract.rs`. Validation is generally 400; malformed JSON/schema/content type retains Axum's 400/422/415 status; oversized bodies return 413.
 
 ### Field-level errors
 
@@ -1446,7 +1446,7 @@ deliberately using a new key; do not automatically replace an expired key on
 failure. Individual item deletion does not erase its receipt: its original
 private response can still be recovered during this seven-day window, but it
 cannot recreate the item. Account deletion cascades all receipts and tombstones.
-Backup retention is governed separately by deployment operations (feature 13).
+Backup retention policy is documented in launch operations (feature 13); actual production provisioning and acceptance are feature 14.
 
 Import receipts replay the original apply report, while permanent owner/source
 provenance still prevents duplicates, overwrites or resurrection when applying
@@ -1461,3 +1461,25 @@ lost response read the decision/audit, and reconcile a 412. These operations do
 not use the new header. Doorman authentication ceremonies retain their own
 challenge/recovery contracts. General request keys do not replace revision
 protection, import provenance, or those existing domain protections.
+
+
+## Client identity and abuse admission
+
+All application routes pass through per-client admission before authentication,
+body parsing and provider/database work. Catalog search/detail/import share a
+5-request burst, 30/minute refill and two concurrent requests per client. All
+requests also share a 600-request burst/refill per minute and 32 concurrent slots;
+application writes have 120/minute/burst and eight slots, transfers share a
+2-request burst, 6/minute refill and one slot, and reports have a 5-request burst,
+10/minute refill and two slots. IPv4 uses canonical IPs; native IPv6 uses /64.
+Publication, social and operator writes are included. Health and OPTIONS are exempt.
+These are single-process budgets; resource ownership, report account quotas,
+Doorman limits, revision checks and idempotency remain independent.
+
+`429 rate_limited` includes `Retry-After` in seconds; respect it and retain original
+idempotency keys/input for uncertain writes. Admission may reject even an invalid
+or unauthenticated request and never mutates domain data. No-store/CORS policies
+also apply to admission errors. NAT clients share budgets. Trusted proxy setup
+errors return `400 invalid_client_ip`; missing server socket metadata is a 500.
+See [launch operations](operations.md) for the exact identity policy, bounded
+registry, edge cache configuration, backup/retention and release acceptance.

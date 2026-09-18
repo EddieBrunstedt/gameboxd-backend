@@ -349,6 +349,7 @@ fn library_and_playthrough_inputs_enforce_their_separate_contracts() {
 #[test]
 fn configuration_rejects_unsafe_browser_origins() {
     let mut config = Config {
+        trusted_proxy_ips: vec![],
         bind_addr: "127.0.0.1:3000".parse().unwrap(),
         database_url: "unused".into(),
         frontend_origin: "http://localhost:5173".parse().unwrap(),
@@ -383,6 +384,7 @@ fn configuration_rejects_unsafe_browser_origins() {
 #[test]
 fn a_cross_site_cookie_must_also_be_secure() {
     let mut config = Config {
+        trusted_proxy_ips: vec![],
         bind_addr: "127.0.0.1:3000".parse().unwrap(),
         database_url: "unused".into(),
         frontend_origin: "http://localhost:5173".parse().unwrap(),

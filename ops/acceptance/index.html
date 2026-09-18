@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width"><meta name="referrer" content="no-referrer">
+<title>Gameboxd authentication acceptance</title>
+<style>body{font:16px system-ui;max-width:56rem;margin:3rem auto;padding:1rem}button,input,select{font:inherit;margin:.4rem;padding:.5rem}label{display:block}pre{white-space:pre-wrap}input{width:30rem;max-width:85%}</style>
+<h1>Authentication acceptance</h1>
+<p>Controlled staging only. Uses the backend contract and real browser passkeys. Use disposable test accounts. Tokens and response bodies are never displayed or persisted.</p>
+<label>Email <input id="email" type="email" autocomplete="off"></label>
+<label>Email-link token <input id="token" type="password" autocomplete="off"></label>
+<label>Passkey name <input id="name" value="Acceptance passkey"></label>
+<label>Passkey credential ID or session ID <input id="id" autocomplete="off"></label>
+<label>Operation <select id="operation">
+<option value="requestSignup">Request signup email</option><option value="finishSignup">Finish signup with passkey</option>
+<option value="authenticatePasskey">Sign in with passkey</option><option value="logout">Sign out</option>
+<option value="requestRecovery">Request recovery email</option><option value="finishRecovery">Finish recovery with new passkey</option>
+<option value="registerPasskey">Add passkey</option><option value="listPasskeys">List passkey IDs</option>
+<option value="deletePasskey">Remove specified passkey (step-up)</option><option value="listSessions">List session IDs</option>
+<option value="revokeSession">Revoke specified session</option><option value="revokeOtherSessions">Revoke other sessions</option>
+<option value="logoutEverywhere">Sign out everywhere</option><option value="requestEmailChange">Request email change (step-up)</option>
+<option value="confirmEmailChange">Confirm email change</option><option value="deleteAccount">Delete disposable account (step-up)</option>
+</select></label>
+<button id="run">Run selected operation</button><pre id="result" aria-live="polite"></pre>
+<script type="module" src="./main.js"></script></html>
