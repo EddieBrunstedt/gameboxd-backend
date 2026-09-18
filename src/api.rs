@@ -20,6 +20,7 @@ mod browsing;
 mod lists;
 mod moderation;
 mod notes;
+mod retry;
 use browsing::{BrowsePage, BrowseQuery, Kind};
 mod profiles;
 mod sharing;
@@ -880,7 +881,7 @@ impl PlaythroughPatch {
 /// or an impossible `started_on` could not be reported against the field that
 /// sent it. The conversion below destructures exhaustively, so the two bodies
 /// cannot quietly drift apart.
-#[derive(Deserialize, TS)]
+#[derive(Deserialize, TS, Serialize)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
 pub struct CreatePlaythroughInput {
@@ -1081,15 +1082,24 @@ async fn playthrough(
 async fn create_playthrough(
     user: AuthUser,
     State(state): State<AppState>,
+    headers: HeaderMap,
     payload: Result<Body<CreatePlaythroughInput>, ApiError>,
-) -> ApiResult<(StatusCode, Tagged)> {
+) -> ApiResult<Response> {
     let input = body(payload)?;
+    let receipt = retry::Receipt::new(&headers, "playthrough:create", &input)?;
     if input.igdb_id <= 0 {
         return Err(ApiError::invalid("IGDB ID must be positive"));
     }
     let igdb_id = input.igdb_id;
     let fields = PlaythroughFields::from(input).validated()?;
+    if let Some(response) = receipt.cached(&state.pool, user.0.id.0.as_bytes()).await? {
+        return Ok(response);
+    }
     let game = attach_game(&state.pool, &state.igdb, &state.refresher, igdb_id).await?;
+    let mut tx = state.pool.begin().await?;
+    if let Some(response) = receipt.replay(&mut tx, user.0.id.0.as_bytes()).await? {
+        return Ok(response);
+    }
     let row = sqlx::query_as(
         "INSERT INTO playthroughs (id,user_id,game_id,rating,review,started_on,finished_on,platform,presentation_on,state)
          VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *, $11::bigint AS igdb_id",
@@ -1097,8 +1107,14 @@ async fn create_playthrough(
     .bind(Uuid::new_v4()).bind(user.0.id.0.as_bytes().as_slice()).bind(game.id)
     .bind(fields.rating).bind(fields.review).bind(fields.started_on)
     .bind(fields.finished_on).bind(fields.platform).bind(fields.presentation_on).bind(fields.state)
-    .bind(igdb_id).fetch_one(&state.pool).await?;
-    Ok((StatusCode::CREATED, Tagged(row)))
+    .bind(igdb_id).fetch_one(&mut *tx).await?;
+    receipt
+        .finish(
+            tx,
+            user.0.id.0.as_bytes(),
+            (StatusCode::CREATED, Tagged(row)),
+        )
+        .await
 }
 
 async fn replace_playthrough(
@@ -1290,7 +1306,7 @@ async fn lock_playthrough_game(
     Ok(false)
 }
 
-#[derive(Deserialize, TS)]
+#[derive(Deserialize, TS, Serialize)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
 pub struct StartPlaythroughInput {
@@ -1302,9 +1318,11 @@ pub struct StartPlaythroughInput {
 async fn start_playthrough(
     user: AuthUser,
     State(state): State<AppState>,
+    headers: HeaderMap,
     payload: Result<Body<StartPlaythroughInput>, ApiError>,
-) -> ApiResult<(StatusCode, Tagged)> {
+) -> ApiResult<Response> {
     let input = body(payload)?;
+    let receipt = retry::Receipt::new(&headers, "playthrough:start", &input)?;
     if input.igdb_id <= 0 {
         return Err(ApiError::invalid("IGDB ID must be positive"));
     }
@@ -1318,9 +1336,18 @@ async fn start_playthrough(
         platform: input.platform,
     }
     .validated()?;
+    if let Some(response) = receipt.cached(&state.pool, user.0.id.0.as_bytes()).await? {
+        return Ok(response);
+    }
     let game = attach_game(&state.pool, &state.igdb, &state.refresher, input.igdb_id).await?;
-    let owner = user.0.id.0.as_bytes().as_slice();
     let mut transaction = state.pool.begin().await?;
+    if let Some(response) = receipt
+        .replay(&mut transaction, user.0.id.0.as_bytes())
+        .await?
+    {
+        return Ok(response);
+    }
+    let owner = user.0.id.0.as_bytes().as_slice();
     lock_game(&mut transaction, owner, game.id).await?;
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM playthroughs
@@ -1356,11 +1383,16 @@ async fn start_playthrough(
     .bind(game.id)
     .execute(&mut *transaction)
     .await?;
-    transaction.commit().await?;
-    Ok((StatusCode::CREATED, Tagged(row)))
+    receipt
+        .finish(
+            transaction,
+            user.0.id.0.as_bytes(),
+            (StatusCode::CREATED, Tagged(row)),
+        )
+        .await
 }
 
-#[derive(Deserialize, TS)]
+#[derive(Deserialize, TS, Serialize)]
 #[ts(export)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleAction {
@@ -1370,7 +1402,7 @@ pub enum LifecycleAction {
     Abandon,
 }
 
-#[derive(Deserialize, TS)]
+#[derive(Deserialize, TS, Serialize)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
 pub struct LifecycleInput {
@@ -1385,12 +1417,19 @@ async fn transition_playthrough(
     id: Result<Path<Uuid>, PathRejection>,
     headers: HeaderMap,
     payload: Result<Body<LifecycleInput>, ApiError>,
-) -> ApiResult<Tagged> {
+) -> ApiResult<Response> {
     let id = path(id)?;
     let precondition = required_precondition(&headers)?;
     let input = body(payload)?;
+    let receipt = retry::Receipt::new(&headers, &format!("playthrough:lifecycle:{id}"), &input)?;
     let owner = user.0.id.0.as_bytes().as_slice();
     let mut transaction = state.pool.begin().await?;
+    if let Some(response) = receipt
+        .replay(&mut transaction, user.0.id.0.as_bytes())
+        .await?
+    {
+        return Ok(response);
+    }
     lock_playthrough_game(&mut transaction, owner, id).await?;
     let current: Playthrough = sqlx::query_as(
         "SELECT p.*,g.igdb_id FROM playthroughs p
@@ -1452,8 +1491,9 @@ async fn transition_playthrough(
     .bind(next.library_status())
     .fetch_one(&mut *transaction)
     .await?;
-    transaction.commit().await?;
-    Ok(Tagged(row))
+    receipt
+        .finish(transaction, user.0.id.0.as_bytes(), Tagged(row))
+        .await
 }
 
 #[cfg(test)]

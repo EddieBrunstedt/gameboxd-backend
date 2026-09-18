@@ -1615,13 +1615,16 @@ async fn browser_security_validation_and_account_deletion_cascade() {
     );
     json_body(response, StatusCode::OK).await;
 
-    // Conditional playthrough edits must survive the browser's preflight.
+    // Conditional and retry-protected writes must survive browser preflight.
     let preflight = Request::builder()
         .method("OPTIONS")
         .uri("/api/me/playthroughs/00000000-0000-0000-0000-000000000000")
         .header("Origin", "http://localhost:5173")
         .header("Access-Control-Request-Method", "PATCH")
-        .header("Access-Control-Request-Headers", "content-type, if-match")
+        .header(
+            "Access-Control-Request-Headers",
+            "content-type, if-match, idempotency-key",
+        )
         .body(Body::empty())
         .unwrap();
     let allowed = fixture.app.clone().oneshot(preflight).await.unwrap();
@@ -1631,6 +1634,7 @@ async fn browser_security_validation_and_account_deletion_cascade() {
         .unwrap()
         .to_ascii_lowercase();
     assert!(headers.contains("if-match"), "{headers}");
+    assert!(headers.contains("idempotency-key"), "{headers}");
 
     let preflight = Request::builder()
         .method("OPTIONS")
@@ -10299,5 +10303,669 @@ async fn personal_transfer_snapshot_migration_moderation_and_account_deletion_pr
             .await
             .unwrap();
     assert_eq!(count, 0);
+    f.finish().await;
+}
+
+impl Fixture {
+    async fn retry(
+        &self,
+        token: &str,
+        path: &str,
+        key: &str,
+        body: Value,
+        status: StatusCode,
+    ) -> Value {
+        let response = self
+            .send("POST", path, Some(token), &[("Idempotency-Key", key)], body)
+            .await;
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        json_body(response, status).await
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn retry_creation_is_atomic_scoped_and_preserves_original_results() {
+    let f = Fixture::new().await;
+    let (_, owner) = f.user("retry-owner").await;
+    let (_, other) = f.user("retry-other").await;
+    let path = "/api/me/playthroughs";
+    let input =
+        json!({"igdb_id":42,"review":"Original private text","presentation_on":"2001-01-01"});
+    let (one, two, three) = tokio::join!(
+        f.retry(&owner, path, "same", input.clone(), StatusCode::CREATED),
+        f.retry(&owner, path, "same", input.clone(), StatusCode::CREATED),
+        f.retry(&owner, path, "same", input.clone(), StatusCode::CREATED)
+    );
+    assert_eq!(one, two);
+    assert_eq!(one, three);
+    let other_run = f
+        .retry(&other, path, "same", input.clone(), StatusCode::CREATED)
+        .await;
+    assert_ne!(one["id"], other_run["id"]);
+    assert_eq!(
+        f.retry(
+            &owner,
+            path,
+            "same",
+            json!({"igdb_id":42,"review":"Different"}),
+            StatusCode::CONFLICT
+        )
+        .await["error"]["code"],
+        "idempotency_conflict"
+    );
+    let unauth = f
+        .send(
+            "POST",
+            path,
+            None,
+            &[("Idempotency-Key", "same")],
+            input.clone(),
+        )
+        .await;
+    assert_eq!(unauth.status(), StatusCode::UNAUTHORIZED);
+    f.edit(
+        "PATCH",
+        &run_path(&one),
+        &owner,
+        &tag(&one),
+        json!({"review":"Corrected"}),
+        StatusCode::OK,
+    )
+    .await;
+    let replay = f
+        .send(
+            "POST",
+            path,
+            Some(&owner),
+            &[("Idempotency-Key", "same")],
+            input.clone(),
+        )
+        .await;
+    assert_eq!(replay.headers()["etag"], tag(&one));
+    assert_eq!(json_body(replay, StatusCode::CREATED).await, one);
+    let updated = f
+        .value("GET", &run_path(&one), &owner, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(updated["review"], "Corrected");
+    assert_eq!(
+        f.send(
+            "DELETE",
+            &run_path(&one),
+            Some(&owner),
+            &[("If-Match", &tag(&updated))],
+            Value::Null
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        f.retry(&owner, path, "same", input, StatusCode::CREATED)
+            .await,
+        one
+    );
+    f.value(
+        "GET",
+        &run_path(&one),
+        &owner,
+        Value::Null,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+    // Same key, distinct operation, is independent.
+    f.retry(
+        &owner,
+        "/api/me/lists",
+        "same",
+        json!({"kind":"custom","title":"My list"}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM playthroughs")
+        .fetch_one(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(count, 1); // Only the other owner's run remains.
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn retry_notes_lists_and_lifecycle_do_not_repeat_writes() {
+    let f = Fixture::new().await;
+    let (_, token) = f.user("retry-actions").await;
+    let (first, second) = tokio::join!(
+        f.retry(
+            &token,
+            START_RUN,
+            "start",
+            json!({"igdb_id":42}),
+            StatusCode::CREATED
+        ),
+        f.retry(
+            &token,
+            START_RUN,
+            "start",
+            json!({"igdb_id":42}),
+            StatusCode::CREATED
+        )
+    );
+    assert_eq!(first, second);
+    let path = format!("{}/lifecycle", run_path(&first));
+    let version = tag(&first);
+    let headers = [("Idempotency-Key", "pause"), ("If-Match", version.as_str())];
+    let (a, b) = tokio::join!(
+        f.send(
+            "POST",
+            &path,
+            Some(&token),
+            &headers,
+            json!({"action":"pause"})
+        ),
+        f.send(
+            "POST",
+            &path,
+            Some(&token),
+            &headers,
+            json!({"action":"pause"})
+        )
+    );
+    let paused = json_body(a, StatusCode::OK).await;
+    assert_eq!(paused, json_body(b, StatusCode::OK).await);
+    let resumed = f
+        .lifecycle(&token, &paused, json!({"action":"resume"}), StatusCode::OK)
+        .await;
+    assert_eq!(
+        json_body(
+            f.send(
+                "POST",
+                &path,
+                Some(&token),
+                &headers,
+                json!({"action":"pause"})
+            )
+            .await,
+            StatusCode::OK
+        )
+        .await,
+        paused
+    );
+    let current = f
+        .value(
+            "GET",
+            &run_path(&first),
+            &token,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(current, resumed);
+    let changed = [("Idempotency-Key", "pause"), ("If-Match", "*")];
+    assert_eq!(
+        json_body(
+            f.send(
+                "POST",
+                &path,
+                Some(&token),
+                &changed,
+                json!({"action":"pause"})
+            )
+            .await,
+            StatusCode::CONFLICT
+        )
+        .await["error"]["code"],
+        "idempotency_conflict"
+    );
+    f.lifecycle(
+        &token,
+        &first,
+        json!({"action":"pause"}),
+        StatusCode::PRECONDITION_FAILED,
+    )
+    .await;
+    let note_path = format!("{}/notes", run_path(&first));
+    let (a, b) = tokio::join!(
+        f.retry(
+            &token,
+            &note_path,
+            "note",
+            json!({"text":"Backfilled note","presentation_on":"1999-01-02"}),
+            StatusCode::CREATED
+        ),
+        f.retry(
+            &token,
+            &note_path,
+            "note",
+            json!({"text":"Backfilled note","presentation_on":"1999-01-02"}),
+            StatusCode::CREATED
+        )
+    );
+    assert_eq!(a, b);
+    let other = f
+        .retry(
+            &token,
+            "/api/me/playthroughs",
+            "other",
+            json!({"igdb_id":42}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let other_path = format!("{}/notes", run_path(&other));
+    let other_note = f
+        .retry(
+            &token,
+            &other_path,
+            "note",
+            json!({"text":"Other parent"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_ne!(a["id"], other_note["id"]);
+    let list = json!({"kind":"favorites","title":"Favorites"});
+    let (a, b) = tokio::join!(
+        f.retry(
+            &token,
+            "/api/me/lists",
+            "favorites",
+            list.clone(),
+            StatusCode::CREATED
+        ),
+        f.retry(
+            &token,
+            "/api/me/lists",
+            "favorites",
+            list.clone(),
+            StatusCode::CREATED
+        )
+    );
+    assert_eq!(a, b);
+    assert_eq!(
+        f.retry(
+            &token,
+            START_RUN,
+            "start",
+            json!({"igdb_id":42}),
+            StatusCode::CREATED
+        )
+        .await,
+        first
+    );
+    let counts: (i64,i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM playthroughs),(SELECT count(*) FROM diary_notes),(SELECT count(*) FROM game_lists)").fetch_one(&f.database.app).await.unwrap();
+    assert_eq!(counts, (2, 2, 1));
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn retry_failures_expiry_cleanup_and_account_deletion_are_safe() {
+    let f = Fixture::new().await;
+    let (owner, token) = f.user("retry-failure").await;
+    // A database failure at receipt insertion must roll back BOTH start writes.
+    sqlx::raw_sql("CREATE FUNCTION reject_receipt() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RAISE EXCEPTION 'injected receipt failure'; END $$;
+        CREATE TRIGGER reject_receipt BEFORE INSERT ON request_receipts FOR EACH ROW EXECUTE FUNCTION reject_receipt();")
+        .execute(&f.database.app).await.unwrap();
+    f.retry(
+        &token,
+        START_RUN,
+        "recover",
+        json!({"igdb_id":42}),
+        StatusCode::INTERNAL_SERVER_ERROR,
+    )
+    .await;
+    let counts: (i64,i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM playthroughs),(SELECT count(*) FROM library_entries),(SELECT count(*) FROM request_receipts)").fetch_one(&f.database.app).await.unwrap();
+    assert_eq!(counts, (0, 0, 0));
+    sqlx::raw_sql(
+        "DROP TRIGGER reject_receipt ON request_receipts; DROP FUNCTION reject_receipt();",
+    )
+    .execute(&f.database.app)
+    .await
+    .unwrap();
+    let run = f
+        .retry(
+            &token,
+            START_RUN,
+            "recover",
+            json!({"igdb_id":42}),
+            StatusCode::CREATED,
+        )
+        .await;
+    // A failure before the domain write also reserves nothing.
+    f.retry(
+        &token,
+        "/api/me/playthroughs",
+        "invalid",
+        json!({"igdb_id":42,"rating":99}),
+        StatusCode::BAD_REQUEST,
+    )
+    .await;
+    f.retry(
+        &token,
+        "/api/me/playthroughs",
+        "invalid",
+        json!({"igdb_id":42,"rating":9}),
+        StatusCode::CREATED,
+    )
+    .await;
+    // Provider failure leaves no receipt. A later trusted resolution can retry.
+    f.server.reset().await;
+    f.retry(
+        &token,
+        "/api/me/playthroughs",
+        "provider",
+        json!({"igdb_id":43}),
+        StatusCode::BAD_GATEWAY,
+    )
+    .await;
+    Mock::given(path("/games"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!([{"id":43,"name":"Recovered game","slug":"recovered-game"}])),
+        )
+        .mount(&f.server)
+        .await;
+    f.retry(
+        &token,
+        "/api/me/playthroughs",
+        "provider",
+        json!({"igdb_id":43}),
+        StatusCode::CREATED,
+    )
+    .await;
+    // Cached success requires no provider and survives an application restart.
+    f.server.reset().await;
+    sqlx::migrate!("./migrations")
+        .run(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.retry(
+            &token,
+            START_RUN,
+            "recover",
+            json!({"igdb_id":42}),
+            StatusCode::CREATED
+        )
+        .await,
+        run
+    );
+    sqlx::query("UPDATE request_receipts SET expires_at=clock_timestamp()-interval '1 second' WHERE key='recover'").execute(&f.database.app).await.unwrap();
+    assert_eq!(
+        f.retry(
+            &token,
+            START_RUN,
+            "recover",
+            json!({"igdb_id":42}),
+            StatusCode::CONFLICT
+        )
+        .await["error"]["code"],
+        "idempotency_expired"
+    );
+    gameboxd_backend::db::purge_request_receipts(&f.database.app)
+        .await
+        .unwrap();
+    let retained: (bool, bool) = sqlx::query_as(
+        "SELECT body IS NULL,etag IS NULL FROM request_receipts WHERE key='recover'",
+    )
+    .fetch_one(&f.database.app)
+    .await
+    .unwrap();
+    assert_eq!(retained, (true, true));
+    assert_eq!(
+        f.retry(
+            &token,
+            START_RUN,
+            "recover",
+            json!({"igdb_id":42}),
+            StatusCode::CONFLICT
+        )
+        .await["error"]["code"],
+        "idempotency_expired"
+    );
+    assert_eq!(
+        f.retry(
+            &token,
+            START_RUN,
+            "recover",
+            json!({"igdb_id":43}),
+            StatusCode::CONFLICT
+        )
+        .await["error"]["code"],
+        "idempotency_conflict"
+    );
+    sqlx::query("DELETE FROM gameboxd_auth.users WHERE id=$1")
+        .bind(owner.0.as_bytes().as_slice())
+        .execute(&f.database.app)
+        .await
+        .unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM request_receipts")
+        .fetch_one(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn retry_import_receipts_coexist_with_durable_provenance() {
+    let f = Fixture::new().await;
+    let (source_id, source) = f.user("retry-source").await;
+    let (_, dest) = f.user("retry-dest").await;
+    let archive = transfer_archive(&f, source_id, &source).await;
+    // Migration is additive, preserves the complete preexisting archive and reruns cleanly.
+    sqlx::raw_sql(
+        "DROP TABLE request_receipts; DELETE FROM _sqlx_migrations WHERE version=202609180001;",
+    )
+    .execute(&f.database.app)
+    .await
+    .unwrap();
+    sqlx::migrate!("./migrations")
+        .run(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(
+        f.value(
+            "GET",
+            "/api/me/export",
+            &source,
+            Value::Null,
+            StatusCode::OK
+        )
+        .await,
+        archive
+    );
+    let input = transfer_input(&archive);
+    let (one, two) = tokio::join!(
+        f.retry(
+            &dest,
+            "/api/me/import",
+            "archive",
+            input.clone(),
+            StatusCode::OK
+        ),
+        f.retry(
+            &dest,
+            "/api/me/import",
+            "archive",
+            input.clone(),
+            StatusCode::OK
+        )
+    );
+    assert_eq!(one, two);
+    let before = f
+        .value("GET", "/api/me/export", &dest, Value::Null, StatusCode::OK)
+        .await;
+    let playthrough = &before["playthroughs"][0];
+    let id = playthrough["id"].as_str().unwrap();
+    f.edit(
+        "PATCH",
+        &format!("/api/me/playthroughs/{id}"),
+        &dest,
+        "*",
+        json!({"review":"Local correction"}),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(
+        f.retry(
+            &dest,
+            "/api/me/import",
+            "archive",
+            input.clone(),
+            StatusCode::OK
+        )
+        .await,
+        one
+    );
+    let current = f
+        .value(
+            "GET",
+            &format!("/api/me/playthroughs/{id}"),
+            &dest,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(current["review"], "Local correction");
+    sqlx::query("UPDATE request_receipts SET expires_at=clock_timestamp()-interval '1 second'")
+        .execute(&f.database.app)
+        .await
+        .unwrap();
+    gameboxd_backend::db::purge_request_receipts(&f.database.app)
+        .await
+        .unwrap();
+    f.retry(
+        &dest,
+        "/api/me/import",
+        "archive",
+        input.clone(),
+        StatusCode::CONFLICT,
+    )
+    .await;
+    let retried = f
+        .retry(
+            &dest,
+            "/api/me/import",
+            "new-request",
+            input,
+            StatusCode::OK,
+        )
+        .await;
+    assert!(
+        retried["mappings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|m| m["already_imported"] == true)
+    );
+    let after = f
+        .value("GET", "/api/me/export", &dest, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(
+        before["playthroughs"].as_array().unwrap().len(),
+        after["playthroughs"].as_array().unwrap().len()
+    );
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn retry_contention_is_bounded_and_cancelled_requests_release_reservations() {
+    let f = Fixture::new().await;
+    let (owner, token) = f.user("retry-cancel").await;
+    // Hold the exact receipt lock without inserting a reservation. This models
+    // an in-flight transaction, and exercises waiting, timeout and cancellation.
+    let mut blocker = f.database.app.begin().await.unwrap();
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended(json_build_array('gameboxd:receipt',encode($1::bytea,'hex'),$2::text,$3::text)::text,0))")
+        .bind(owner.0.as_bytes().as_slice()).bind("list:create").bind("blocked")
+        .execute(&mut *blocker).await.unwrap();
+    let response = timeout(
+        Duration::from_secs(8),
+        f.retry(
+            &token,
+            "/api/me/lists",
+            "blocked",
+            json!({"kind":"custom","title":"One list"}),
+            StatusCode::SERVICE_UNAVAILABLE,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(response["error"]["code"], "database_unavailable");
+    let request = Request::builder()
+        .method("POST")
+        .uri("/api/me/lists")
+        .extension(ConnectInfo(
+            "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
+        ))
+        .header("Content-Type", "application/json")
+        .header("Authorization", format!("Bearer {token}"))
+        .header("Idempotency-Key", "blocked")
+        .body(Body::from(
+            json!({"kind":"custom","title":"One list"}).to_string(),
+        ))
+        .unwrap();
+    let app = f.app.clone();
+    let pending = tokio::spawn(async move { app.oneshot(request).await.unwrap() });
+    timeout(Duration::from_secs(3),async {
+        loop {
+            let waiting: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM pg_locks WHERE locktype='advisory' AND NOT granted AND database=(SELECT oid FROM pg_database WHERE datname=current_database()))")
+                .fetch_one(&f.database.app).await.unwrap();
+            if waiting { break; }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }).await.unwrap();
+    pending.abort();
+    assert!(pending.await.unwrap_err().is_cancelled());
+    blocker.rollback().await.unwrap();
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM request_receipts")
+        .fetch_one(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(count, 0);
+    let result = f
+        .retry(
+            &token,
+            "/api/me/lists",
+            "blocked",
+            json!({"kind":"custom","title":"One list"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_eq!(result["list"]["title"], "One list");
+    // Racing different payloads may pick either winner but must never create both.
+    let headers = [("Idempotency-Key", "conflict")];
+    let (a, b) = tokio::join!(
+        f.send(
+            "POST",
+            "/api/me/lists",
+            Some(&token),
+            &headers,
+            json!({"kind":"custom","title":"A"})
+        ),
+        f.send(
+            "POST",
+            "/api/me/lists",
+            Some(&token),
+            &headers,
+            json!({"kind":"custom","title":"B"})
+        )
+    );
+    let (winner, loser) = if a.status() == StatusCode::CREATED {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    json_body(winner, StatusCode::CREATED).await;
+    assert_eq!(
+        json_body(loser, StatusCode::CONFLICT).await["error"]["code"],
+        "idempotency_conflict"
+    );
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM game_lists")
+        .fetch_one(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(count, 2);
     f.finish().await;
 }

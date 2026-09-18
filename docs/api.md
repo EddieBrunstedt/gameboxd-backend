@@ -112,7 +112,7 @@ A playthrough represents one experience with a game, not an individual gaming se
 - **PUT replaces.** Every editable field takes the value in the body, so an omitted field and an explicit `null` both clear it. Use it where one form owns the whole record.
 - **PATCH merges.** An omitted field keeps its stored value and an explicit `null` clears it. Use it where a control owns a single field — a rating widget, a review editor, a date picker — so it cannot erase fields it never displayed.
 
-Both preserve the playthrough's identity and `created_at`. Unknown fields are rejected by either route, so a misspelled name fails loudly instead of silently changing nothing. An edit that changes nothing is not a revision: `updated_at`, `version` and the entity tag all stay as they were. To start a current replay, use the start route below. To backfill a past replay, POST a new historical entry. POST always creates a new UUID, so retrying a successful POST can create a duplicate.
+Both preserve the playthrough's identity and `created_at`. Unknown fields are rejected by either route, so a misspelled name fails loudly instead of silently changing nothing. An edit that changes nothing is not a revision: `updated_at`, `version` and the entity tag all stay as they were. To start a current replay, use the start route below. To backfill a past replay, POST a new historical entry. Send an `Idempotency-Key` to recover a successful POST without creating another UUID; see [request recovery](#retry-safe-creation-and-request-recovery). Without a key, every POST creates a new UUID.
 
 - `rating`: null or an integer 1–10 (divide by two to show half-stars).
 - `review`: null or plain text of at most 10000 characters, without NUL. Render user content as text, never as HTML.
@@ -158,7 +158,7 @@ Both lists use `presentation_on DESC NULLS LAST, id DESC`, exactly the [historic
 
 Notes have independent revisions: changing a note does not change the parent's revision, review, rating, lifecycle, or library status. No-op writes preserve the note's timestamps and revision. Note writes lock the parent against deletion before locking the note, so simultaneous edits merge/check against the locked revision and parent deletion cannot leave orphaned rows. They do not participate in current-run state changes.
 
-Removing library membership or starting a replay preserves all previous notes on their original playthrough IDs. Deleting a playthrough deliberately cascades to **all its notes** in the same transaction; deleting the account removes them too. The playthrough's own revision does not cover its notes: deleting that aggregate removes even independently revised notes. Note-only deletion checks the note's own revision and preserves the parent/review/siblings. Creation always uses a new UUID; uncertain POST retries can duplicate notes until feature 12 adds idempotency keys.
+Removing library membership or starting a replay preserves all previous notes on their original playthrough IDs. Deleting a playthrough deliberately cascades to **all its notes** in the same transaction; deleting the account removes them too. The playthrough's own revision does not cover its notes: deleting that aggregate removes even independently revised notes. Note-only deletion checks the note's own revision and preserves the parent/review/siblings. Each deliberate creation uses a new UUID; send `Idempotency-Key` to recover an uncertain POST response without duplicating the note.
 
 Migration `202609090003_diary_notes.sql` adds an empty note table without deriving notes from reviews, inventing historical dates, changing existing playthrough content/revisions, or publishing data. Independent note visibility and separate public projections are described below; these owner DTOs and revision ETags remain private.
 
@@ -195,7 +195,7 @@ Backfilling or correcting historical state never changes current status, even wh
 
 All current-state mutations serialize per authenticated user/game with a transaction-scoped advisory lock, acquired before playthrough row locks. Starts, lifecycle actions, library status saves/removal, and playthrough edits/deletion follow this protocol. A database partial unique index additionally prevents two current runs; check constraints require a current run to be active/paused and prevent end dates on open runs. Competing revisions cannot silently overwrite one another. Concurrent status-only operations use last committed intent; when a current run exists, conflicting status saves fail. Removing membership and starting a run concurrently execute in lock order: the final result is either detached history without membership, or a new coherent current run with membership.
 
-Existing runs migrate with `state: null` and `is_current: false`, preserving dates, content, revisions, and private timestamps. An end date or existing library status is never treated as evidence of completion. No sharing behavior changes. Feature 12 will add retry keys: start currently has no replayable idempotency response; after an uncertain response, read the library/current run before starting again. Transition retries with an old revision return 412.
+Existing runs migrate with `state: null` and `is_current: false`, preserving dates, content, revisions, and private timestamps. An end date or existing library status is never treated as evidence of completion. No sharing behavior changes. Start and lifecycle actions support `Idempotency-Key` receipts. A matching successful retry returns the original result before reevaluating current state or the original `If-Match`. Without a key, transition retries with an old revision return 412; reread the current run after an uncertain response.
 
 ### Historical chronology policy
 
@@ -362,7 +362,7 @@ page after such edits. Catalog/local-game pagination is unchanged.
 {"error":{"code":"validation_error","message":"rating must be an integer from 1 to 10, or null"}}
 ```
 
-Application error codes are exactly `validation_error`, `invalid_json`, `not_found`, `method_not_allowed`, `precondition_required`, `precondition_failed`, `lifecycle_conflict`, `handle_unavailable`, `favorites_exists`, `request_rejected`, `internal_error`, `database_unavailable`, `igdb_not_configured`, `igdb_unavailable`, `igdb_rate_limited`, `catalog_busy` — a closed set, published as a TypeScript union and checked against this list by `tests/contract.rs`. Validation is generally 400; malformed JSON/schema/content type retains Axum's 400/422/415 status; oversized bodies return 413.
+Application error codes are exactly `validation_error`, `invalid_json`, `not_found`, `method_not_allowed`, `precondition_required`, `precondition_failed`, `lifecycle_conflict`, `import_conflict`, `idempotency_conflict`, `idempotency_expired`, `forbidden`, `moderation_restricted`, `report_limit`, `handle_unavailable`, `favorites_exists`, `request_rejected`, `internal_error`, `database_unavailable`, `igdb_not_configured`, `igdb_unavailable`, `igdb_rate_limited`, `catalog_busy` — a closed set, published as a TypeScript union and checked against this list by `tests/contract.rs`. Validation is generally 400; malformed JSON/schema/content type retains Axum's 400/422/415 status; oversized bodies return 413.
 
 ### Field-level errors
 
@@ -402,7 +402,7 @@ These codes are published as the `AuthCode` union in `contract/errors.ts`, check
 
 `navigator.credentials.create()` and `.get()` reject with a `DOMException`; they do not resolve `null`. These never come from the server, and `contract/auth.ts` translates them so a caller handles them in the same place as everything else: `passkey_cancelled` (dismissed or timed out — WebAuthn reports those identically), `passkey_already_registered` (this authenticator already holds a credential for the account), `passkey_unsupported` (no WebAuthn, or an insecure context), and `passkey_origin_mismatch` (the page's origin does not match the relying-party ID). A cancelled prompt is an ordinary outcome and usually deserves no error message at all.
 
-`ETag` and `Retry-After` are exposed to the browser through CORS, and `If-Match` is an allowed request header, so a `fetch` may both read a tag and send one back. Every response carries an `x-request-id` for correlation. App/auth responses use `Cache-Control: no-store` to avoid leaking private or auth data through shared browser caches. No database details, upstream response bodies or credentials are returned in app errors.
+`ETag` and `Retry-After` are exposed to the browser through CORS, and `If-Match` and `Idempotency-Key` are allowed request headers, so a `fetch` may both read a tag and send one back. Every response carries an `x-request-id` for correlation. App/auth responses use `Cache-Control: no-store` to avoid leaking private or auth data through shared browser caches. No database details, upstream response bodies or credentials are returned in app errors.
 
 ## Generated types and client
 
@@ -637,7 +637,7 @@ the original profile and may be restored by that owner. Account deletion erases
 the reservation's owner reference but keeps the name unavailable to prevent
 impersonation through old links. No public reservation/availability endpoint
 exposes claim history. Broader claim throttling is part of the resource controls
-planned for feature 12.
+planned for feature 13.
 
 ### Profile and sections
 
@@ -780,8 +780,8 @@ Real edits increment it once; identical writes preserve revision/timestamps.
 All edits and deletion acquire the same list row lock. Conflicting edits cannot
 silently discard membership changes, even if one edits publication or the title.
 After 412, reread and reconcile; do not blindly retry a stale array with a fresh
-revision. An uncertain creation response requires rereading collections before
-retrying; general creation idempotency remains future work. Missing/other-owner
+revision. Use `Idempotency-Key` on list creation to recover an uncertain response. Without
+a key, reread collections before deliberately creating another list. Missing/other-owner
 IDs return the same 404, including conditional deletion after a prior deletion.
 
 Owner summaries (`GameList`) contain `id`, `kind`, `title`, `description`,
@@ -1335,8 +1335,8 @@ in skip mappings can therefore refer to deleted records. Deleting a record does
 not erase its duplicate protection. Do not regenerate source identities to retry:
 changing source IDs declares new content, and separately exported accounts are
 separate sources. Equal review text alone is not a duplicate, since repeat
-experiences can legitimately contain identical text. Ordinary creation retry
-keys in feature 12 should coexist with this durable import provenance.
+experiences can legitimately contain identical text. The request receipts below coexist with this durable import provenance; receipt
+expiry never removes source-record duplicate protection.
 
 ### Validation, reports and failure recovery
 
@@ -1377,3 +1377,87 @@ injected database failures and cancellation before commit leave no partial impor
 or in-progress receipt. A lost response can safely be retried with the same archive.
 Account deletion cascades to provenance as well as imported content. No background
 job, external notifications, automatic sharing or authentication changes occur.
+
+
+## Retry-safe creation and request recovery
+
+Send one optional `Idempotency-Key` header on these authenticated operations:
+
+| Method and route | Key scope within the authenticated account |
+| --- | --- |
+| `POST /api/me/playthroughs` | Historical playthrough creation |
+| `POST /api/me/playthroughs/start` | Start/replay creation |
+| `POST /api/me/playthroughs/{id}/lifecycle` | Lifecycle action on this playthrough |
+| `POST /api/me/playthroughs/{id}/notes` | Note creation under this playthrough |
+| `POST /api/me/lists` | List creation (custom or favorites) |
+| `POST /api/me/import` | Personal archive apply |
+
+A key contains 1–128 ASCII letters, digits, or `-_.:`. Empty, malformed, repeated
+or combined headers return 400 `validation_error`. Prefer a random UUID generated
+once per deliberate operation. Persist it with the input **before sending** so
+network failures, reloads and lost responses can use the same key. A new key
+means a new operation. Without a key these routes retain ordinary behavior;
+creation can duplicate records, and stale lifecycle actions fail their revision
+precondition. No automatic browser retry or implicit key generation is performed.
+
+Keys are scoped to the authenticated account, operation and canonical target
+UUID, not the session. Different users, routes and parents cannot retrieve one
+another's receipts. The complete parsed input and all `If-Match` header values
+are fingerprinted with SHA-256. JSON object key order and whitespace do not
+matter; omitted nullable/default fields equal their parsed default. Array order,
+string content, dates, and preconditions matter. No trimming is applied to the
+fingerprint. A successful key reused with a different parsed input/precondition
+returns 409 `idempotency_conflict`, including after expiry. Schema/domain errors
+can reject invalid requests before receipt lookup. Unknown JSON fields remain
+invalid. These keys are not authentication or authorization credentials.
+
+A successful retry within seven days returns the original success status, JSON
+body, and owner ETag, even if the server committed and its response was lost.
+The retry does not create a record, repeat a transition, rerun an import or alter
+bookkeeping. Its original lifecycle `If-Match` is parsed and required but is not
+reevaluated against newer state once a matching receipt exists. The receipt is
+an acknowledgement of **that operation**, not a current resource representation:
+subsequent edits, deletion or publication changes remain intact. Returned IDs may
+now be deleted, and returned revisions may be stale. Reread the resource before
+editing it. Responses remain authenticated, private and `Cache-Control: no-store`;
+request IDs are fresh per HTTP attempt. No receipt is exposed on public routes,
+exports or feeds. Every attempt still passes session/CSRF/account checks.
+
+The domain write and successful receipt commit in one PostgreSQL transaction.
+An account/operation/key transaction lock serializes concurrent retries; the
+waiter reads the winner's receipt. There is no committed pending reservation.
+Validation, provider, database or serialization failure rolls back the mutation
+and receipt; the key can be retried with corrected input. Disconnect/cancellation
+before commit also releases the transaction lock; cancellation or connection
+loss during commit has an uncertain outcome that the same key safely resolves.
+A matching-key lock wait is bounded to five seconds and returns 503
+`database_unavailable` if still busy; retry the same key/input with backoff.
+Provider work runs before write locks, and committed receipts can be recovered
+without provider calls. Shared catalog metadata may be fetched/stored before a
+failed personal write; no personal history is partially committed.
+
+Response bodies are retained for seven days from receipt insertion, without
+sliding renewal. Read-time expiry applies even if maintenance is delayed. The
+five-minute maintenance loop clears expired bodies and ETags. Expired keys keep
+only scope, key, fingerprint, success status and expiry as private tombstones
+until account deletion. A matching expired key returns 409
+`idempotency_expired` and **never executes again**. Inspect current records before
+deliberately using a new key; do not automatically replace an expired key on
+failure. Individual item deletion does not erase its receipt: its original
+private response can still be recovered during this seven-day window, but it
+cannot recreate the item. Account deletion cascades all receipts and tombstones.
+Backup retention is governed separately by deployment operations (feature 13).
+
+Import receipts replay the original apply report, while permanent owner/source
+provenance still prevents duplicates, overwrites or resurrection when applying
+with a new key or no key after receipt expiry. Import preview is read-only and
+needs no receipt. Keep archive source identities stable across retries/batches.
+Catalog import is an IGDB-keyed upsert; follow/block writes are idempotent set
+operations; report submissions already have permanent reporter/target deduplication
+and return their original receipt. List membership/order and ordinary content or
+publication edits use their existing revision preconditions. Operator decisions
+require expected versions and cannot repeat the same audited mutation; after a
+lost response read the decision/audit, and reconcile a 412. These operations do
+not use the new header. Doorman authentication ceremonies retain their own
+challenge/recovery contracts. General request keys do not replace revision
+protection, import provenance, or those existing domain protections.

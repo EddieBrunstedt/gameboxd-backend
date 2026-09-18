@@ -48,6 +48,10 @@ async fn main() -> anyhow::Result<()> {
             if let Err(error) = gameboxd_backend::db::purge_moderation(&moderation_pool).await {
                 tracing::error!(%error, "Moderation evidence cleanup failed");
             }
+            if let Err(error) = gameboxd_backend::db::purge_request_receipts(&moderation_pool).await
+            {
+                tracing::error!(%error, "Request receipt cleanup failed");
+            }
             if let Err(error) = auth.purge_expired(chrono::Utc::now()).await {
                 tracing::error!(%error, "Expired authentication data cleanup failed");
             }

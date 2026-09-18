@@ -53,3 +53,11 @@ pub async fn purge_moderation(pool: &PgPool) -> Result<(), sqlx::Error> {
     tx.commit().await?;
     Ok(())
 }
+
+/// Expired receipts retain only a fingerprint/key tombstone to prevent late
+/// retries from duplicating history. No request text is stored in tombstones.
+pub async fn purge_request_receipts(pool: &PgPool) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE request_receipts SET body=NULL,etag=NULL WHERE expires_at<=clock_timestamp() AND body IS NOT NULL")
+        .execute(pool).await?;
+    Ok(())
+}

@@ -146,6 +146,10 @@ export {
 } from "./errors";
 export type { AnyErrorCode, AuthCode, ClientCode } from "./errors";
 
+/** Generate once per deliberate operation and persist with its input before sending.
+ * Reuse for retries, including after reload; never generate inside a retry loop. */
+export const newIdempotencyKey = (): string => crypto.randomUUID();
+
 type Query = Record<string, string | number | boolean | undefined | null>;
 
 function url(path: string, query?: Query): string {
@@ -160,11 +164,12 @@ function url(path: string, query?: Query): string {
 async function request<T>(
   method: string,
   path: string,
-  options: { query?: Query; body?: unknown; ifMatch?: string } = {},
+  options: { query?: Query; body?: unknown; ifMatch?: string; idempotencyKey?: string } = {},
 ): Promise<T> {
   const headers: Record<string, string> = {};
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
   if (options.ifMatch !== undefined) headers["If-Match"] = options.ifMatch;
+  if (options.idempotencyKey !== undefined) headers["Idempotency-Key"] = options.idempotencyKey;
   const response = await fetch(url(path, options.query), {
     method,
     credentials: "include",
@@ -276,22 +281,24 @@ export const playthrough = (id: string): Promise<Playthrough> =>
   request("GET", `/api/me/playthroughs/${id}`);
 
 /** Starts a current run (or replay), atomically setting library status to playing. */
-export const startPlaythrough = (input: StartPlaythroughInput): Promise<Playthrough> =>
-  request("POST", "/api/me/playthroughs/start", { body: input });
+export const startPlaythrough = (input: StartPlaythroughInput, idempotencyKey?: string): Promise<Playthrough> =>
+  request("POST", "/api/me/playthroughs/start", { body: input, idempotencyKey });
 
 /** Pauses, resumes, completes or abandons the current run and updates library status. */
 export const transitionPlaythrough = (
   current: Playthrough,
   input: LifecycleInput,
+  idempotencyKey?: string,
 ): Promise<Playthrough> =>
   request("POST", `/api/me/playthroughs/${current.id}/lifecycle`, {
     body: input,
+    idempotencyKey,
     ifMatch: precondition(current),
   });
 
 /** Records history without changing present-day library status or the current run. */
-export const createPlaythrough = (input: CreatePlaythroughInput): Promise<Playthrough> =>
-  request("POST", "/api/me/playthroughs", { body: input });
+export const createPlaythrough = (input: CreatePlaythroughInput, idempotencyKey?: string): Promise<Playthrough> =>
+  request("POST", "/api/me/playthroughs", { body: input, idempotencyKey });
 
 /**
  * Replaces every editable field. An omitted field is cleared, exactly as an
@@ -351,8 +358,8 @@ export const playthroughNotes = (
 export const note = (id: string): Promise<DiaryNote> =>
   request("GET", `/api/me/notes/${id}`);
 
-export const createNote = (playthroughId: string, input: NoteInput): Promise<DiaryNote> =>
-  request("POST", `/api/me/playthroughs/${playthroughId}/notes`, { body: input });
+export const createNote = (playthroughId: string, input: NoteInput, idempotencyKey?: string): Promise<DiaryNote> =>
+  request("POST", `/api/me/playthroughs/${playthroughId}/notes`, { body: input, idempotencyKey });
 
 /** Replaces text and chosen day; omission of the day clears it. */
 export const replaceNote = (current: DiaryNote, input: NoteInput): Promise<DiaryNote> =>
@@ -432,8 +439,8 @@ export const list = (id: string): Promise<GameListDetail> =>
   request("GET", `/api/me/lists/${encodeURIComponent(id)}`);
 
 /** Empty and private initially; at most one kind=favorites list per owner. */
-export const createList = (input: CreateListInput): Promise<GameListDetail> =>
-  request("POST", "/api/me/lists", { body: input });
+export const createList = (input: CreateListInput, idempotencyKey?: string): Promise<GameListDetail> =>
+  request("POST", "/api/me/lists", { body: input, idempotencyKey });
 
 /** Replaces title/description. Omitted description becomes empty. */
 export const replaceList = (current: GameList, input: ListInput): Promise<GameListDetail> =>
@@ -547,5 +554,5 @@ export const previewPersonalImport = (input: PersonalImportInput): Promise<Perso
   request("POST", "/api/me/import/preview", { body: input });
 
 /** Atomic create-only merge. Imported content is private; conflicts throw ApiError. */
-export const importPersonalData = (input: PersonalImportInput): Promise<PersonalImportReport> =>
-  request("POST", "/api/me/import", { body: input });
+export const importPersonalData = (input: PersonalImportInput, idempotencyKey?: string): Promise<PersonalImportReport> =>
+  request("POST", "/api/me/import", { body: input, idempotencyKey });

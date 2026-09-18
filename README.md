@@ -131,3 +131,12 @@ reports conflicts; `/api/me/import` performs an atomic create-only merge with
 owner-scoped duplicate protection, ID remapping and private import defaults.
 Existing history is never silently overwritten. See the
 [transfer contract](docs/api.md#personal-export-and-round-trip-import).
+
+
+Creation of playthroughs, notes and lists, lifecycle actions, and personal import
+support authenticated `Idempotency-Key` receipts committed atomically with the
+write. Matching retries recover the original response for seven days; expired
+keys remain tombstones until account deletion and cannot duplicate history.
+The maintenance loop removes expired response bodies. Import provenance remains
+permanent and independent. See [request recovery](docs/api.md#retry-safe-creation-and-request-recovery)
+for retention, failure handling and typed-client use.

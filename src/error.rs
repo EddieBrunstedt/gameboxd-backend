@@ -24,6 +24,8 @@ pub enum ErrorCode {
     PreconditionFailed,
     LifecycleConflict,
     ImportConflict,
+    IdempotencyConflict,
+    IdempotencyExpired,
     HandleUnavailable,
     FavoritesExists,
     Forbidden,
@@ -41,7 +43,7 @@ pub enum ErrorCode {
 impl ErrorCode {
     /// Every variant, so a test can assert the documented list is complete.
     /// A new code added above without a line in `docs/api.md` fails there.
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 22] = [
         Self::ValidationError,
         Self::InvalidJson,
         Self::NotFound,
@@ -50,6 +52,8 @@ impl ErrorCode {
         Self::PreconditionFailed,
         Self::LifecycleConflict,
         Self::ImportConflict,
+        Self::IdempotencyConflict,
+        Self::IdempotencyExpired,
         Self::HandleUnavailable,
         Self::FavoritesExists,
         Self::Forbidden,
@@ -78,6 +82,8 @@ impl ErrorCode {
             Self::ModerationRestricted => "moderation_restricted",
             Self::ReportLimit => "report_limit",
             Self::FavoritesExists => "favorites_exists",
+            Self::IdempotencyConflict => "idempotency_conflict",
+            Self::IdempotencyExpired => "idempotency_expired",
             Self::ImportConflict => "import_conflict",
             Self::LifecycleConflict => "lifecycle_conflict",
             Self::RequestRejected => "request_rejected",

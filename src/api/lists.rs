@@ -71,7 +71,7 @@ pub struct PublicListDetail {
     pub games: Vec<PublicGame>,
 }
 
-#[derive(Deserialize, TS)]
+#[derive(Deserialize, TS, Serialize)]
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct CreateListInput {
@@ -254,9 +254,11 @@ async fn read(
 async fn create(
     user: AuthUser,
     State(state): State<AppState>,
+    headers: HeaderMap,
     payload: Result<Body<CreateListInput>, ApiError>,
-) -> ApiResult<(StatusCode, TaggedList)> {
+) -> ApiResult<Response> {
     let input = body(payload)?;
+    let receipt = retry::Receipt::new(&headers, "list:create", &input)?;
     let metadata = ListInput {
         title: input.title,
         description: input.description,
@@ -265,6 +267,9 @@ async fn create(
     let owner = user.0.id.0.as_bytes().as_slice();
     let id = Uuid::new_v4();
     let mut tx = state.pool.begin().await?;
+    if let Some(response) = receipt.replay(&mut tx, user.0.id.0.as_bytes()).await? {
+        return Ok(response);
+    }
     let inserted: Option<Uuid> = sqlx::query_scalar("INSERT INTO game_lists (id,user_id,kind,title,description)
         VALUES ($1,$2,$3,$4,$5) ON CONFLICT (user_id) WHERE kind='favorites' DO NOTHING RETURNING id")
         .bind(id).bind(owner).bind(input.kind).bind(metadata.title).bind(metadata.description)
@@ -277,8 +282,13 @@ async fn create(
         ));
     }
     let row = saved(&mut tx, owner, id).await?;
-    tx.commit().await?;
-    Ok((StatusCode::CREATED, TaggedList(row)))
+    receipt
+        .finish(
+            tx,
+            user.0.id.0.as_bytes(),
+            (StatusCode::CREATED, TaggedList(row)),
+        )
+        .await
 }
 
 async fn replace(

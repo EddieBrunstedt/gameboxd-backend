@@ -59,6 +59,7 @@ pub fn router(config: &Config, state: AppState, auth: &AuthService) -> Router {
             header::CONTENT_TYPE,
             header::AUTHORIZATION,
             header::IF_MATCH,
+            header::HeaderName::from_static("idempotency-key"),
         ])
         .expose_headers([
             header::HeaderName::from_static("x-request-id"),

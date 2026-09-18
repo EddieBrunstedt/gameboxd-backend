@@ -315,3 +315,22 @@ apply revalidates, imports privately and returns source-to-destination mappings.
 `import_conflict` errors use the normal `ApiError.fields` contract. Identical
 retries skip records, including after local edits/deletion. See the backend's
 [format, limits and recovery policy](../docs/api.md#personal-export-and-round-trip-import).
+
+
+### Retrying creation and lifecycle actions
+
+`createPlaythrough`, `startPlaythrough`, `transitionPlaythrough`, `createNote`,
+`createList` and `importPersonalData` accept an optional final `idempotencyKey`
+string. Generate it once with `newIdempotencyKey()` and persist it alongside the
+input before sending; reuse both after uncertain responses or reloads. For a
+lifecycle retry, retain the original `current` argument (its version supplies
+`If-Match`). The client does not automatically retry or generate replacement keys.
+
+Successful retries return the original result for seven days, including its
+possibly stale version; reread before subsequent edits. Later corrections and
+deletions are never undone. Handle `idempotency_conflict` by fixing accidental key
+reuse, and `idempotency_expired` by inspecting current records before deliberately
+starting a new operation. Do not automatically choose a fresh key after either
+409. Retry matching-key contention (`database_unavailable`, 503) with backoff and
+the same key. Import source-record deduplication persists beyond receipt expiry.
+See [the complete recovery contract](../docs/api.md#retry-safe-creation-and-request-recovery).

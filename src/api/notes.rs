@@ -29,7 +29,7 @@ pub struct DiaryNote {
     pub updated_at: DateTime<Utc>,
 }
 
-#[derive(Debug, Deserialize, TS)]
+#[derive(Debug, Deserialize, TS, Serialize)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
 pub struct NoteInput {
@@ -187,20 +187,31 @@ async fn create(
     user: AuthUser,
     State(state): State<AppState>,
     id: Result<Path<Uuid>, PathRejection>,
+    headers: HeaderMap,
     payload: Result<Body<NoteInput>, ApiError>,
-) -> ApiResult<(StatusCode, TaggedNote)> {
+) -> ApiResult<Response> {
     let parent = path(id)?;
-    let input = body(payload)?.validated()?;
+    let input = body(payload)?;
+    let receipt = retry::Receipt::new(&headers, &format!("note:create:{parent}"), &input)?;
+    let input = input.validated()?;
     let owner = user.0.id.0.as_bytes().as_slice();
     let mut tx = state.pool.begin().await?;
+    if let Some(response) = receipt.replay(&mut tx, user.0.id.0.as_bytes()).await? {
+        return Ok(response);
+    }
     lock_parent(&mut tx, owner, parent).await?;
     let id = Uuid::new_v4();
     sqlx::query("INSERT INTO diary_notes (id,user_id,playthrough_id,text,presentation_on) VALUES ($1,$2,$3,$4,$5)")
         .bind(id).bind(owner).bind(parent).bind(input.text).bind(input.presentation_on)
         .execute(&mut *tx).await?;
     let row = saved(&mut tx, owner, id).await?;
-    tx.commit().await?;
-    Ok((StatusCode::CREATED, TaggedNote(row)))
+    receipt
+        .finish(
+            tx,
+            user.0.id.0.as_bytes(),
+            (StatusCode::CREATED, TaggedNote(row)),
+        )
+        .await
 }
 
 pub(super) async fn saved(

@@ -175,7 +175,7 @@ pub enum ImportProfilePolicy {
     Keep,
 }
 
-#[derive(Deserialize, TS)]
+#[derive(Deserialize, TS, Serialize)]
 #[serde(deny_unknown_fields)]
 #[ts(export)]
 pub struct PersonalImportInput {
@@ -774,14 +774,19 @@ fn rejected(report: PersonalImportReport) -> ApiError {
 async fn apply(
     user: AuthUser,
     State(state): State<AppState>,
+    headers: HeaderMap,
     payload: Result<Body<PersonalImportInput>, ApiError>,
 ) -> ApiResult<Response> {
     let input = body(payload)?;
+    let receipt = retry::Receipt::new(&headers, "personal:import", &input)?;
     let errors = input.archive.validate();
     if !errors.is_empty() {
         return Err(ApiError::fields(errors));
     }
 
+    if let Some(response) = receipt.cached(&state.pool, user.0.id.0.as_bytes()).await? {
+        return Ok(response);
+    }
     let owner = user.0.id.0.as_bytes().as_slice();
     let mut check = browsing::snapshot(&state.pool).await?;
     let initial = plan(&mut check, owner, &input).await?;
@@ -800,6 +805,9 @@ async fn apply(
         })?);
     }
     let mut tx = state.pool.begin().await?;
+    if let Some(response) = receipt.replay(&mut tx, user.0.id.0.as_bytes()).await? {
+        return Ok(response);
+    }
     sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended('gameboxd:import:' || encode($1::bytea,'hex'),0))")
         .bind(owner).execute(&mut *tx).await?;
     for id in input.archive.game_ids() {
@@ -841,10 +849,11 @@ async fn apply(
         }
         return Err(error.into());
     }
-    tx.commit().await?;
     plan.report.applied = true;
     plan.report.missing_game_ids.clear();
-    Ok(Json(plan.report).into_response())
+    receipt
+        .finish(tx, user.0.id.0.as_bytes(), Json(plan.report))
+        .await
 }
 
 async fn write(
