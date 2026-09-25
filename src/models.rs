@@ -220,6 +220,8 @@ pub struct Profile {
     pub bio_visibility: Visibility,
     pub statistics_visibility: Visibility,
     pub public_enabled: bool,
+    #[sqlx(flatten)]
+    pub sharing_defaults: SharingDefaults,
     pub version: i32,
     pub display_name: String,
     pub bio: String,
@@ -227,7 +229,59 @@ pub struct Profile {
     pub updated_at: DateTime<Utc>,
 }
 
-/// Owner-controlled permission; creation always uses the database's private default.
+/// The visibility each kind of content takes when it comes into existence,
+/// chosen by the owner. All private until they choose otherwise. A default is
+/// read once, at creation; changing it never touches existing content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, FromRow, TS)]
+#[ts(export)]
+#[serde(deny_unknown_fields)]
+pub struct SharingDefaults {
+    /// A game's library entry: its status and the public rating derived from it.
+    #[sqlx(rename = "default_library_visibility")]
+    pub library: Visibility,
+    /// A playthrough's outcome, chosen dates and platform.
+    #[sqlx(rename = "default_summary_visibility")]
+    pub summary: Visibility,
+    #[sqlx(rename = "default_rating_visibility")]
+    pub rating: Visibility,
+    #[sqlx(rename = "default_review_visibility")]
+    pub review: Visibility,
+    #[sqlx(rename = "default_note_visibility")]
+    pub note: Visibility,
+    #[sqlx(rename = "default_list_visibility")]
+    pub list: Visibility,
+}
+
+impl SharingDefaults {
+    pub const PRIVATE: Self = Self {
+        library: Visibility::Private,
+        summary: Visibility::Private,
+        rating: Visibility::Private,
+        review: Visibility::Private,
+        note: Visibility::Private,
+        list: Visibility::Private,
+    };
+
+    /// The defaults new content takes. Content can be written before the
+    /// profile row exists (it is created on first `GET /api/me`); that owner
+    /// has chosen nothing, so everything stays private. A moderation-restricted
+    /// owner's defaults are not applied either: they may keep writing their
+    /// diary, but nothing they write becomes public by default.
+    pub async fn of(conn: &mut sqlx::PgConnection, owner: &[u8]) -> sqlx::Result<Self> {
+        Ok(sqlx::query_as(
+            "SELECT default_library_visibility,default_summary_visibility,default_rating_visibility,
+                    default_review_visibility,default_note_visibility,default_list_visibility
+             FROM profiles WHERE user_id=$1 AND NOT moderation_hidden('profile',public_id)",
+        )
+        .bind(owner)
+        .fetch_optional(conn)
+        .await?
+        .unwrap_or(Self::PRIVATE))
+    }
+}
+
+/// Owner-controlled permission. New content takes the owner's
+/// [`SharingDefaults`] unless the creating request chooses explicitly.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, sqlx::Type, TS)]
 #[ts(export)]
 #[serde(rename_all = "snake_case")]

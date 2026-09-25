@@ -3851,7 +3851,7 @@ async fn diary_notes_enforce_ownership_validation_and_revision_preconditions() {
         json!({"text":"a","presentation_on":"2020-02-30"}),
         json!({"text":"a","user_id":alice_id.0.to_string()}),
         json!({"text":"a","playthrough_id":parent["id"]}),
-        json!({"text":"a","visibility":"public"}),
+        json!({"text":"a","visibility":"friends"}),
     ] {
         f.value(
             "POST",
@@ -6734,7 +6734,7 @@ async fn ordered_lists_validate_edits_and_preserve_independent_history() {
     }
     for input in [
         json!({"title":"x","kind":"wishlist"}),
-        json!({"title":"x","visibility":"public"}),
+        json!({"title":"x","visibility":"friends"}),
         json!({"title":null}),
     ] {
         f.value(
@@ -8468,7 +8468,36 @@ async fn feed_snapshot_never_mixes_following_visibility_and_component_edits() {
     f.finish().await;
 }
 
+/// Undoes the sharing-defaults migration, including its revision of the
+/// moderation guard, so earlier migrations can be re-applied in order.
+async fn undo_sharing_defaults(pool: &PgPool) {
+    let moderation = include_str!("../migrations/202609170002_moderation.sql");
+    let start = moderation
+        .find("CREATE FUNCTION moderation_publication_guard")
+        .unwrap();
+    let end = moderation[start..].find("$$;").unwrap() + start + "$$;".len();
+    let guard = moderation[start..end].replace("CREATE FUNCTION", "CREATE OR REPLACE FUNCTION");
+    sqlx::raw_sql(sqlx::AssertSqlSafe(guard))
+        .execute(pool)
+        .await
+        .unwrap();
+    sqlx::raw_sql(
+        "DROP TRIGGER moderation_publication_insert ON playthroughs;
+        DROP TRIGGER moderation_publication_insert ON diary_notes;
+        DROP TRIGGER moderation_publication_insert ON library_entries;
+        DROP TRIGGER moderation_publication_insert ON game_lists;
+        ALTER TABLE profiles DROP COLUMN default_library_visibility,DROP COLUMN default_summary_visibility,
+            DROP COLUMN default_rating_visibility,DROP COLUMN default_review_visibility,
+            DROP COLUMN default_note_visibility,DROP COLUMN default_list_visibility;
+        DELETE FROM _sqlx_migrations WHERE version=202609260001;",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 async fn undo_moderation(pool: &PgPool) {
+    undo_sharing_defaults(pool).await;
     let profile_sql = include_str!("../migrations/202609160001_public_profiles.sql");
     let views = profile_sql
         .split("CREATE VIEW selected_reviews")
@@ -8792,7 +8821,39 @@ async fn safety_moderation_gates_all_surfaces_preserves_diaries_and_checks_versi
         3
     );
     assert_eq!(browse(&f, &reader, "/api/me/restrictions").await, json!([]));
-    let denied=f.edit("PUT",&format!("{}/visibility",run_path(&run)),&author,&tag(&run),json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"public"}),StatusCode::FORBIDDEN).await;
+    // Restating what is already public changes nothing, so it lifts nothing.
+    let run = f
+        .edit(
+            "PUT",
+            &format!("{}/visibility", run_path(&run)),
+            &author,
+            &tag(&run),
+            json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"public"}),
+            StatusCode::OK,
+        )
+        .await;
+    // Anything that would become public is refused. A moderated note can be
+    // made private, but not published again while the restriction stands.
+    let hidden_note = f
+        .edit(
+            "PUT",
+            &format!("{}/visibility", note_path(&note)),
+            &author,
+            &tag(&note),
+            json!({"visibility":"private"}),
+            StatusCode::OK,
+        )
+        .await;
+    let denied = f
+        .edit(
+            "PUT",
+            &format!("{}/visibility", note_path(&hidden_note)),
+            &author,
+            &tag(&hidden_note),
+            json!({"visibility":"public"}),
+            StatusCode::FORBIDDEN,
+        )
+        .await;
     assert_eq!(denied["error"]["code"], "moderation_restricted");
     let revised = f
         .edit(
@@ -8813,6 +8874,8 @@ async fn safety_moderation_gates_all_surfaces_preserves_diaries_and_checks_versi
     ] {
         restriction(&f, &operator, kind, id, false, 1).await;
     }
+    // Lifted, the note can be shared again, restoring the earlier public view.
+    share_note(&f, &author, &hidden_note).await;
     assert_eq!(
         public_body(&f, &run_url, None, StatusCode::OK).await["review"],
         "Privately corrected"
@@ -8868,17 +8931,45 @@ async fn safety_moderation_gates_all_surfaces_preserves_diaries_and_checks_versi
         browse(&f, &author, "/api/me/statistics").await["playthroughs"]["completed_playthroughs"],
         1
     );
-    let denied = f
+    // Restating the enabled profile changes nothing and is allowed, so a
+    // restricted owner can still manage their settings; sharing anything
+    // further is refused.
+    let restated = f
         .edit(
             "PUT",
             "/api/me/publication",
             &author,
             &tag(&profile),
             json!({"public_enabled":true}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(restated["version"], profile["version"]);
+    let denied = f
+        .edit(
+            "PUT",
+            "/api/me/publication",
+            &author,
+            &tag(&profile),
+            json!({"public_enabled":true,"bio_visibility":"public"}),
             StatusCode::FORBIDDEN,
         )
         .await;
     assert_eq!(denied["error"]["code"], "moderation_restricted");
+    // Defaults can be chosen, but a restricted owner's are not applied: what
+    // they write meanwhile stays private, even after the restriction lifts.
+    f.edit(
+        "PUT",
+        "/api/me/publication",
+        &author,
+        &tag(&profile),
+        json!({"public_enabled":true,"sharing_defaults":
+            sharing("public", "public", "public", "public", "public", "public")}),
+        StatusCode::OK,
+    )
+    .await;
+    let written = feed_run(&f, &author, Some("2001-01-01"), Some("completed")).await;
+    assert_eq!(run_visibility(&written), ["private", "private", "private"]);
     let route = format!(
         "/api/operator/restrictions/profile/{}",
         profile["public_id"].as_str().unwrap()
@@ -11401,5 +11492,469 @@ async fn launch_backup_restore_preserves_all_tables_and_application_behavior() {
         .await
         .unwrap();
     std::fs::remove_dir_all(dir).unwrap();
+    f.finish().await;
+}
+
+fn sharing(
+    library: &str,
+    summary: &str,
+    rating: &str,
+    review: &str,
+    note: &str,
+    list: &str,
+) -> Value {
+    json!({"library":library,"summary":summary,"rating":rating,"review":review,"note":note,"list":list})
+}
+
+fn run_visibility(run: &Value) -> [&str; 3] {
+    [
+        run["summary_visibility"].as_str().unwrap(),
+        run["rating_visibility"].as_str().unwrap(),
+        run["review_visibility"].as_str().unwrap(),
+    ]
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn sharing_defaults_apply_when_content_is_created_and_never_retroactively() {
+    let f = Fixture::new().await;
+    let (_, owner) = f.user("defaults-owner").await;
+    let private = sharing(
+        "private", "private", "private", "private", "private", "private",
+    );
+    let share = sharing("public", "public", "public", "public", "private", "private");
+
+    // A new account has chosen nothing, so it shares nothing.
+    let me = f
+        .value("GET", "/api/me", &owner, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(me["profile"]["sharing_defaults"], private);
+
+    // Defaults are all-or-nothing, so a partial form cannot reset the rest.
+    let partial = f
+        .send(
+            "PUT",
+            "/api/me/publication",
+            Some(&owner),
+            &[("If-Match", &tag(&me["profile"]))],
+            json!({"public_enabled":true,"sharing_defaults":{"library":"public"}}),
+        )
+        .await;
+    assert_eq!(partial.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let profile = f
+        .edit(
+            "PUT",
+            "/api/me/publication",
+            &owner,
+            &tag(&me["profile"]),
+            json!({"public_enabled":true,"sharing_defaults":share}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(profile["sharing_defaults"], share);
+    // Omitting them later keeps them.
+    let profile = f
+        .edit(
+            "PUT",
+            "/api/me/publication",
+            &owner,
+            &tag(&profile),
+            json!({"public_enabled":true}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(profile["sharing_defaults"], share);
+
+    // Starting a game creates a run and a library entry; both take defaults.
+    let started = f
+        .value(
+            "POST",
+            START_RUN,
+            &owner,
+            json!({"igdb_id":42}),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_eq!(run_visibility(&started), ["public", "private", "private"]);
+    let entry = f
+        .value(
+            "GET",
+            "/api/me/library/42",
+            &owner,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(entry["visibility"], "public");
+
+    // A logged run: default for what has content, private for what has none,
+    // and an explicit choice wins over the default.
+    let logged = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &owner,
+            json!({"igdb_id":42,"state":"completed","rating":8,"review":null,
+                "presentation_on":"2020-01-01","started_on":null,"finished_on":null,"platform":null}),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_eq!(run_visibility(&logged), ["public", "public", "private"]);
+    let spoilers = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &owner,
+            json!({"igdb_id":42,"state":"completed","rating":9,"review":"Spoilers",
+                "presentation_on":null,"started_on":null,"finished_on":null,"platform":null,
+                "review_visibility":"private"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_eq!(run_visibility(&spoilers), ["public", "public", "private"]);
+
+    // Asking to publish something that does not exist is an error, reported
+    // before anything is written.
+    let refused = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &owner,
+            json!({"igdb_id":42,"state":null,"rating":null,"review":null,
+                "presentation_on":null,"started_on":null,"finished_on":null,"platform":null,
+                "rating_visibility":"public"}),
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    assert_eq!(refused["error"]["fields"][0]["field"], "rating_visibility");
+
+    // A review added later is new content, so it takes the default. Editing
+    // it afterwards keeps whatever was chosen, even once the default changes.
+    let reviewed = f
+        .edit(
+            "PATCH",
+            &run_path(&logged),
+            &owner,
+            &tag(&logged),
+            json!({"review":"Held up"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(run_visibility(&reviewed), ["public", "public", "public"]);
+    let profile = f
+        .edit(
+            "PUT",
+            "/api/me/publication",
+            &owner,
+            &tag(&profile),
+            json!({"public_enabled":true,"sharing_defaults":private}),
+            StatusCode::OK,
+        )
+        .await;
+    let edited = f
+        .edit(
+            "PATCH",
+            &run_path(&reviewed),
+            &owner,
+            &tag(&reviewed),
+            json!({"review":"Still holds up"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(run_visibility(&edited), ["public", "public", "public"]);
+    // Changing defaults touched nothing that already existed.
+    let entry = f
+        .value(
+            "GET",
+            "/api/me/library/42",
+            &owner,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(entry["visibility"], "public");
+    // An edit may also choose explicitly, in the same request.
+    let hidden = f
+        .edit(
+            "PATCH",
+            &run_path(&edited),
+            &owner,
+            &tag(&edited),
+            json!({"review_visibility":"private"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(run_visibility(&hidden), ["public", "public", "private"]);
+
+    // Notes and lists take their own defaults, never their parent's choice.
+    f.edit(
+        "PUT",
+        "/api/me/publication",
+        &owner,
+        &tag(&profile),
+        json!({"public_enabled":true,"sharing_defaults":share}),
+        StatusCode::OK,
+    )
+    .await;
+    let notes = format!("{}/notes", run_path(&started));
+    let note = f
+        .value(
+            "POST",
+            &notes,
+            &owner,
+            json!({"text":"Day one","presentation_on":null}),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_eq!(note["visibility"], "private");
+    let shared_note = f
+        .value(
+            "POST",
+            &notes,
+            &owner,
+            json!({"text":"Day two","presentation_on":null,"visibility":"public"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_eq!(shared_note["visibility"], "public");
+    let list = f
+        .value(
+            "POST",
+            "/api/me/lists",
+            &owner,
+            json!({"title":"Draft"}),
+            StatusCode::CREATED,
+        )
+        .await;
+    assert_eq!(list["list"]["visibility"], "private");
+
+    // Re-adding a removed game creates a new entry, which takes the default;
+    // an explicit choice on an existing entry changes it.
+    f.call("DELETE", "/api/me/library/42", Some(&owner), Value::Null)
+        .await;
+    let readded = f
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &owner,
+            json!({"status":"backlog"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(readded["visibility"], "public");
+    let hidden_entry = f
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &owner,
+            json!({"status":"backlog","visibility":"private"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(hidden_entry["visibility"], "private");
+
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn bulk_visibility_changes_only_named_kinds_and_skips_missing_content() {
+    let f = Fixture::new().await;
+    let (_, owner) = f.user("bulk-owner").await;
+    let (_, visitor) = f.user("bulk-visitor").await;
+    let profile = publication(&f, &owner, true).await;
+    let public_id = profile["public_id"].as_str().unwrap().to_owned();
+    let run = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &owner,
+            json!({"igdb_id":42,"state":"completed","rating":7,"review":null,
+                "presentation_on":"2021-05-05","started_on":null,"finished_on":null,"platform":null}),
+            StatusCode::CREATED,
+        )
+        .await;
+    f.value(
+        "POST",
+        &format!("{}/notes", run_path(&run)),
+        &owner,
+        json!({"text":"A note","presentation_on":null}),
+        StatusCode::CREATED,
+    )
+    .await;
+    f.value(
+        "PUT",
+        "/api/me/library/42",
+        &owner,
+        json!({"status":"completed"}),
+        StatusCode::OK,
+    )
+    .await;
+
+    // Everything above is private: this account never chose defaults.
+    let counts = |body: Value| body["counts"].clone();
+    let before = counts(
+        public_body(
+            &f,
+            &format!("/api/public/profiles/{public_id}"),
+            Some(&visitor),
+            StatusCode::OK,
+        )
+        .await,
+    );
+    assert_eq!(before["playthroughs"], 0);
+    assert_eq!(before["ratings"], 0);
+
+    // Unauthenticated bulk writes are refused like any owner write.
+    assert_eq!(
+        f.call(
+            "PUT",
+            "/api/me/visibility",
+            None,
+            json!({"summary":"public"})
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let report = f
+        .value(
+            "PUT",
+            "/api/me/visibility",
+            &owner,
+            json!({"summary":"public","rating":"public","review":"public","note":"public"}),
+            StatusCode::OK,
+        )
+        .await;
+    // There is no review to publish, and the library was not named.
+    assert_eq!(
+        report,
+        json!({"library":0,"summary":1,"rating":1,"review":0,"note":1,"list":0})
+    );
+    let after = counts(
+        public_body(
+            &f,
+            &format!("/api/public/profiles/{public_id}"),
+            Some(&visitor),
+            StatusCode::OK,
+        )
+        .await,
+    );
+    assert_eq!(after["playthroughs"], 1);
+    assert_eq!(after["ratings"], 1);
+    assert_eq!(after["notes"], 1);
+    assert_eq!(after["reviews"], 0);
+    assert_eq!(after["library"], 0);
+
+    // The changed run has a new revision, so a stale editor cannot revert it.
+    let stale = f
+        .send(
+            "PATCH",
+            &run_path(&run),
+            Some(&owner),
+            &[("If-Match", &tag(&run))],
+            json!({"rating":6}),
+        )
+        .await;
+    assert_eq!(stale.status(), StatusCode::PRECONDITION_FAILED);
+
+    // Repeating the request changes nothing, and says so.
+    let again = f
+        .value(
+            "PUT",
+            "/api/me/visibility",
+            &owner,
+            json!({"summary":"public","rating":"public","review":"public","note":"public"}),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        again,
+        json!({"library":0,"summary":0,"rating":0,"review":0,"note":0,"list":0})
+    );
+    let unknown = f
+        .call(
+            "PUT",
+            "/api/me/visibility",
+            Some(&owner),
+            json!({"reviews":"public"}),
+        )
+        .await;
+    assert_eq!(unknown.status(), StatusCode::UNPROCESSABLE_ENTITY);
+
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL; run cargo test --test backend -- --ignored"]
+async fn personal_import_stays_private_whatever_the_destination_defaults() {
+    let f = Fixture::new().await;
+    let (_, source) = f.user("import-defaults-source").await;
+    let (_, dest) = f.user("import-defaults-dest").await;
+    let run = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &source,
+            json!({"igdb_id":42,"state":"completed","rating":7,"review":"Imported review",
+                "presentation_on":null,"started_on":null,"finished_on":null,"platform":null}),
+            StatusCode::CREATED,
+        )
+        .await;
+    f.value(
+        "POST",
+        &format!("{}/notes", run_path(&run)),
+        &source,
+        json!({"text":"Imported note","presentation_on":null}),
+        StatusCode::CREATED,
+    )
+    .await;
+    let archive = f
+        .value(
+            "GET",
+            "/api/me/export",
+            &source,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    let me = f
+        .value("GET", "/api/me", &dest, Value::Null, StatusCode::OK)
+        .await;
+    f.edit(
+        "PUT",
+        "/api/me/publication",
+        &dest,
+        &tag(&me["profile"]),
+        json!({"public_enabled":true,"sharing_defaults":
+            sharing("public", "public", "public", "public", "public", "public")}),
+        StatusCode::OK,
+    )
+    .await;
+    f.value(
+        "POST",
+        "/api/me/import",
+        &dest,
+        json!({"archive":archive,"profile_policy":"keep"}),
+        StatusCode::OK,
+    )
+    .await;
+    let runs = f
+        .value(
+            "GET",
+            "/api/me/playthroughs",
+            &dest,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(
+        run_visibility(&runs["data"][0]),
+        ["private", "private", "private"]
+    );
+    let notes = f
+        .value("GET", "/api/me/diary", &dest, Value::Null, StatusCode::OK)
+        .await;
+    assert_eq!(notes["data"][0]["visibility"], "private");
     f.finish().await;
 }

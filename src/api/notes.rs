@@ -35,6 +35,11 @@ pub struct DiaryNote {
 pub struct NoteInput {
     pub text: String,
     pub presentation_on: Option<NaiveDate>,
+    /// Omitted or null: a new note takes the owner's note default, and an
+    /// edited one keeps its choice.
+    #[serde(default)]
+    #[ts(optional)]
+    pub visibility: Option<Visibility>,
 }
 
 impl NoteInput {
@@ -71,6 +76,10 @@ pub struct NotePatch {
     #[serde(default)]
     #[ts(optional = nullable, as = "Option<NaiveDate>")]
     pub presentation_on: Patch<NaiveDate>,
+    /// Omitted or null keeps the note's choice.
+    #[serde(default)]
+    #[ts(optional)]
+    pub visibility: Option<Visibility>,
 }
 
 #[derive(Default)]
@@ -200,9 +209,15 @@ async fn create(
         return Ok(response);
     }
     lock_parent(&mut tx, owner, parent).await?;
+    // The owner's note default, never the parent run's choice: a note does
+    // not inherit publication from what it was written under.
+    let visibility = match input.visibility {
+        Some(visibility) => visibility,
+        None => SharingDefaults::of(&mut tx, owner).await?.note,
+    };
     let id = Uuid::new_v4();
-    sqlx::query("INSERT INTO diary_notes (id,user_id,playthrough_id,text,presentation_on) VALUES ($1,$2,$3,$4,$5)")
-        .bind(id).bind(owner).bind(parent).bind(input.text).bind(input.presentation_on)
+    sqlx::query("INSERT INTO diary_notes (id,user_id,playthrough_id,text,presentation_on,visibility) VALUES ($1,$2,$3,$4,$5,$6)")
+        .bind(id).bind(owner).bind(parent).bind(input.text).bind(input.presentation_on).bind(visibility)
         .execute(&mut *tx).await?;
     let row = saved(&mut tx, owner, id).await?;
     receipt
@@ -281,6 +296,7 @@ async fn update(
     edit(&state, &user, id, &precondition, |current| NoteInput {
         text: input.text.0.unwrap_or(current.text),
         presentation_on: input.presentation_on.apply(current.presentation_on),
+        visibility: input.visibility,
     })
     .await
 }
@@ -296,11 +312,12 @@ async fn edit(
     let mut tx = state.pool.begin().await?;
     let current = locked_note(&mut tx, owner, id, precondition).await?;
     let input = merge(current).validated()?;
-    sqlx::query("UPDATE diary_notes SET text=$3,presentation_on=$4 WHERE user_id=$1 AND id=$2")
+    sqlx::query("UPDATE diary_notes SET text=$3,presentation_on=$4,visibility=COALESCE($5,visibility) WHERE user_id=$1 AND id=$2")
         .bind(owner)
         .bind(id)
         .bind(input.text)
         .bind(input.presentation_on)
+        .bind(input.visibility)
         .execute(&mut *tx)
         .await?;
     let row = saved(&mut tx, owner, id).await?;

@@ -34,7 +34,8 @@ Base URL: `http://localhost:3000`. All bodies are JSON unless a response is `204
 | PUT | `/api/me/notes/{id}` | Yes | Replace note text/date; requires `If-Match` |
 | PATCH | `/api/me/notes/{id}` | Yes | Edit note text/date; requires `If-Match` |
 | DELETE | `/api/me/notes/{id}` | Yes | Delete note (204); requires `If-Match` |
-| PUT | `/api/me/publication` | Yes | Enable/disable public profile; requires profile `If-Match` |
+| PUT | `/api/me/publication` | Yes | Enable/disable public profile, bio/statistics sharing and sharing defaults; requires profile `If-Match` |
+| PUT | `/api/me/visibility` | Yes | Set every existing item of the named kinds to one visibility; returns changed counts |
 | PUT | `/api/me/library/{igdb_id}/visibility` | Yes | Set library entry visibility; requires entry `If-Match` |
 | PUT | `/api/me/playthroughs/{id}/visibility` | Yes | Set independent summary/rating/review visibility; requires playthrough `If-Match` |
 | PUT | `/api/me/notes/{id}/visibility` | Yes | Set note visibility; requires note `If-Match` |
@@ -464,15 +465,81 @@ Email links only start signup/recovery; they do not create sessions on their own
 
 ## Per-item visibility and public representations
 
-All personal content starts private, including existing records after migration,
-new runs/replays, new notes under public runs, and newly re-added library entries.
-Creation and ordinary content endpoints do not accept visibility fields. Publish
-with a separate explicit visibility write after reading the saved resource.
-Changing display name/bio, library status, lifecycle state, note text, or review
-text preserves that resource's existing choice. New children never inherit it.
-Clearing a rating or review to null resets that component's visibility to private;
-adding its replacement later requires a new publication choice. Changing an
-existing published rating/review is an edit to that public item.
+New content takes the owner's **sharing defaults** (below), which start private
+for every account, so an owner who has chosen nothing publishes nothing. A
+default is the owner's explicit choice for a kind of content; nothing inherits
+publication from a parent, so a public run never makes its later notes public.
+Existing records were not changed by the introduction of defaults, and personal
+import always writes private items whatever the defaults are.
+
+Writes that create content accept an optional explicit choice that overrides the
+default in the same request, so there is never a moment when something is public
+that the owner meant to keep private. Changing display name/bio, library status,
+lifecycle state, note text, or review text preserves that resource's existing
+choice. Clearing a rating or review to null resets that component's visibility to
+private; a rating or review added later is new content and takes the default
+(or the choice sent with it). Changing an existing published rating/review is an
+edit to that public item. The per-item visibility routes change a choice later.
+
+### Sharing defaults
+
+`Profile.sharing_defaults` holds one visibility per kind, all `private` until the
+owner chooses:
+
+| Key | Applies to | Taken when |
+| --- | --- | --- |
+| `library` | Library entry (status and derived public rating) | An entry is created: `PUT /api/me/library/{igdb_id}` for a game not in the library, starting a run, or re-adding a removed game |
+| `summary` | Playthrough outcome, chosen dates, platform | A playthrough is created (logged or started) |
+| `rating` | Playthrough rating | A playthrough is created with a rating, or an edit gives a rating to one that had none |
+| `review` | Playthrough review | As `rating`, for reviews |
+| `note` | Diary note | A note is created |
+| `list` | Custom or favorites list | A list is created |
+
+Write them with `PUT /api/me/publication`, alongside the required
+`public_enabled`:
+
+```json
+{"public_enabled":true,"sharing_defaults":{"library":"public","summary":"public","rating":"public","review":"public","note":"private","list":"private"}}
+```
+
+Omission/null keeps the stored defaults; when present, all six keys are required,
+so a partial form cannot silently reset one. Changing defaults never changes
+existing content. A default that is `public` for a rating or review has nothing
+to apply to when the component is empty, which then stays private.
+
+Explicit choices on creating and editing writes, each optional:
+
+| Body | Fields |
+| --- | --- |
+| `EntryInput` | `visibility`: sets the entry's visibility; omitted, a new entry takes `library` and an existing one keeps its choice |
+| `StartPlaythroughInput` | `summary_visibility`; `library_visibility` (as `EntryInput.visibility`, for the entry set to playing) |
+| `CreatePlaythroughInput`, `PlaythroughInput`, `PlaythroughPatch` | `summary_visibility`, `rating_visibility`, `review_visibility`: omitted, a component gaining content takes its default and one that already had content keeps its choice. In `PlaythroughInput`, omission never means private: visibility is not content. |
+| `NoteInput` (create and replace), `NotePatch` | `visibility`: omitted, a new note takes `note` and an edited one keeps its choice |
+| `CreateListInput` | `visibility`: omitted, `list` |
+
+Explicitly publishing a rating or review that the write leaves empty is
+`400 validation_error` naming `rating_visibility` or `review_visibility`, checked
+before anything is stored or imported.
+
+### Changing every item at once
+
+`PUT /api/me/visibility` sets every existing item of each named kind to one
+visibility, in one transaction. The keys are those of `sharing_defaults`, each
+optional; a kind left out is untouched. Sending the owner's `sharing_defaults`
+applies them retroactively.
+
+```json
+{"summary":"public","rating":"public","review":"public","note":"private"}
+```
+
+The response counts the items each kind changed, so repeating a request reports
+zeros: `{"library":0,"summary":12,"rating":9,"review":4,"note":0,"list":0}`.
+Ratings and reviews apply only to playthroughs that have one. Every changed item
+advances its own revision, so an editor holding an older tag gets `412` rather
+than reverting the change. Row locks are taken in the order single-item writers
+use (playthroughs, notes, library entries, lists), so concurrent item writes wait
+rather than deadlock. No `If-Match` is required: the request names its outcome
+rather than editing a revision.
 
 The profile's `public_enabled` switch is a separate gate. Initialize/read the
 profile with `GET /api/me`, then send:
@@ -1178,13 +1245,16 @@ progress can complete against its authorized statement/transaction snapshot.
 Private owner reads, corrections, deletion and statistics remain available;
 moderation never deletes the diary or changes its visibility choices, timestamps
 or revision. `GET /api/me/restrictions` explains which selections are suppressed.
-Explicit visibility/publication writes selecting restricted public content
-return 403 `moderation_restricted`. Owners can turn selections private, but
-cannot clear restrictions or make a restricted component public through edits.
-Under an account restriction, a playthrough visibility write must select all
-components private; to revise profile publication choices, disable the profile.
-Private content edits may retain their stored public selection while remaining
-suppressed. Restoration makes content eligible only if its owner still selects
+A write that would make restricted content public returns 403
+`moderation_restricted`: a component that becomes public (or is created public)
+while its item or account is restricted. Restating a selection that is already
+public changes nothing and is allowed, so owners can keep editing and can turn
+selections private, but cannot clear restrictions or make a restricted component
+public through edits. Under an account restriction nothing can become public, and
+the owner's sharing defaults are not applied, so content written meanwhile is
+private even after the restriction lifts. The owner may still save publication
+settings that share nothing new, such as sharing defaults. Private content edits
+may retain their stored public selection while remaining suppressed. Restoration makes content eligible only if its owner still selects
 it and the profile is enabled; it creates no public chronology event. New copies
 have new identities: use an account restriction when item-level moderation is
 insufficient to stop repeated public abuse.

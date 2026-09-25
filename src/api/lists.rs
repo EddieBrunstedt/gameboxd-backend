@@ -82,6 +82,10 @@ pub struct CreateListInput {
     #[serde(default)]
     #[ts(optional, as = "Option<String>")]
     pub description: String,
+    /// Omitted or null: the owner's list default.
+    #[serde(default)]
+    #[ts(optional)]
+    pub visibility: Option<Visibility>,
 }
 
 #[derive(Deserialize, TS)]
@@ -270,9 +274,13 @@ async fn create(
     if let Some(response) = receipt.replay(&mut tx, user.0.id.0.as_bytes()).await? {
         return Ok(response);
     }
-    let inserted: Option<Uuid> = sqlx::query_scalar("INSERT INTO game_lists (id,user_id,kind,title,description)
-        VALUES ($1,$2,$3,$4,$5) ON CONFLICT (user_id) WHERE kind='favorites' DO NOTHING RETURNING id")
-        .bind(id).bind(owner).bind(input.kind).bind(metadata.title).bind(metadata.description)
+    let visibility = match input.visibility {
+        Some(visibility) => visibility,
+        None => SharingDefaults::of(&mut tx, owner).await?.list,
+    };
+    let inserted: Option<Uuid> = sqlx::query_scalar("INSERT INTO game_lists (id,user_id,kind,title,description,visibility)
+        VALUES ($1,$2,$3,$4,$5,$6) ON CONFLICT (user_id) WHERE kind='favorites' DO NOTHING RETURNING id")
+        .bind(id).bind(owner).bind(input.kind).bind(metadata.title).bind(metadata.description).bind(visibility)
         .fetch_optional(&mut *tx).await?;
     if inserted.is_none() {
         return Err(ApiError::new(

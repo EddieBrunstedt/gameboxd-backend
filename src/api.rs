@@ -24,6 +24,7 @@ mod retry;
 use browsing::{BrowsePage, BrowseQuery, Kind};
 mod profiles;
 mod sharing;
+use sharing::{RunChoice, RunVisibility};
 mod social;
 mod statistics;
 mod transfer;
@@ -33,8 +34,8 @@ use crate::{
     error::{ApiError, ApiResult, ErrorCode, FieldError, FieldErrorCode},
     igdb::{CatalogGame, validate_search},
     models::{
-        Game, LibraryEntry, PlayStatus, Playthrough, PlaythroughState, Profile, attach_game,
-        ensure_game, find_game,
+        Game, LibraryEntry, PlayStatus, Playthrough, PlaythroughState, Profile, SharingDefaults,
+        Visibility, attach_game, ensure_game, find_game,
     },
 };
 
@@ -535,6 +536,11 @@ async fn entry(
 #[serde(deny_unknown_fields)]
 pub struct EntryInput {
     pub status: PlayStatus,
+    /// Omitted: a new entry takes the owner's library default and an existing
+    /// one keeps its choice.
+    #[serde(default)]
+    #[ts(optional)]
+    pub visibility: Option<Visibility>,
 }
 
 async fn save_entry(
@@ -564,14 +570,15 @@ async fn save_entry(
             "Use a lifecycle action while this game has a current run",
         ));
     }
-    sqlx::query(
-        "INSERT INTO library_entries (user_id,game_id,status) VALUES ($1,$2,$3)
-        ON CONFLICT (user_id,game_id) DO UPDATE SET status=EXCLUDED.status,updated_at=now()",
+    let defaults = SharingDefaults::of(&mut transaction, owner).await?;
+    upsert_entry(
+        &mut transaction,
+        owner,
+        game.id,
+        input.status,
+        input.visibility,
+        defaults,
     )
-    .bind(user.0.id.0.as_bytes().as_slice())
-    .bind(game.id)
-    .bind(input.status)
-    .execute(&mut *transaction)
     .await?;
     let row = sqlx::query_as(
         "SELECT *
@@ -583,6 +590,32 @@ async fn save_entry(
     .await?;
     transaction.commit().await?;
     Ok(Json(row))
+}
+
+/// Sets a game's library status, creating the entry if needed. A created entry
+/// takes `visibility` or else the owner's default; an existing one changes
+/// visibility only when asked. Callers hold the owner/game lifecycle lock.
+async fn upsert_entry(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    owner: &[u8],
+    game_id: Uuid,
+    status: PlayStatus,
+    visibility: Option<Visibility>,
+    defaults: SharingDefaults,
+) -> ApiResult<()> {
+    sqlx::query(
+        "INSERT INTO library_entries (user_id,game_id,status,visibility) VALUES ($1,$2,$3,$4)
+        ON CONFLICT (user_id,game_id) DO UPDATE
+        SET status=EXCLUDED.status,visibility=COALESCE($5,library_entries.visibility),updated_at=now()",
+    )
+    .bind(owner)
+    .bind(game_id)
+    .bind(status)
+    .bind(visibility.unwrap_or(defaults.library))
+    .bind(visibility)
+    .execute(&mut **transaction)
+    .await?;
+    Ok(())
 }
 
 async fn remove_entry(
@@ -785,7 +818,8 @@ impl From<&Playthrough> for PlaythroughFields {
 }
 
 /// A complete replacement of the editable fields: an omitted field is cleared,
-/// exactly as an explicit `null` is.
+/// exactly as an explicit `null` is. Visibility is not content: an omitted
+/// choice is never a request to make something private.
 #[derive(Debug, Deserialize, TS)]
 #[ts(export)]
 #[serde(deny_unknown_fields)]
@@ -797,6 +831,27 @@ pub struct PlaythroughInput {
     pub started_on: Option<NaiveDate>,
     pub finished_on: Option<NaiveDate>,
     pub platform: Option<String>,
+    /// Omitted or null: a component this write gives content takes the owner's
+    /// default, and one that already had content keeps its choice.
+    #[serde(default)]
+    #[ts(optional)]
+    pub summary_visibility: Option<Visibility>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub rating_visibility: Option<Visibility>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub review_visibility: Option<Visibility>,
+}
+
+impl PlaythroughInput {
+    fn choice(&self) -> RunChoice {
+        RunChoice {
+            summary: self.summary_visibility,
+            rating: self.rating_visibility,
+            review: self.review_visibility,
+        }
+    }
 }
 
 impl From<PlaythroughInput> for PlaythroughFields {
@@ -811,6 +866,9 @@ impl From<PlaythroughInput> for PlaythroughFields {
             started_on,
             finished_on,
             platform,
+            summary_visibility: _,
+            rating_visibility: _,
+            review_visibility: _,
         } = input;
         Self {
             state,
@@ -856,10 +914,29 @@ pub struct PlaythroughPatch {
     #[serde(default)]
     #[ts(optional = nullable, as = "Option<String>")]
     pub platform: Patch<String>,
+    /// Omitted or null: a component this write gives content takes the owner's
+    /// default, and one that already had content keeps its choice.
+    #[serde(default)]
+    #[ts(optional)]
+    pub summary_visibility: Option<Visibility>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub rating_visibility: Option<Visibility>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub review_visibility: Option<Visibility>,
 }
 
 impl PlaythroughPatch {
+    fn choice(&self) -> RunChoice {
+        RunChoice {
+            summary: self.summary_visibility,
+            rating: self.rating_visibility,
+            review: self.review_visibility,
+        }
+    }
     fn apply(self, current: PlaythroughFields) -> PlaythroughFields {
+        // Visibility is resolved separately, from `choice`.
         PlaythroughFields {
             state: self.state.apply(current.state),
             rating: self.rating.apply(current.rating),
@@ -893,6 +970,27 @@ pub struct CreatePlaythroughInput {
     pub started_on: Option<NaiveDate>,
     pub finished_on: Option<NaiveDate>,
     pub platform: Option<String>,
+    /// Omitted or null: a component this write gives content takes the owner's
+    /// default, and one that already had content keeps its choice.
+    #[serde(default)]
+    #[ts(optional)]
+    pub summary_visibility: Option<Visibility>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub rating_visibility: Option<Visibility>,
+    #[serde(default)]
+    #[ts(optional)]
+    pub review_visibility: Option<Visibility>,
+}
+
+impl CreatePlaythroughInput {
+    fn choice(&self) -> RunChoice {
+        RunChoice {
+            summary: self.summary_visibility,
+            rating: self.rating_visibility,
+            review: self.review_visibility,
+        }
+    }
 }
 
 impl From<CreatePlaythroughInput> for PlaythroughFields {
@@ -906,6 +1004,9 @@ impl From<CreatePlaythroughInput> for PlaythroughFields {
             started_on,
             finished_on,
             platform,
+            summary_visibility: _,
+            rating_visibility: _,
+            review_visibility: _,
         } = input;
         Self {
             state,
@@ -1091,7 +1192,9 @@ async fn create_playthrough(
         return Err(ApiError::invalid("IGDB ID must be positive"));
     }
     let igdb_id = input.igdb_id;
+    let choice = input.choice();
     let fields = PlaythroughFields::from(input).validated()?;
+    choice.validate(&fields)?;
     if let Some(response) = receipt.cached(&state.pool, user.0.id.0.as_bytes()).await? {
         return Ok(response);
     }
@@ -1100,13 +1203,18 @@ async fn create_playthrough(
     if let Some(response) = receipt.replay(&mut tx, user.0.id.0.as_bytes()).await? {
         return Ok(response);
     }
+    let owner = user.0.id.0.as_bytes().as_slice();
+    let defaults = SharingDefaults::of(&mut tx, owner).await?;
+    let visibility = RunVisibility::resolve(choice, defaults, None, &fields);
     let row = sqlx::query_as(
-        "INSERT INTO playthroughs (id,user_id,game_id,rating,review,started_on,finished_on,platform,presentation_on,state)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING *, $11::bigint AS igdb_id",
+        "INSERT INTO playthroughs (id,user_id,game_id,rating,review,started_on,finished_on,platform,presentation_on,state,
+            summary_visibility,rating_visibility,review_visibility)
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *, $14::bigint AS igdb_id",
     )
-    .bind(Uuid::new_v4()).bind(user.0.id.0.as_bytes().as_slice()).bind(game.id)
+    .bind(Uuid::new_v4()).bind(owner).bind(game.id)
     .bind(fields.rating).bind(fields.review).bind(fields.started_on)
     .bind(fields.finished_on).bind(fields.platform).bind(fields.presentation_on).bind(fields.state)
+    .bind(visibility.summary).bind(visibility.rating).bind(visibility.review)
     .bind(igdb_id).fetch_one(&mut *tx).await?;
     receipt
         .finish(
@@ -1127,7 +1235,8 @@ async fn replace_playthrough(
     let id = path(id)?;
     let precondition = required_precondition(&headers)?;
     let input = body(payload)?;
-    edit_playthrough(&state, &user, id, &precondition, |_| {
+    let choice = input.choice();
+    edit_playthrough(&state, &user, id, &precondition, choice, |_| {
         PlaythroughFields::from(input)
     })
     .await
@@ -1143,7 +1252,8 @@ async fn update_playthrough(
     let id = path(id)?;
     let precondition = required_precondition(&headers)?;
     let input = body(payload)?;
-    edit_playthrough(&state, &user, id, &precondition, |current| {
+    let choice = input.choice();
+    edit_playthrough(&state, &user, id, &precondition, choice, |current| {
         input.apply(current)
     })
     .await
@@ -1161,6 +1271,7 @@ async fn edit_playthrough(
     user: &AuthUser,
     id: Uuid,
     precondition: &Precondition,
+    choice: RunChoice,
     merge: impl FnOnce(PlaythroughFields) -> PlaythroughFields,
 ) -> ApiResult<Tagged> {
     let owner = user.0.id.0.as_bytes().as_slice();
@@ -1181,13 +1292,17 @@ async fn edit_playthrough(
         return Err(stale());
     }
     let fields = merge(PlaythroughFields::from(&current)).validated()?;
+    choice.validate(&fields)?;
     if current.is_current && fields.state != current.state {
         return Err(lifecycle_conflict(
             "Use a lifecycle action to change the current run's state",
         ));
     }
+    let defaults = SharingDefaults::of(&mut transaction, owner).await?;
+    let visibility = RunVisibility::resolve(choice, defaults, Some(&current), &fields);
     let row = sqlx::query_as(
-        "UPDATE playthroughs p SET rating=$3,review=$4,started_on=$5,finished_on=$6,platform=$7,presentation_on=$8,state=$9
+        "UPDATE playthroughs p SET rating=$3,review=$4,started_on=$5,finished_on=$6,platform=$7,presentation_on=$8,state=$9,
+            summary_visibility=$10,rating_visibility=$11,review_visibility=$12
          FROM games g WHERE p.user_id=$1 AND p.id=$2 AND g.id=p.game_id
          RETURNING p.*,g.igdb_id",
     )
@@ -1200,6 +1315,9 @@ async fn edit_playthrough(
     .bind(fields.platform)
     .bind(fields.presentation_on)
     .bind(fields.state)
+    .bind(visibility.summary)
+    .bind(visibility.rating)
+    .bind(visibility.review)
     .fetch_one(&mut *transaction)
     .await?;
     transaction.commit().await?;
@@ -1313,6 +1431,15 @@ pub struct StartPlaythroughInput {
     pub igdb_id: i64,
     pub started_on: Option<NaiveDate>,
     pub platform: Option<String>,
+    /// The new run's summary. Omitted or null: the owner's default.
+    #[serde(default)]
+    #[ts(optional)]
+    pub summary_visibility: Option<Visibility>,
+    /// The library entry, which starting sets to playing. Omitted or null: a
+    /// new entry takes the owner's default and an existing one keeps its choice.
+    #[serde(default)]
+    #[ts(optional)]
+    pub library_visibility: Option<Visibility>,
 }
 
 async fn start_playthrough(
@@ -1362,26 +1489,29 @@ async fn start_playthrough(
             "This game already has a current run; finish or abandon it before starting a replay",
         ));
     }
+    let defaults = SharingDefaults::of(&mut transaction, owner).await?;
     let row = sqlx::query_as(
         "INSERT INTO playthroughs
-        (id,user_id,game_id,state,is_current,started_on,platform)
-        VALUES ($1,$2,$3,'active',true,$4,$5) RETURNING *, $6::bigint AS igdb_id",
+        (id,user_id,game_id,state,is_current,started_on,platform,summary_visibility)
+        VALUES ($1,$2,$3,'active',true,$4,$5,$6) RETURNING *, $7::bigint AS igdb_id",
     )
     .bind(Uuid::new_v4())
     .bind(owner)
     .bind(game.id)
     .bind(fields.started_on)
     .bind(fields.platform)
+    .bind(input.summary_visibility.unwrap_or(defaults.summary))
     .bind(input.igdb_id)
     .fetch_one(&mut *transaction)
     .await?;
-    sqlx::query(
-        "INSERT INTO library_entries (user_id,game_id,status) VALUES ($1,$2,'playing')
-        ON CONFLICT (user_id,game_id) DO UPDATE SET status='playing',updated_at=now()",
+    upsert_entry(
+        &mut transaction,
+        owner,
+        game.id,
+        PlayStatus::Playing,
+        input.library_visibility,
+        defaults,
     )
-    .bind(owner)
-    .bind(game.id)
-    .execute(&mut *transaction)
     .await?;
     receipt
         .finish(

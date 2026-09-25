@@ -35,6 +35,8 @@ import type { HandleInput } from "./types/HandleInput";
 import type { PublicationInput } from "./types/PublicationInput";
 import type { VisibilityInput } from "./types/VisibilityInput";
 import type { PlaythroughVisibilityInput } from "./types/PlaythroughVisibilityInput";
+import type { BulkVisibilityInput } from "./types/BulkVisibilityInput";
+import type { BulkVisibilityReport } from "./types/BulkVisibilityReport";
 import type { PublicLibraryEntry } from "./types/PublicLibraryEntry";
 import type { PublicPlaythrough } from "./types/PublicPlaythrough";
 import type { PublicRating } from "./types/PublicRating";
@@ -388,6 +390,13 @@ export const setPlaythroughVisibility = (current: Playthrough, input: Playthroug
 
 export const setNoteVisibility = (current: DiaryNote, input: VisibilityInput): Promise<DiaryNote> =>
   request("PUT", `/api/me/notes/${current.id}/visibility`, { body: input, ifMatch: precondition(current) });
+
+/**
+ * Sets every existing item of each named kind at once; kinds left out are
+ * untouched. Send the profile's `sharing_defaults` to apply them retroactively.
+ */
+export const setAllVisibility = (input: BulkVisibilityInput): Promise<BulkVisibilityReport> =>
+  request("PUT", "/api/me/visibility", { body: input });
 
 /** These reads apply identical visibility rules with or without a session. */
 export const publicLibraryEntry = (id: string): Promise<PublicLibraryEntry> =>
