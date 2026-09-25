@@ -384,7 +384,7 @@ async fn set_playthrough_visibility(
     let mut tx = state.pool.begin().await?;
     lock_playthrough_game(&mut tx, owner, id).await?;
     let current: Playthrough = sqlx::query_as(
-        "SELECT p.*,g.igdb_id FROM playthroughs p JOIN games g ON g.id=p.game_id
+        "SELECT p.*,g.igdb_id,g.name AS game_name,g.slug AS game_slug,g.cover_url FROM playthroughs p JOIN games g ON g.id=p.game_id
          WHERE p.user_id=$1 AND p.id=$2 FOR NO KEY UPDATE OF p",
     )
     .bind(owner)
@@ -403,7 +403,7 @@ async fn set_playthrough_visibility(
     .validate(&PlaythroughFields::from(&current))?;
     let row = sqlx::query_as(
         "UPDATE playthroughs p SET summary_visibility=$3,rating_visibility=$4,review_visibility=$5
-         FROM games g WHERE p.user_id=$1 AND p.id=$2 AND g.id=p.game_id RETURNING p.*,g.igdb_id",
+         FROM games g WHERE p.user_id=$1 AND p.id=$2 AND g.id=p.game_id RETURNING p.*,g.igdb_id,g.name AS game_name,g.slug AS game_slug,g.cover_url",
     )
     .bind(owner)
     .bind(id)
@@ -456,6 +456,8 @@ pub struct PublicLibraryEntry {
     pub id: Uuid,
     pub author_name: String,
     pub author_id: Uuid,
+    /// The author's current canonical handle, read live; null without one.
+    pub author_handle: Option<String>,
     #[sqlx(flatten)]
     pub game: PublicGame,
     pub status: PlayStatus,
@@ -485,6 +487,8 @@ pub struct PublicPlaythrough {
     pub id: Uuid,
     pub author_name: String,
     pub author_id: Uuid,
+    /// The author's current canonical handle, read live; null without one.
+    pub author_handle: Option<String>,
     #[sqlx(flatten)]
     pub game: PublicGame,
     pub presentation_on: Option<NaiveDate>,
@@ -492,6 +496,8 @@ pub struct PublicPlaythrough {
     pub started_on: Option<NaiveDate>,
     pub finished_on: Option<NaiveDate>,
     pub platform: Option<String>,
+    /// The same run's rating, only when that rating is itself public.
+    pub rating: Option<i16>,
 }
 
 async fn summary(
@@ -516,6 +522,8 @@ pub struct PublicRating {
     pub id: Uuid,
     pub author_name: String,
     pub author_id: Uuid,
+    /// The author's current canonical handle, read live; null without one.
+    pub author_handle: Option<String>,
     #[sqlx(flatten)]
     pub game: PublicGame,
     pub presentation_on: Option<NaiveDate>,
@@ -544,10 +552,14 @@ pub struct PublicReview {
     pub id: Uuid,
     pub author_name: String,
     pub author_id: Uuid,
+    /// The author's current canonical handle, read live; null without one.
+    pub author_handle: Option<String>,
     #[sqlx(flatten)]
     pub game: PublicGame,
     pub presentation_on: Option<NaiveDate>,
     pub review: String,
+    /// The same run's rating, only when that rating is itself public.
+    pub rating: Option<i16>,
 }
 
 async fn review(
@@ -572,6 +584,8 @@ pub struct PublicNote {
     pub id: Uuid,
     pub author_name: String,
     pub author_id: Uuid,
+    /// The author's current canonical handle, read live; null without one.
+    pub author_handle: Option<String>,
     #[sqlx(flatten)]
     pub game: PublicGame,
     pub presentation_on: Option<NaiveDate>,
@@ -628,6 +642,9 @@ mod tests {
             is_current: false,
             id: Uuid::nil(),
             igdb_id: 1,
+            game_name: String::new(),
+            game_slug: String::new(),
+            cover_url: None,
             version: 1,
             rating,
             review: review.map(str::to_owned),

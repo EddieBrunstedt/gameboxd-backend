@@ -198,6 +198,9 @@ pub struct Playthrough {
     pub is_current: bool,
     pub id: Uuid,
     pub igdb_id: i64,
+    pub game_name: String,
+    pub game_slug: String,
+    pub cover_url: Option<String>,
     // Revision counter, incremented by the database on every real change.
     // Published so a client holding a listed playthrough can edit it without
     // re-reading the single-resource route for its `ETag`.

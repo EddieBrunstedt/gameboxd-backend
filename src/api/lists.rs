@@ -62,6 +62,8 @@ pub struct PublicList {
     pub game_count: i64,
     pub author_id: Uuid,
     pub author_name: String,
+    /// The author's current canonical handle, read live; null without one.
+    pub author_handle: Option<String>,
 }
 
 #[derive(Serialize, TS)]

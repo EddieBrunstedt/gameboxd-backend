@@ -398,6 +398,9 @@ pub struct Me {
     pub id: Uuid,
     pub email: Option<String>,
     pub profile: Profile,
+    /// Whether a live operator grant exists, read on every request. It only
+    /// labels the UI: operator routes check the grant themselves.
+    pub is_operator: bool,
 }
 
 async fn me(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Me>> {
@@ -409,10 +412,16 @@ async fn me(user: AuthUser, State(state): State<AppState>) -> ApiResult<Json<Me>
         .bind(user.0.id.0.as_bytes().as_slice())
         .fetch_one(&state.pool)
         .await?;
+    let is_operator =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM moderation_operators WHERE user_id=$1)")
+            .bind(user.0.id.0.as_bytes().as_slice())
+            .fetch_one(&state.pool)
+            .await?;
     Ok(Json(Me {
         id: user.0.id.0,
         email: user.0.email.clone(),
         profile,
+        is_operator,
     }))
 }
 
@@ -1169,7 +1178,7 @@ async fn playthrough(
     id: Result<Path<Uuid>, PathRejection>,
 ) -> ApiResult<Tagged> {
     let row = sqlx::query_as(
-        "SELECT p.*,g.igdb_id FROM playthroughs p JOIN games g ON g.id=p.game_id
+        "SELECT p.*,g.igdb_id,g.name AS game_name,g.slug AS game_slug,g.cover_url FROM playthroughs p JOIN games g ON g.id=p.game_id
          WHERE p.user_id=$1 AND p.id=$2",
     )
     .bind(user.0.id.0.as_bytes().as_slice())
@@ -1207,15 +1216,16 @@ async fn create_playthrough(
     let defaults = SharingDefaults::of(&mut tx, owner).await?;
     let visibility = RunVisibility::resolve(choice, defaults, None, &fields);
     let row = sqlx::query_as(
-        "INSERT INTO playthroughs (id,user_id,game_id,rating,review,started_on,finished_on,platform,presentation_on,state,
+        "WITH p AS (INSERT INTO playthroughs (id,user_id,game_id,rating,review,started_on,finished_on,platform,presentation_on,state,
             summary_visibility,rating_visibility,review_visibility)
-         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *, $14::bigint AS igdb_id",
+         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13) RETURNING *)
+         SELECT p.*,g.igdb_id,g.name AS game_name,g.slug AS game_slug,g.cover_url FROM p JOIN games g ON g.id=p.game_id",
     )
     .bind(Uuid::new_v4()).bind(owner).bind(game.id)
     .bind(fields.rating).bind(fields.review).bind(fields.started_on)
     .bind(fields.finished_on).bind(fields.platform).bind(fields.presentation_on).bind(fields.state)
     .bind(visibility.summary).bind(visibility.rating).bind(visibility.review)
-    .bind(igdb_id).fetch_one(&mut *tx).await?;
+    .fetch_one(&mut *tx).await?;
     receipt
         .finish(
             tx,
@@ -1280,7 +1290,7 @@ async fn edit_playthrough(
     // Ownership is resolved before the precondition, so another user's
     // playthrough is a 404 and never reveals a revision through 412.
     let current: Playthrough = sqlx::query_as(
-        "SELECT p.*,g.igdb_id FROM playthroughs p JOIN games g ON g.id=p.game_id
+        "SELECT p.*,g.igdb_id,g.name AS game_name,g.slug AS game_slug,g.cover_url FROM playthroughs p JOIN games g ON g.id=p.game_id
          WHERE p.user_id=$1 AND p.id=$2 FOR NO KEY UPDATE OF p",
     )
     .bind(owner)
@@ -1304,7 +1314,7 @@ async fn edit_playthrough(
         "UPDATE playthroughs p SET rating=$3,review=$4,started_on=$5,finished_on=$6,platform=$7,presentation_on=$8,state=$9,
             summary_visibility=$10,rating_visibility=$11,review_visibility=$12
          FROM games g WHERE p.user_id=$1 AND p.id=$2 AND g.id=p.game_id
-         RETURNING p.*,g.igdb_id",
+         RETURNING p.*,g.igdb_id,g.name AS game_name,g.slug AS game_slug,g.cover_url",
     )
     .bind(owner)
     .bind(id)
@@ -1491,9 +1501,10 @@ async fn start_playthrough(
     }
     let defaults = SharingDefaults::of(&mut transaction, owner).await?;
     let row = sqlx::query_as(
-        "INSERT INTO playthroughs
+        "WITH p AS (INSERT INTO playthroughs
         (id,user_id,game_id,state,is_current,started_on,platform,summary_visibility)
-        VALUES ($1,$2,$3,'active',true,$4,$5,$6) RETURNING *, $7::bigint AS igdb_id",
+        VALUES ($1,$2,$3,'active',true,$4,$5,$6) RETURNING *)
+        SELECT p.*,g.igdb_id,g.name AS game_name,g.slug AS game_slug,g.cover_url FROM p JOIN games g ON g.id=p.game_id",
     )
     .bind(Uuid::new_v4())
     .bind(owner)
@@ -1501,7 +1512,6 @@ async fn start_playthrough(
     .bind(fields.started_on)
     .bind(fields.platform)
     .bind(input.summary_visibility.unwrap_or(defaults.summary))
-    .bind(input.igdb_id)
     .fetch_one(&mut *transaction)
     .await?;
     upsert_entry(
@@ -1562,7 +1572,7 @@ async fn transition_playthrough(
     }
     lock_playthrough_game(&mut transaction, owner, id).await?;
     let current: Playthrough = sqlx::query_as(
-        "SELECT p.*,g.igdb_id FROM playthroughs p
+        "SELECT p.*,g.igdb_id,g.name AS game_name,g.slug AS game_slug,g.cover_url FROM playthroughs p
         JOIN games g ON g.id=p.game_id WHERE p.user_id=$1 AND p.id=$2 FOR NO KEY UPDATE OF p",
     )
     .bind(owner)
@@ -1600,7 +1610,7 @@ async fn transition_playthrough(
     let is_current = matches!(next, PlaythroughState::Active | PlaythroughState::Paused);
     let row = sqlx::query_as(
         "UPDATE playthroughs p SET state=$3,is_current=$4,finished_on=$5
-        FROM games g WHERE p.user_id=$1 AND p.id=$2 AND g.id=p.game_id RETURNING p.*,g.igdb_id",
+        FROM games g WHERE p.user_id=$1 AND p.id=$2 AND g.id=p.game_id RETURNING p.*,g.igdb_id,g.name AS game_name,g.slug AS game_slug,g.cover_url",
     )
     .bind(owner)
     .bind(id)

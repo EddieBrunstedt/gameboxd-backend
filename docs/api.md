@@ -8,7 +8,7 @@ Base URL: `http://localhost:3000`. All bodies are JSON unless a response is `204
 | --- | --- | --- | --- |
 | GET | `/health/live` | No | Process liveness |
 | GET | `/health/ready` | No | PostgreSQL readiness |
-| GET | `/api/me` | Yes | Current user ID, email and app profile |
+| GET | `/api/me` | Yes | Current user ID, email, app profile and operator flag |
 | PUT | `/api/me` | Yes | Replace display name and bio |
 | GET | `/api/games?q=halo&limit=20&offset=0` | No | Search games stored locally |
 | GET | `/api/games/{igdb_id}` | No | Locally stored game details |
@@ -74,7 +74,7 @@ Catalog lookup accepts a positive signed 64-bit integer ID; malformed, overflowi
 {"display_name":"Eddie","bio":"I like RPGs."}
 ```
 
-Display name is trimmed and limited to 80 characters; bio to 1000. The response is the profile object with those fields plus `created_at`, `updated_at`, `version`, `public_enabled` (initially false), random `public_id`, nullable `handle`, and `bio_visibility` (initially `private`). `GET /api/me` returns `{id,email,profile}`, where `id` is the Doorman user UUID and `email` may be null.
+Display name is trimmed and limited to 80 characters; bio to 1000. The response is the profile object with those fields plus `created_at`, `updated_at`, `version`, `public_enabled` (initially false), random `public_id`, nullable `handle`, and `bio_visibility` (initially `private`). `GET /api/me` returns `{id,email,profile,is_operator}`, where `id` is the Doorman user UUID and `email` may be null. `is_operator` says whether a live moderation operator grant exists for the session's user, read on every request, so a revoked grant reads false on the next call. It only labels the UI; operator routes still check the grant themselves (see [operator access](#operator-access-and-decisions)).
 
 `PUT /api/me/library/{igdb_id}` body:
 
@@ -123,7 +123,7 @@ Both preserve the playthrough's identity and `created_at`. Unknown fields are re
 - `started_on`, `finished_on`: null or calendar dates in `YYYY-MM-DD` format. If both are set, the finish must be on or after the start. These describe the experience; `finished_on` does not imply the game was completed or update library status. Either date can be provided alone. Active/paused runs cannot have an end date; completed/abandoned runs may have an unknown end date. For a historical correction to active/paused, clear an existing end date in the same edit.
 - `platform`: null or a label of 1–100 characters without control characters, trimmed when saved. This is free text (for example `PC` or `Steam Deck`), not an IGDB taxonomy ID.
 
-An undated rating, a review without a rating, and a record with neither are all valid. Responses contain `id`, `igdb_id`, `version`, `rating`, `review`, `presentation_on`, `started_on`, `finished_on`, `platform`, `created_at`, and `updated_at`; they never expose the owner or local game key.
+An undated rating, a review without a rating, and a record with neither are all valid. Responses contain `id`, `igdb_id`, `game_name`, `game_slug`, nullable `cover_url`, `version`, `rating`, `review`, `presentation_on`, `started_on`, `finished_on`, `platform`, `created_at`, and `updated_at`; they never expose the owner or local game key. The game context sits flat beside `igdb_id`, as on `DiaryNote`, and every route returning a `Playthrough` includes it: list, detail, create, start, lifecycle, PUT, PATCH and the visibility route. It is read from the local catalog in the same statement. The personal archive keeps its own playthrough shape without it.
 
 ### Concurrent and partial edits
 
@@ -583,13 +583,26 @@ lock protocol; note publication follows parent-before-note locking.
 
 Public routes have dedicated types, with this explicit field allowlist:
 
-| Type | Fields besides `id`, `author_id`, `author_name`, and `game` |
+| Type | Fields besides `id`, `author_id`, `author_name`, `author_handle`, and `game` |
 | --- | --- |
 | `PublicLibraryEntry` | `status`, nullable `rating`, nullable `rating_id` |
-| `PublicPlaythrough` | nullable `presentation_on`, `state`, `started_on`, `finished_on`, `platform` |
+| `PublicPlaythrough` | nullable `presentation_on`, `state`, `started_on`, `finished_on`, `platform`, `rating` |
 | `PublicRating` | nullable `presentation_on`, non-null `rating` |
-| `PublicReview` | nullable `presentation_on`, non-null `review` |
+| `PublicReview` | nullable `presentation_on`, non-null `review`, nullable `rating` |
 | `PublicNote` | nullable `presentation_on`, non-null `text` |
+
+`author_handle` is the author's **current** canonical handle, or null when they
+have none. It is read live from the profile, so a rename changes it on every item
+at once, and a retired handle never appears. `PublicList` carries it too. It is
+present wherever these types are served: direct routes, profile sections,
+previews, the feed and list details.
+
+`rating` on `PublicPlaythrough` and `PublicReview` is the **same run's** rating,
+non-null only when that rating is itself public (`rating_visibility` public, the
+same condition as `GET /api/public/ratings/{id}`). A summary or review whose
+rating is private looks exactly like one with no rating. The field never changes
+the item's identity, order or eligibility: publishing a summary or review still
+requires its own choice, and the rating remains its own item.
 
 `game` is `PublicGame`: `igdb_id`, `game_name`, `game_slug`, nullable `cover_url`,
 read entirely from local storage without contacting or refreshing IGDB. The
@@ -600,7 +613,8 @@ Rating and review IDs coincide with the underlying run, but the resource kind is
 part of the URL/identity; knowledge of that UUID never grants another projection.
 
 Publishing a summary explicitly shares its state, platform and chosen play dates;
-it shares no rating, review, notes, or current-run/library relationship. Publishing
+it shares no rating, review, notes, or current-run/library relationship; a public
+summary or review shows the run's rating only when that rating is itself public. Publishing
 only a review shares its text, game and chosen author/day attribution. Notes share
 no parent ID or parent details. A public note remains available with a private
 summary; deleting the parent removes the note. Library removal preserves public
@@ -740,7 +754,8 @@ infer private current-playthrough relationships. A paused/on-hold entry is in th
 library section but not current games. Library ratings use only independently
 selected public ratings, including during disabled-profile preview. Reviews and
 notes can appear without a public library entry or parent summary. Every item
-carries its `author_id` (public profile UUID) and display-name attribution.
+carries its `author_id` (public profile UUID), display-name attribution and
+live `author_handle`.
 Game-based items include local game ID/title/slug/cover context; list sections
 return summaries whose ordered game context is available at the list detail URL. No profile read contacts or refreshes IGDB.
 
@@ -869,7 +884,8 @@ preserve visibility. Because visibility shares the aggregate revision, an edit
 based on a private version cannot inadvertently land after concurrent publication.
 
 Public list summaries (`PublicList`) expose only `id`, `kind`, `title`,
-`description`, `game_count`, `author_id`, and `author_name`. Direct public detail
+`description`, `game_count`, `author_id`, `author_name`, and live nullable
+`author_handle`. Direct public detail
 `GET /api/public/lists/{id}` returns `PublicListDetail` (`{list,games}`), with exactly
 the safe game context above. No internal dates, revisions, visibility, authentication
 identity, library membership, status, ratings or playthrough details are exposed.
@@ -1057,8 +1073,11 @@ rating-only shares, library statuses, lists, favorites, profile edits and follow
 operations do not generate feed items.
 
 Identity is the pair **`(kind, item.id)`**. A run can contribute one milestone
-and one independently public review. Its milestone contains no review text or
-rating; the review is never repeated through a summary or library projection.
+and one independently public review. Its milestone contains no review text; the
+review is never repeated through a summary or library projection. Milestones and
+reviews carry the run's `rating` when that rating is itself public, as their
+direct routes do. The rating is attached to the item; it is never an item of its
+own, and a rating-only share still generates nothing.
 Note IDs have their own kind namespace. IDs persist through text corrections,
 state changes, date changes, and unpublishing/republishing. Item payloads match
 the corresponding direct public endpoint exactly, including author identity and
@@ -1166,7 +1185,8 @@ Evidence captures the public representation at report time: selected profile
 identity/bio, an independently public review/note and game context, or list text
 and its ordered public members. It contains no private diary context, library
 membership, hidden rating, private biography, actual content timestamps or
-revisions. Evidence is a snapshot and can differ from the subsequently edited
+revisions. Its format predates `author_handle` and the run rating on reviews, and
+omits both. Evidence is a snapshot and can differ from the subsequently edited
 content. Reporter details and evidence are untrusted plain text/data; clients
 must escape them, never render them as HTML. Evidence is typed as `unknown | null`
 in the contract because its object shape depends on the target kind.
@@ -1198,7 +1218,8 @@ Every operator operation checks and locks the grant for its transaction;
 revocation waits for already authorized operations and takes effect for subsequent
 requests, even with an existing session. Anonymous access returns 401; ordinary
 sessions return 403 `forbidden`. Operator credentials and database grants must
-be limited to trusted administrators.
+be limited to trusted administrators. `GET /api/me` reports the grant as
+`is_operator` so a client can offer operator screens; it authorizes nothing.
 
 | Route | Behavior |
 | --- | --- |

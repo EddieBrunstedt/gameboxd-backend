@@ -278,6 +278,7 @@ struct FeedRow {
     kind: i16,
     author_name: String,
     author_id: Uuid,
+    author_handle: Option<String>,
     #[sqlx(flatten)]
     game: PublicGame,
     presentation_on: Option<NaiveDate>,
@@ -286,6 +287,7 @@ struct FeedRow {
     started_on: Option<NaiveDate>,
     finished_on: Option<NaiveDate>,
     platform: Option<String>,
+    rating: Option<i16>,
 }
 
 impl FeedRow {
@@ -303,14 +305,17 @@ impl FeedRow {
                 id: self.id,
                 author_name: self.author_name,
                 author_id: self.author_id,
+                author_handle: self.author_handle,
                 game: self.game,
                 presentation_on: self.presentation_on,
                 review: self.text,
+                rating: self.rating,
             }),
             1 => FeedItem::Note(PublicNote {
                 id: self.id,
                 author_name: self.author_name,
                 author_id: self.author_id,
+                author_handle: self.author_handle,
                 game: self.game,
                 presentation_on: self.presentation_on,
                 text: self.text,
@@ -319,12 +324,14 @@ impl FeedRow {
                 id: self.id,
                 author_name: self.author_name,
                 author_id: self.author_id,
+                author_handle: self.author_handle,
                 game: self.game,
                 presentation_on: self.presentation_on,
                 state: self.state,
                 started_on: self.started_on,
                 finished_on: self.finished_on,
                 platform: self.platform,
+                rating: self.rating,
             }),
         }
     }
@@ -346,17 +353,17 @@ async fn feed(
     );
     sql.push_bind(user.0.id.0.as_bytes().to_vec()).push(
         "), items AS (
-         SELECT id,0::smallint AS kind,author_name,author_id,igdb_id,game_name,game_slug,cover_url,
+         SELECT id,0::smallint AS kind,author_name,author_id,author_handle,igdb_id,game_name,game_slug,cover_url,
                 presentation_on,review AS text,NULL::text AS state,NULL::date AS started_on,
-                NULL::date AS finished_on,NULL::text AS platform
+                NULL::date AS finished_on,NULL::text AS platform,rating
          FROM public_reviews WHERE user_id IN (SELECT followed_id FROM sources)
          UNION ALL
-         SELECT id,1::smallint,author_name,author_id,igdb_id,game_name,game_slug,cover_url,
-                presentation_on,text,NULL::text,NULL::date,NULL::date,NULL::text
+         SELECT id,1::smallint,author_name,author_id,author_handle,igdb_id,game_name,game_slug,cover_url,
+                presentation_on,text,NULL::text,NULL::date,NULL::date,NULL::text,NULL::smallint
          FROM public_notes WHERE user_id IN (SELECT followed_id FROM sources)
          UNION ALL
-         SELECT id,2::smallint,author_name,author_id,igdb_id,game_name,game_slug,cover_url,
-                presentation_on,''::text,state,started_on,finished_on,platform
+         SELECT id,2::smallint,author_name,author_id,author_handle,igdb_id,game_name,game_slug,cover_url,
+                presentation_on,''::text,state,started_on,finished_on,platform,rating
          FROM public_playthroughs WHERE state IS NOT NULL AND user_id IN (SELECT followed_id FROM sources)
          ) SELECT * FROM items WHERE true",
     );

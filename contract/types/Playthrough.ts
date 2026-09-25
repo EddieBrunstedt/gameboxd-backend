@@ -2,4 +2,4 @@
 import type { PlaythroughState } from "./PlaythroughState";
 import type { Visibility } from "./Visibility";
 
-export type Playthrough = { summary_visibility: Visibility, rating_visibility: Visibility, review_visibility: Visibility, state: PlaythroughState | null, is_current: boolean, id: string, igdb_id: number, version: number, rating: number | null, review: string | null, presentation_on: string | null, started_on: string | null, finished_on: string | null, platform: string | null, created_at: string, updated_at: string, };
+export type Playthrough = { summary_visibility: Visibility, rating_visibility: Visibility, review_visibility: Visibility, state: PlaythroughState | null, is_current: boolean, id: string, igdb_id: number, game_name: string, game_slug: string, cover_url: string | null, version: number, rating: number | null, review: string | null, presentation_on: string | null, started_on: string | null, finished_on: string | null, platform: string | null, created_at: string, updated_at: string, };

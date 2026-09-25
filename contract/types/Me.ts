@@ -6,4 +6,9 @@ import type { Profile } from "./Profile";
  * application's profile. Doorman's own `UserDto` is richer and is served on
  * its own routes; this route publishes only what the app itself owns.
  */
-export type Me = { id: string, email: string | null, profile: Profile, };
+export type Me = { id: string, email: string | null, profile: Profile, 
+/**
+ * Whether a live operator grant exists, read on every request. It only
+ * labels the UI: operator routes check the grant themselves.
+ */
+is_operator: boolean, };

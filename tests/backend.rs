@@ -4372,9 +4372,10 @@ async fn visibility_is_independent_and_public_projections_do_not_expand_private_
     .await;
     public_body(&fixture, &urls[3], None, StatusCode::NOT_FOUND).await;
     let profile = publication(&fixture, &owner, true).await;
-    let expected = json!({"id":run["id"],"author_name":"Author","author_id":profile["public_id"],"game":{
+    let expected = json!({"id":run["id"],"author_name":"Author","author_id":profile["public_id"],
+        "author_handle":null,"game":{
         "igdb_id":42,"game_name":"Test Game","game_slug":"test-game","cover_url":null},
-        "presentation_on":"2020-02-02","review":"Public review"});
+        "presentation_on":"2020-02-02","review":"Public review","rating":null});
     for token in [None, Some(owner.as_str()), Some(other.as_str())] {
         for (i, url) in urls.iter().enumerate() {
             let body = public_body(
@@ -4426,8 +4427,8 @@ async fn visibility_is_independent_and_public_projections_do_not_expand_private_
         let body = public_body(&fixture, &urls[4], token, StatusCode::OK).await;
         assert_eq!(
             body,
-            json!({"id":note["id"],"author_name":"Author","author_id":profile["public_id"],"game":expected["game"],
-            "presentation_on":"2019-08-01","text":"Secret note"})
+            json!({"id":note["id"],"author_name":"Author","author_id":profile["public_id"],"author_handle":null,
+            "game":expected["game"],"presentation_on":"2019-08-01","text":"Secret note"})
         );
         public_body(&fixture, &urls[1], token, StatusCode::NOT_FOUND).await;
     }
@@ -4461,15 +4462,15 @@ async fn visibility_is_independent_and_public_projections_do_not_expand_private_
                 if i == 1 && i == index {
                     assert_eq!(
                         body,
-                        json!({"id":run["id"],"author_name":"Author","author_id":profile["public_id"],"game":expected["game"],
-                        "presentation_on":"2020-02-02","state":"abandoned","started_on":"2019-01-01",
-                        "finished_on":"2020-01-01","platform":"Secret platform"})
+                        json!({"id":run["id"],"author_name":"Author","author_id":profile["public_id"],"author_handle":null,
+                        "game":expected["game"],"presentation_on":"2020-02-02","state":"abandoned","started_on":"2019-01-01",
+                        "finished_on":"2020-01-01","platform":"Secret platform","rating":null})
                     );
                 } else if i == 2 && i == index {
                     assert_eq!(
                         body,
-                        json!({"id":run["id"],"author_name":"Author","author_id":profile["public_id"],"game":expected["game"],
-                        "presentation_on":"2020-02-02","rating":9})
+                        json!({"id":run["id"],"author_name":"Author","author_id":profile["public_id"],"author_handle":null,
+                        "game":expected["game"],"presentation_on":"2020-02-02","rating":9})
                     );
                 }
             }
@@ -4490,8 +4491,8 @@ async fn visibility_is_independent_and_public_projections_do_not_expand_private_
         let body = public_body(&fixture, &urls[0], token, StatusCode::OK).await;
         assert_eq!(
             body,
-            json!({"id":entry["public_id"],"author_name":"Author","author_id":profile["public_id"],"game":expected["game"],
-            "status":"dropped","rating":null,"rating_id":null})
+            json!({"id":entry["public_id"],"author_name":"Author","author_id":profile["public_id"],"author_handle":null,
+            "game":expected["game"],"status":"dropped","rating":null,"rating_id":null})
         );
     }
     fixture.finish().await;
@@ -5589,7 +5590,8 @@ async fn profile_chronology_pagination_and_independent_review_links_use_selected
         )
         .await;
         assert_eq!(page["page"]["data"][0], direct);
-        for key in ["rating", "state", "platform", "started_on", "finished_on"] {
+        assert!(direct["rating"].is_null());
+        for key in ["state", "platform", "started_on", "finished_on"] {
             assert!(direct.get(key).is_none());
         }
     }
@@ -5819,7 +5821,13 @@ async fn public_handles_are_unique_revision_protected_and_safe_across_renames() 
         )
         .await;
     assert_eq!(renamed["public_id"], saved["public_id"]);
-    assert_eq!(public_body(&f, &direct, None, StatusCode::OK).await, before);
+    // The item keeps its identity; only its live author handle follows the rename.
+    let mut expected = before.clone();
+    expected["author_handle"] = json!("new_name");
+    assert_eq!(
+        public_body(&f, &direct, None, StatusCode::OK).await,
+        expected
+    );
     public_body(
         &f,
         "/api/public/handles/same_name",
@@ -6955,6 +6963,7 @@ async fn public_lists_share_only_selected_membership_and_revoke_every_access_pat
     assert_eq!(
         keys,
         [
+            "author_handle",
             "author_id",
             "author_name",
             "description",
@@ -8167,13 +8176,13 @@ async fn feed_projects_independent_components_and_revokes_every_source_live() {
         for key in [
             "platform",
             "state",
-            "rating",
             "started_on",
             "finished_on",
             "playthrough_id",
         ] {
             assert!(row["item"].get(key).is_none(), "leaked {key}");
         }
+        assert!(row["item"]["rating"].is_null(), "leaked rating");
     }
     assert_eq!(feed_body(&f, &other).await["data"], json!([]));
     let run = share_run(&f, &author, &run, json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"public"})).await;
@@ -8181,7 +8190,15 @@ async fn feed_projects_independent_components_and_revokes_every_source_live() {
     assert_eq!(all["data"].as_array().unwrap().len(), 3);
     assert_eq!(all["data"][0]["kind"], "milestone");
     assert!(all["data"][0]["item"].get("review").is_none());
-    assert!(all["data"][0]["item"].get("rating").is_none());
+    // A public rating rides on its run's milestone and review, never as an item.
+    assert_eq!(all["data"][0]["item"]["rating"], 9);
+    let review = all["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["kind"] == "review")
+        .unwrap();
+    assert_eq!(review["item"]["rating"], 9);
     assert_eq!(
         all["data"][0]["item"],
         public_body(
@@ -8470,7 +8487,36 @@ async fn feed_snapshot_never_mixes_following_visibility_and_component_edits() {
 
 /// Undoes the sharing-defaults migration, including its revision of the
 /// moderation guard, so earlier migrations can be re-applied in order.
+// Views cannot drop columns in place, so the attribution migration is undone by
+// recreating the selected views and gated wrappers exactly as they stood before.
+async fn undo_item_attribution(pool: &PgPool) {
+    let moderation = include_str!("../migrations/202609170002_moderation.sql");
+    let selected = &moderation[moderation
+        .find("CREATE OR REPLACE VIEW selected_reviews")
+        .unwrap()
+        ..moderation
+            .find("CREATE FUNCTION public_view_allowed")
+            .unwrap()];
+    let profiles = include_str!("../migrations/202609160001_public_profiles.sql");
+    let wrappers = &profiles[profiles
+        .find("CREATE OR REPLACE VIEW public_reviews")
+        .unwrap()..];
+    let lists = include_str!("../migrations/202609160002_game_lists.sql");
+    let list_wrapper = &lists[lists.find("CREATE VIEW public_lists").unwrap()..];
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "DROP VIEW public_library_entries,public_reviews,public_ratings,public_playthroughs,public_notes,public_lists;
+        DROP VIEW selected_library_entries;
+        DROP VIEW selected_reviews,selected_ratings,selected_playthroughs,selected_notes,selected_lists;
+        {selected}{wrappers}{list_wrapper}
+        DELETE FROM _sqlx_migrations WHERE version=202609260002;"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 async fn undo_sharing_defaults(pool: &PgPool) {
+    undo_item_attribution(pool).await;
     let moderation = include_str!("../migrations/202609170002_moderation.sql");
     let start = moderation
         .find("CREATE FUNCTION moderation_publication_guard")
@@ -11956,5 +12002,437 @@ async fn personal_import_stays_private_whatever_the_destination_defaults() {
         .value("GET", "/api/me/diary", &dest, Value::Null, StatusCode::OK)
         .await;
     assert_eq!(notes["data"][0]["visibility"], "private");
+    f.finish().await;
+}
+
+/// The database's UTC calendar date. Chosen dates in tests are derived from it
+/// rather than written as fixed days.
+async fn database_today(f: &Fixture) -> chrono::NaiveDate {
+    sqlx::query_scalar("SELECT (now() AT TIME ZONE 'UTC')::date")
+        .fetch_one(&f.database.app)
+        .await
+        .unwrap()
+}
+
+async fn claim_handle(f: &Fixture, token: &str, handle: &str) -> Value {
+    let profile = owner_profile(f, token).await;
+    f.edit(
+        "PUT",
+        "/api/me/handle",
+        token,
+        &tag(&profile),
+        json!({ "handle": handle }),
+        StatusCode::OK,
+    )
+    .await
+}
+
+/// Every surface that serves one author's items: direct routes, list detail,
+/// profile sections, the owner's preview and a follower's feed.
+struct AttributedSurfaces {
+    direct: Vec<String>,
+    list: String,
+    profile: String,
+    author: String,
+    reader: String,
+    author_id: Value,
+    plain_id: Value,
+}
+
+impl AttributedSurfaces {
+    /// Reads every surface, asserts each of the author's items carries `handle`,
+    /// and returns those items.
+    async fn items(&self, f: &Fixture, handle: Value) -> Vec<Value> {
+        let mut seen = Vec::new();
+        for url in &self.direct {
+            seen.push(public_body(f, url, None, StatusCode::OK).await);
+        }
+        seen.push(public_body(f, &self.list, None, StatusCode::OK).await["list"].clone());
+        for section in ["library", "playthroughs", "reviews", "notes", "lists"] {
+            let url = format!("{}/{section}", self.profile);
+            let public = public_body(f, &url, None, StatusCode::OK).await;
+            let preview = public_body(
+                f,
+                &format!("/api/me/public-preview/{section}"),
+                Some(&self.author),
+                StatusCode::OK,
+            )
+            .await;
+            assert_eq!(public, preview, "{section}");
+            seen.extend(public["page"]["data"].as_array().unwrap().iter().cloned());
+        }
+        let feed = feed_body(f, &self.reader).await;
+        for row in feed["data"].as_array().unwrap() {
+            if row["item"]["author_id"] == self.author_id {
+                seen.push(row["item"].clone());
+            } else {
+                // The handle-less author serializes alongside, with null.
+                assert_eq!(row["item"]["author_id"], self.plain_id);
+                assert!(row["item"]["author_handle"].is_null());
+                assert_eq!(row["item"]["rating"], 4);
+            }
+        }
+        // 4 direct, the list, 5 sections of one item each, and review, note
+        // and milestone in the feed.
+        assert_eq!(seen.len(), 4 + 1 + 5 + 3);
+        for item in &seen {
+            assert_eq!(item["author_handle"], handle, "{item}");
+        }
+        seen
+    }
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn public_items_carry_the_live_author_handle_and_only_a_public_run_rating() {
+    let f = Fixture::new().await;
+    let (_, author) = f.user("attribution-author").await;
+    let (_, plain) = f.user("attribution-plain").await;
+    let (_, reader) = f.user("attribution-reader").await;
+    let (_, operator) = safety_operator(&f).await;
+    let day = (database_today(&f).await - chrono::Days::new(1)).to_string();
+    let profile = publication(&f, &author, true).await;
+    let plain_profile = publication(&f, &plain, true).await;
+    let run = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &author,
+            json!({"igdb_id":42,"rating":7,"review":"Worth it","state":"completed","presentation_on":day}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let run = share_run(&f, &author, &run, json!({"summary_visibility":"public","rating_visibility":"private","review_visibility":"public"})).await;
+    let note = f
+        .value(
+            "POST",
+            &format!("{}/notes", run_path(&run)),
+            &author,
+            json!({"text":"Halfway","presentation_on":day}),
+            StatusCode::CREATED,
+        )
+        .await;
+    let note = share_note(&f, &author, &note).await;
+    let entry = f
+        .value(
+            "PUT",
+            "/api/me/library/42",
+            &author,
+            json!({"status":"completed"}),
+            StatusCode::OK,
+        )
+        .await;
+    let entry = f
+        .edit(
+            "PUT",
+            "/api/me/library/42/visibility",
+            &author,
+            &tag(&entry),
+            json!({"visibility":"public"}),
+            StatusCode::OK,
+        )
+        .await;
+    let list = new_list(&f, &author, "Shelf").await;
+    let list = edit_list(
+        &f,
+        &author,
+        &list,
+        "/visibility",
+        json!({"visibility":"public"}),
+    )
+    .await;
+    // A second author who never claims a handle shares the reader's feed.
+    let plain_run = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &plain,
+            json!({"igdb_id":42,"rating":4,"review":"Not for me","presentation_on":day}),
+            StatusCode::CREATED,
+        )
+        .await;
+    share_run(&f, &plain, &plain_run, json!({"summary_visibility":"private","rating_visibility":"public","review_visibility":"public"})).await;
+    follow_request(&f, &reader, &profile, "PUT").await;
+    follow_request(&f, &reader, &plain_profile, "PUT").await;
+
+    let id = |v: &Value| v.as_str().unwrap().to_owned();
+    let run_id = id(&run["id"]);
+    let base = format!("/api/public/profiles/{}", id(&profile["public_id"]));
+    let direct = [
+        format!("/api/public/library/{}", id(&entry["public_id"])),
+        format!("/api/public/playthroughs/{run_id}"),
+        format!("/api/public/reviews/{run_id}"),
+        format!("/api/public/notes/{}", id(&note["id"])),
+    ];
+    let list_url = format!("/api/public/lists/{}", id(&list["list"]["id"]));
+    let surfaces = AttributedSurfaces {
+        direct: direct.to_vec(),
+        list: list_url.clone(),
+        profile: base,
+        author: author.clone(),
+        reader: reader.clone(),
+        author_id: profile["public_id"].clone(),
+        plain_id: plain_profile["public_id"].clone(),
+    };
+    let items = |handle: Value| surfaces.items(&f, handle);
+
+    // Without a handle, and with the run's rating private.
+    let seen = items(Value::Null).await;
+    let rated = |seen: &[Value]| -> Vec<Value> {
+        seen.iter()
+            .filter(|item| item.get("review").is_some() || item.get("state").is_some())
+            .map(|item| item["rating"].clone())
+            .collect()
+    };
+    // Summary and review, each direct, in a section and in the feed.
+    assert_eq!(rated(&seen), vec![Value::Null; 6]);
+    public_body(
+        &f,
+        &format!("/api/public/ratings/{run_id}"),
+        None,
+        StatusCode::NOT_FOUND,
+    )
+    .await;
+
+    // Publishing the rating attaches it to the same run's review and summary.
+    let run = share_run(&f, &author, &run, json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"public"})).await;
+    let seen = items(Value::Null).await;
+    assert_eq!(rated(&seen), vec![json!(7); 6]);
+    assert_eq!(
+        public_body(
+            &f,
+            &format!("/api/public/ratings/{run_id}"),
+            None,
+            StatusCode::OK
+        )
+        .await["author_handle"],
+        Value::Null
+    );
+    // Making it private again leaves it looking exactly like no rating.
+    let run = share_run(&f, &author, &run, json!({"summary_visibility":"public","rating_visibility":"private","review_visibility":"public"})).await;
+    let private = items(Value::Null).await;
+    assert_eq!(rated(&private), vec![Value::Null; 6]);
+    let run = share_run(&f, &author, &run, json!({"summary_visibility":"public","rating_visibility":"public","review_visibility":"public"})).await;
+
+    // The handle is read live: claiming one and renaming change every item at once.
+    claim_handle(&f, &author, "first_name").await;
+    items(json!("first_name")).await;
+    let renamed = claim_handle(&f, &author, "second_name").await;
+    assert_eq!(renamed["handle"], "second_name");
+    let seen = items(json!("second_name")).await;
+    assert!(!Value::Array(seen).to_string().contains("first_name"));
+    let rating = public_body(
+        &f,
+        &format!("/api/public/ratings/{run_id}"),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(rating["author_handle"], "second_name");
+    assert_eq!(rating["rating"], 7);
+
+    // A profile restriction removes every item as before, rating included.
+    restriction(&f, &operator, "profile", &profile["public_id"], true, 0).await;
+    for url in direct
+        .iter()
+        .chain([&list_url, &format!("/api/public/ratings/{run_id}")])
+    {
+        public_body(&f, url, None, StatusCode::NOT_FOUND).await;
+    }
+    let feed = feed_body(&f, &reader).await;
+    assert!(
+        feed["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row["item"]["author_id"] == plain_profile["public_id"])
+    );
+    assert_eq!(run["rating"], 7);
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn every_owner_playthrough_response_carries_its_game_context() {
+    let f = Fixture::new().await;
+    let (_, owner) = f.user("run-context-owner").await;
+    let (_, other) = f.user("run-context-other").await;
+    let cover = "https://images.igdb.test/cover.jpg";
+    let context = |run: &Value| {
+        assert_eq!(run["igdb_id"], 42, "{run}");
+        assert_eq!(run["game_name"], "Test Game", "{run}");
+        assert_eq!(run["game_slug"], "test-game", "{run}");
+        assert_eq!(run["cover_url"], cover, "{run}");
+    };
+    // The first write stores the game; give it a cover so every field is non-null.
+    f.value(
+        "PUT",
+        "/api/me/library/42",
+        &owner,
+        json!({"status":"backlog"}),
+        StatusCode::OK,
+    )
+    .await;
+    sqlx::query("UPDATE games SET cover_url=$1 WHERE igdb_id=42")
+        .bind(cover)
+        .execute(&f.database.app)
+        .await
+        .unwrap();
+    let day = database_today(&f).await.to_string();
+    let created = f
+        .value(
+            "POST",
+            "/api/me/playthroughs",
+            &owner,
+            json!({"igdb_id":42,"rating":6,"presentation_on":day}),
+            StatusCode::CREATED,
+        )
+        .await;
+    context(&created);
+    let started = f
+        .value(
+            "POST",
+            START_RUN,
+            &owner,
+            json!({"igdb_id":42}),
+            StatusCode::CREATED,
+        )
+        .await;
+    context(&started);
+    let paused = f
+        .lifecycle(&owner, &started, json!({"action":"pause"}), StatusCode::OK)
+        .await;
+    context(&paused);
+    let replaced = f
+        .edit(
+            "PUT",
+            &run_path(&created),
+            &owner,
+            &tag(&created),
+            json!({"rating":7,"presentation_on":day}),
+            StatusCode::OK,
+        )
+        .await;
+    context(&replaced);
+    let patched = f
+        .edit(
+            "PATCH",
+            &run_path(&replaced),
+            &owner,
+            &tag(&replaced),
+            json!({"review":"Better the second time"}),
+            StatusCode::OK,
+        )
+        .await;
+    context(&patched);
+    let shared = share_run(&f, &owner, &patched, private_parts()).await;
+    context(&shared);
+    context(
+        &f.value(
+            "GET",
+            &run_path(&shared),
+            &owner,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await,
+    );
+    let listed = f
+        .value(
+            "GET",
+            "/api/me/playthroughs",
+            &owner,
+            Value::Null,
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(listed["data"].as_array().unwrap().len(), 2);
+    listed["data"].as_array().unwrap().iter().for_each(context);
+
+    // The personal archive keeps its own playthrough shape and round-trips as before.
+    let archive = f
+        .value("GET", "/api/me/export", &owner, Value::Null, StatusCode::OK)
+        .await;
+    let mut keys: Vec<_> = archive["playthroughs"][0]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "bookkeeping",
+            "finished_on",
+            "id",
+            "igdb_id",
+            "is_current",
+            "platform",
+            "presentation_on",
+            "rating",
+            "rating_visibility",
+            "review",
+            "review_visibility",
+            "started_on",
+            "state",
+            "summary_visibility"
+        ]
+    );
+    let report = f
+        .value(
+            "POST",
+            "/api/me/import",
+            &other,
+            transfer_input(&archive),
+            StatusCode::OK,
+        )
+        .await;
+    assert_eq!(report["applied"], true);
+    let imported = f
+        .value("GET", "/api/me/export", &other, Value::Null, StatusCode::OK)
+        .await;
+    for (original, restored) in archive["playthroughs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(imported["playthroughs"].as_array().unwrap())
+    {
+        for (key, value) in original.as_object().unwrap() {
+            if !matches!(key.as_str(), "id" | "bookkeeping") {
+                assert_eq!(&restored[key], value, "{key}");
+            }
+        }
+    }
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn me_reports_a_live_operator_grant() {
+    let f = Fixture::new().await;
+    let (id, token) = f.user("maybe-operator").await;
+    let me = |token: String| {
+        let f = &f;
+        async move {
+            f.value("GET", "/api/me", &token, Value::Null, StatusCode::OK)
+                .await["is_operator"]
+                .clone()
+        }
+    };
+    assert_eq!(me(token.clone()).await, false);
+    sqlx::query("INSERT INTO moderation_operators(user_id) VALUES($1)")
+        .bind(id.0.as_bytes().as_slice())
+        .execute(&f.database.app)
+        .await
+        .unwrap();
+    assert_eq!(me(token.clone()).await, true);
+    sqlx::query("DELETE FROM moderation_operators WHERE user_id=$1")
+        .bind(id.0.as_bytes().as_slice())
+        .execute(&f.database.app)
+        .await
+        .unwrap();
+    // The same session sees the revocation on its next read.
+    assert_eq!(me(token).await, false);
     f.finish().await;
 }

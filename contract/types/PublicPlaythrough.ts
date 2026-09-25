@@ -2,4 +2,12 @@
 import type { PlaythroughState } from "./PlaythroughState";
 import type { PublicGame } from "./PublicGame";
 
-export type PublicPlaythrough = { id: string, author_name: string, author_id: string, game: PublicGame, presentation_on: string | null, state: PlaythroughState | null, started_on: string | null, finished_on: string | null, platform: string | null, };
+export type PublicPlaythrough = { id: string, author_name: string, author_id: string, 
+/**
+ * The author's current canonical handle, read live; null without one.
+ */
+author_handle: string | null, game: PublicGame, presentation_on: string | null, state: PlaythroughState | null, started_on: string | null, finished_on: string | null, platform: string | null, 
+/**
+ * The same run's rating, only when that rating is itself public.
+ */
+rating: number | null, };

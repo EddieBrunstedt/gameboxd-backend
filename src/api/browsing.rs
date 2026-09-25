@@ -385,8 +385,7 @@ where
     })
 }
 
-pub(super) const OWNER_PLAYTHROUGHS: &str =
-    "SELECT p.*,g.igdb_id,g.name AS game_name FROM playthroughs p JOIN games g ON g.id=p.game_id";
+pub(super) const OWNER_PLAYTHROUGHS: &str = "SELECT p.*,g.igdb_id,g.name AS game_name,g.slug AS game_slug,g.cover_url FROM playthroughs p JOIN games g ON g.id=p.game_id";
 pub(super) const OWNER_NOTES: &str = "SELECT n.*,p.state,p.rating,p.review FROM diary_note_details n JOIN playthroughs p ON p.id=n.playthrough_id AND p.user_id=n.user_id";
 pub(super) const OWNER_LIBRARY: &str = "SELECT g.id,g.igdb_id,g.name,g.name AS game_name,g.slug,g.summary,g.cover_url,g.first_release_date,
     g.platforms,g.genres,g.developers,g.game_type,g.parent_igdb_id,g.version_parent_igdb_id,g.source_url,g.imported_at,g.refreshed_at,
@@ -400,9 +399,9 @@ pub(super) const PUBLIC_LIBRARY: &str = "SELECT e.*,
 pub(super) const PUBLIC_CURRENT: &str = "SELECT e.*,
     (SELECT max(GREATEST(p.started_on,p.finished_on)) FROM selected_playthroughs p WHERE p.user_id=e.user_id AND p.game_id=e.game_id) AS last_played_on
     FROM selected_library_entries e WHERE status='playing'";
-pub(super) const PUBLIC_PLAYTHROUGHS: &str =
-    "SELECT p.*,r.rating,v.review FROM selected_playthroughs p
-    LEFT JOIN selected_ratings r ON r.user_id=p.user_id AND r.id=p.id
+// The summary view carries its run's selected rating; the selected review is
+// joined only so has_review can filter on it.
+pub(super) const PUBLIC_PLAYTHROUGHS: &str = "SELECT p.*,v.review FROM selected_playthroughs p
     LEFT JOIN selected_reviews v ON v.user_id=p.user_id AND v.id=p.id";
 
 #[cfg(test)]

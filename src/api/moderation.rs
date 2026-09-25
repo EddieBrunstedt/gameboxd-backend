@@ -272,6 +272,8 @@ async fn own_restrictions(
 
 // Explicit safe evidence, never row_to_json on owner tables. Profile evidence
 // includes only its selected identity/bio; list evidence includes public members.
+// The evidence format predates item handles and review ratings; both are
+// removed so the captured shape stays the same.
 async fn evidence(
     conn: &mut PgConnection,
     kind: ModerationTarget,
@@ -282,13 +284,13 @@ async fn evidence(
             "SELECT user_id,jsonb_build_object('id',public_id,'handle',handle,'display_name',display_name,'bio',CASE WHEN bio_visibility='public' THEN bio END) FROM profiles WHERE public_id=$1 AND public_enabled AND NOT moderation_hidden('profile',public_id)"
         }
         ModerationTarget::Review => {
-            "SELECT user_id,to_jsonb(s)-'user_id'-'game_id' FROM public_reviews s WHERE id=$1"
+            "SELECT user_id,to_jsonb(s)-'user_id'-'game_id'-'author_handle'-'rating' FROM public_reviews s WHERE id=$1"
         }
         ModerationTarget::Note => {
-            "SELECT user_id,to_jsonb(s)-'user_id'-'game_id' FROM public_notes s WHERE id=$1"
+            "SELECT user_id,to_jsonb(s)-'user_id'-'game_id'-'author_handle' FROM public_notes s WHERE id=$1"
         }
         ModerationTarget::List => {
-            "SELECT user_id,(to_jsonb(s)-'user_id') || jsonb_build_object('games',COALESCE((SELECT jsonb_agg(jsonb_build_object('igdb_id',g.igdb_id,'game_name',g.name,'game_slug',g.slug,'cover_url',g.cover_url) ORDER BY m.position) FROM game_list_members m JOIN games g ON g.id=m.game_id WHERE m.list_id=s.id),'[]'::jsonb)) FROM public_lists s WHERE id=$1"
+            "SELECT user_id,(to_jsonb(s)-'user_id'-'author_handle') || jsonb_build_object('games',COALESCE((SELECT jsonb_agg(jsonb_build_object('igdb_id',g.igdb_id,'game_name',g.name,'game_slug',g.slug,'cover_url',g.cover_url) ORDER BY m.position) FROM game_list_members m JOIN games g ON g.id=m.game_id WHERE m.list_id=s.id),'[]'::jsonb)) FROM public_lists s WHERE id=$1"
         }
     };
     sqlx::query_as(sql)
