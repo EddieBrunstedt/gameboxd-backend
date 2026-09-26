@@ -40,7 +40,7 @@ pub struct SocialPage<T> {
     pub next_cursor: Option<String>,
 }
 
-fn limit(value: Option<u32>) -> ApiResult<u32> {
+pub(super) fn limit(value: Option<u32>) -> ApiResult<u32> {
     let value = value.unwrap_or(20);
     if !(1..=50).contains(&value) {
         return Err(ApiError::invalid("limit must be 1–50"));
@@ -195,14 +195,15 @@ pub enum FeedItem {
     Milestone(PublicPlaythrough),
 }
 
-struct FeedCursor {
-    date: Option<NaiveDate>,
-    id: Uuid,
-    kind: i16,
+pub(super) struct FeedCursor {
+    pub(super) date: Option<NaiveDate>,
+    pub(super) id: Uuid,
+    /// 0 review, 1 note, 2 milestone.
+    pub(super) kind: i16,
 }
 
 impl FeedCursor {
-    fn parse(value: &str) -> ApiResult<Self> {
+    pub(super) fn parse(value: &str) -> ApiResult<Self> {
         let invalid = || ApiError::invalid("Invalid feed cursor");
         if value.len() > 90 {
             return Err(invalid());
@@ -237,7 +238,7 @@ impl FeedCursor {
         })
     }
 
-    fn encode(&self) -> String {
+    pub(super) fn encode(&self) -> String {
         let kind = match self.kind {
             0 => "review",
             1 => "note",

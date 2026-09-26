@@ -59,6 +59,9 @@ Base URL: `http://localhost:3000`. All bodies are JSON unless a response is `204
 | DELETE | `/api/me/lists/{id}` | Yes | Delete list and membership (204); requires revision `If-Match` |
 | GET | `/api/public/lists/{id}` | No | Public list and ordered game context |
 | GET | `/api/me/public-preview/lists/{id}` | Yes | Visitor detail of owner's selected list, including while profile is disabled |
+| GET | `/api/public/trending/games?limit=10` | No | Games with the most public profiles playing or recently finishing them |
+| GET | `/api/public/feed?limit=20&after=` | No | The Everyone stream: public reviews from every profile |
+| GET | `/api/public/people?q=zel&limit=20&offset=0` | No | Find enabled profiles by handle prefix or display name |
 
 The owner-only stored game shape (authenticated import response and nested owner library game) includes `id`, `igdb_id`, `name`, `slug`, nullable `summary`, `cover_url`, `first_release_date`, arrays of `{id,name}` for `platforms`, `genres`, `developers`, nullable `game_type`, `parent_igdb_id`, `version_parent_igdb_id`, `source_url`, `imported_at` and `refreshed_at`. Taxonomy/parent IDs are upstream IGDB IDs, not local UUIDs. The `game` nested in an owner library listing is that same object, field for field. Public local game reads (`GET /api/games` and `/api/games/{igdb_id}`) instead return the descriptive catalog shape below, without local identity or import/refresh bookkeeping.
 
@@ -1124,6 +1127,79 @@ copies. Feature 10 must extend the relationship write checks and feed source
 scope for both directions of blocking, remove existing blocked relationships,
 and apply moderation gates through the shared public sources. Blocking and
 moderation are not introduced by this feature.
+
+## Global discovery
+
+Three reads span every public profile rather than one author or one reader's
+follows. None requires a session; a signed-in viewer is recognized only where
+blocks apply. Each response is read in one statement through the gated public
+views, so the profile switch, item choices and moderation restrictions apply
+exactly as on direct routes. Responses are `no-store` without ETag or
+Last-Modified, and no counter, cache or precomputed stream stands behind them.
+Unknown, duplicate or malformed parameters return `400 validation_error`.
+
+**Today** is the database's UTC calendar date, D. It only caps and windows
+chosen `presentation_on` days. Recording, edit and publication times are never
+read, returned or used for ordering, and D+1 is admitted wherever D is a limit,
+so a chosen day in a time zone ahead of UTC is not lost.
+
+### Trending games
+
+`GET /api/public/trending/games` accepts only `limit` (1–50, default 10) and
+returns `{data: TrendingGame[]}`. Each row carries the game context (`igdb_id`,
+`game_name`, `game_slug`, `cover_url`) and three counts of **distinct
+profiles**:
+
+- `playing_now`: public library entries for the game with status `playing`.
+- `finished_recently`: public run summaries for the game with state `completed`
+  and a chosen day from D−29 to D+1. Undated runs never count, and nor do later
+  days.
+- `active`: profiles in either set, each counted once, however many runs a
+  profile finished and whether it is also playing.
+
+A game is listed only from 3 active profiles. Order is `active` descending,
+then `playing_now` descending, then IGDB ID ascending, which only makes ties
+stable. The window and the threshold are server constants. The response is the
+same for every viewer, signed in or not: it contains counts and never people,
+so blocks do not apply.
+
+### The Everyone stream
+
+`GET /api/public/feed` accepts `limit` (1–50, default 20) and `after`, and
+returns the feed envelope `SocialPage<FeedItem>`. Only `kind: "review"`
+occurs, with the `PublicReview` payload of the direct route, `rating` and
+`author_handle` included.
+
+- **Selection:** public reviews with a chosen day no later than D+1. Undated
+  reviews have no place in this stream and never appear.
+- **Per-author cap:** at most 3 reviews per author per chosen day, keeping the
+  first 3 by UUID descending. The rest remain on the author's profile and
+  direct routes. The cap depends only on chosen days and UUIDs, so the same
+  reviews are kept on every read and every page.
+- **Blocks:** a signed-in viewer does not see authors blocked in either
+  direction. The cap is counted before blocks, which remove an author entirely.
+  Anonymous reads include everyone.
+- **Order and cursor:** `presentation_on DESC, id DESC`, with the following
+  feed's `f1:<date>:<uuid>:review` cursor. A cursor with an `unknown` date or
+  another kind returns 400. As in the following feed, the cursor is a value
+  boundary, not a snapshot.
+
+### People search
+
+`GET /api/public/people` requires `q` and accepts `limit` and `offset` under the
+[pagination](#pagination) rules. `q` is trimmed, then one leading `@` is
+removed; what remains must be 1–100 characters without control characters.
+It returns `{data: PersonSummary[], limit, offset, has_more}` without a total,
+where `PersonSummary` is `{id, handle, display_name}` with the public profile
+UUID as `id`.
+
+A profile matches when its handle begins with the term or its display name
+contains it, both case-insensitively and with `%`, `_` and `\` taken
+literally. Only enabled profiles without a profile restriction are found, and
+a signed-in viewer never finds a profile blocked in either direction. Order is
+an exact handle match first, then other handle prefixes, then display-name-only
+matches; within each, lowercase display name, then public UUID. Results carry
+no bio, counts, follow state or follower data.
 
 ## Blocking, reporting and operator moderation
 

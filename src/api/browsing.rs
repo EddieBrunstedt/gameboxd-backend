@@ -198,13 +198,16 @@ impl BrowseQuery {
 }
 
 fn pattern(term: &str) -> String {
-    format!(
-        "%{}%",
-        term.trim()
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_")
-    )
+    format!("%{}%", literal(term))
+}
+
+/// A trimmed search term with LIKE's wildcards and escape character escaped,
+/// so it matches literally inside a pattern.
+pub(super) fn literal(term: &str) -> String {
+    term.trim()
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_")
 }
 
 struct Cursor {

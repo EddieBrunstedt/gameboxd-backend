@@ -8487,9 +8487,21 @@ async fn feed_snapshot_never_mixes_following_visibility_and_component_edits() {
 
 /// Undoes the sharing-defaults migration, including its revision of the
 /// moderation guard, so earlier migrations can be re-applied in order.
+async fn undo_public_discovery(pool: &PgPool) {
+    sqlx::raw_sql(
+        "DROP INDEX public_playing_game_idx,public_completed_date_idx,public_reviews_date_idx,
+            profiles_display_name_trgm_idx,profiles_handle_trgm_idx;
+        DELETE FROM _sqlx_migrations WHERE version=202609260003;",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 // Views cannot drop columns in place, so the attribution migration is undone by
 // recreating the selected views and gated wrappers exactly as they stood before.
 async fn undo_item_attribution(pool: &PgPool) {
+    undo_public_discovery(pool).await;
     let moderation = include_str!("../migrations/202609170002_moderation.sql");
     let selected = &moderation[moderation
         .find("CREATE OR REPLACE VIEW selected_reviews")
@@ -12434,5 +12446,559 @@ async fn me_reports_a_live_operator_grant() {
         .unwrap();
     // The same session sees the revocation on its next read.
     assert_eq!(me(token).await, false);
+    f.finish().await;
+}
+
+/// A user whose profile is enabled under a chosen display name, which need not
+/// be unique.
+async fn discoverable(f: &Fixture, name: &str) -> (UserId, String, Value) {
+    let (id, token) = f.user(&Uuid::new_v4().simple().to_string()).await;
+    f.value(
+        "PUT",
+        "/api/me",
+        &token,
+        json!({"display_name":name,"bio":""}),
+        StatusCode::OK,
+    )
+    .await;
+    let profile = publication(f, &token, true).await;
+    (id, token, profile)
+}
+
+/// Stored games 42 to 45, so discovery tests can spread activity across them
+/// without contacting the provider.
+async fn discovery_games(f: &Fixture) {
+    for id in 42_i64..=45 {
+        sqlx::query("INSERT INTO games(id,igdb_id,name,slug,source_url) VALUES ($1,$2,$3,$3,'https://example.test')")
+            .bind(Uuid::new_v4()).bind(id).bind(format!("Game {id}"))
+            .execute(&f.database.app).await.unwrap();
+    }
+}
+
+async fn library_status(f: &Fixture, token: &str, igdb_id: i64, status: &str, visibility: &str) {
+    f.value(
+        "PUT",
+        &format!("/api/me/library/{igdb_id}"),
+        token,
+        json!({"status":status,"visibility":visibility}),
+        StatusCode::OK,
+    )
+    .await;
+}
+
+/// A run with a chosen state and day whose summary is shared or not.
+async fn dated_run(
+    f: &Fixture,
+    token: &str,
+    igdb_id: i64,
+    state: &str,
+    day: Option<chrono::NaiveDate>,
+    visibility: &str,
+) -> Value {
+    f.value(
+        "POST",
+        "/api/me/playthroughs",
+        token,
+        json!({"igdb_id":igdb_id,"state":state,"presentation_on":day,"summary_visibility":visibility}),
+        StatusCode::CREATED,
+    )
+    .await
+}
+
+fn block_path(profile: &Value) -> String {
+    format!("/api/me/blocks/{}", profile["public_id"].as_str().unwrap())
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn trending_games_count_distinct_public_profiles_in_a_chosen_date_window() {
+    let f = Fixture::new().await;
+    discovery_games(&f).await;
+    let (_, operator) = safety_operator(&f).await;
+    let d = database_today(&f).await;
+    let day = |offset: i64| Some(d + chrono::Duration::days(offset));
+    let mut users = Vec::new();
+    for n in 1..=8 {
+        users.push(discoverable(&f, &format!("trend-{n}")).await);
+    }
+    let token = |n: usize| users[n - 1].1.as_str();
+    // Game 42: u1 plays and finished two runs, counted once; u2 plays; u3 and
+    // u4 finished on the window's edges.
+    library_status(&f, token(1), 42, "playing", "public").await;
+    dated_run(&f, token(1), 42, "completed", day(0), "public").await;
+    dated_run(&f, token(1), 42, "completed", day(-1), "public").await;
+    library_status(&f, token(2), 42, "playing", "public").await;
+    dated_run(&f, token(3), 42, "completed", day(1), "public").await;
+    dated_run(&f, token(4), 42, "completed", day(-29), "public").await;
+    // Game 43: three players.
+    for n in 1..=3 {
+        library_status(&f, token(n), 43, "playing", "public").await;
+    }
+    // Game 44: two finished, one playing.
+    dated_run(&f, token(4), 44, "completed", day(-5), "public").await;
+    dated_run(&f, token(5), 44, "completed", day(-5), "public").await;
+    library_status(&f, token(6), 44, "playing", "public").await;
+    // Game 45: two count; everything else is outside the window, undated,
+    // abandoned, private, disabled or restricted.
+    library_status(&f, token(5), 45, "playing", "public").await;
+    dated_run(&f, token(6), 45, "completed", day(0), "public").await;
+    dated_run(&f, token(1), 45, "completed", day(2), "public").await;
+    dated_run(&f, token(2), 45, "completed", day(-30), "public").await;
+    library_status(&f, token(2), 45, "playing", "private").await;
+    dated_run(&f, token(3), 45, "completed", None, "public").await;
+    dated_run(&f, token(3), 45, "abandoned", day(0), "public").await;
+    let hidden = dated_run(&f, token(4), 45, "completed", day(0), "private").await;
+    library_status(&f, token(7), 45, "playing", "public").await;
+    publication(&f, token(7), false).await;
+    library_status(&f, token(8), 45, "playing", "public").await;
+    restriction(&f, &operator, "profile", &users[7].2["public_id"], true, 0).await;
+
+    let trending = |uri: &'static str, viewer: Option<String>| {
+        let f = &f;
+        async move {
+            let body = public_body(f, uri, viewer.as_deref(), StatusCode::OK).await;
+            let rows = body["data"].as_array().unwrap().clone();
+            for row in &rows {
+                let mut keys: Vec<_> = row.as_object().unwrap().keys().cloned().collect();
+                keys.sort_unstable();
+                assert_eq!(
+                    keys,
+                    [
+                        "active",
+                        "cover_url",
+                        "finished_recently",
+                        "game_name",
+                        "game_slug",
+                        "igdb_id",
+                        "playing_now"
+                    ]
+                );
+            }
+            assert_eq!(body.as_object().unwrap().len(), 1);
+            rows.iter()
+                .map(|row| {
+                    [
+                        &row["igdb_id"],
+                        &row["active"],
+                        &row["playing_now"],
+                        &row["finished_recently"],
+                    ]
+                    .map(|v| v.as_i64().unwrap())
+                })
+                .collect::<Vec<_>>()
+        }
+    };
+    const URI: &str = "/api/public/trending/games";
+    assert_eq!(
+        trending(URI, None).await,
+        [[42, 4, 2, 3], [43, 3, 3, 0], [44, 3, 1, 2]]
+    );
+    assert_eq!(
+        public_body(&f, "/api/public/trending/games", None, StatusCode::OK).await["data"][0]["game_name"],
+        "Game 42"
+    );
+    // Sharing the private run lifts game 45 to the threshold. It ties game 44
+    // on every count, so the IGDB ID orders them.
+    share_run(&f, token(4), &hidden, json!({"summary_visibility":"public","rating_visibility":"private","review_visibility":"private"})).await;
+    let expected = [[42, 4, 2, 3], [43, 3, 3, 0], [44, 3, 1, 2], [45, 3, 1, 2]];
+    assert_eq!(trending(URI, None).await, expected);
+    assert_eq!(
+        trending("/api/public/trending/games?limit=2", None).await,
+        expected[..2]
+    );
+    // The disabled player was excluded only by the profile switch.
+    publication(&f, token(7), true).await;
+    assert_eq!(
+        trending(URI, None).await,
+        [[42, 4, 2, 3], [45, 4, 2, 2], [43, 3, 3, 0], [44, 3, 1, 2]]
+    );
+    publication(&f, token(7), false).await;
+
+    // Counts ignore blocks: every viewer, on either side of one, sees the same.
+    let (_, outsider) = f.user("trend-outsider").await;
+    assert_eq!(
+        f.call("PUT", &block_path(&users[4].2), Some(token(1)), Value::Null)
+            .await
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+    for viewer in [token(1), token(5), outsider.as_str()] {
+        assert_eq!(trending(URI, Some(viewer.to_owned())).await, expected);
+    }
+
+    for query in [
+        "limit=0",
+        "limit=51",
+        "limit=-1",
+        "limit=ten",
+        "limit=1&limit=2",
+        "offset=0",
+        "after=x",
+    ] {
+        public_body(&f, &format!("{URI}?{query}"), None, StatusCode::BAD_REQUEST).await;
+    }
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn everyone_stream_caps_each_author_per_day_and_pages_stably() {
+    let f = Fixture::new().await;
+    discovery_games(&f).await;
+    let (_, operator) = safety_operator(&f).await;
+    let d = database_today(&f).await;
+    let day = |offset: i64| d + chrono::Duration::days(offset);
+    let review = |token: String, day: Option<chrono::NaiveDate>, visibility: &'static str| {
+        let f = &f;
+        async move {
+            f.value(
+                "POST",
+                "/api/me/playthroughs",
+                &token,
+                json!({"igdb_id":43,"review":"Shared thoughts","rating":8,"presentation_on":day,
+                    "review_visibility":visibility,"rating_visibility":"public"}),
+                StatusCode::CREATED,
+            )
+            .await
+        }
+    };
+    let (_, prolific, _) = discoverable(&f, "everyone-prolific").await;
+    let (_, blocked, blocked_profile) = discoverable(&f, "everyone-blocked").await;
+    let (_, reader, _) = discoverable(&f, "everyone-reader").await;
+    let (_, disabled, _) = discoverable(&f, "everyone-disabled").await;
+    let (_, restricted, restricted_profile) = discoverable(&f, "everyone-restricted").await;
+    let (_, moderated, _) = discoverable(&f, "everyone-moderated").await;
+    claim_handle(&f, &prolific, "prolific").await;
+
+    // (day, id) of every review the stream must contain.
+    let mut expected = Vec::new();
+    let mut capped = Vec::new();
+    for _ in 0..4 {
+        capped.push(review(prolific.clone(), Some(day(-1)), "public").await);
+    }
+    capped.sort_by(|a, b| b["id"].as_str().cmp(&a["id"].as_str()));
+    let dropped = capped.pop().unwrap();
+    for run in &capped {
+        expected.push((day(-1), run["id"].clone()));
+    }
+    for (offset, visibility) in [(-2, "public"), (1, "public")] {
+        let run = review(prolific.clone(), Some(day(offset)), visibility).await;
+        expected.push((day(offset), run["id"].clone()));
+    }
+    // Future beyond D+1, undated and private reviews never appear.
+    review(prolific.clone(), Some(day(2)), "public").await;
+    review(prolific.clone(), None, "public").await;
+    review(prolific.clone(), Some(day(0)), "private").await;
+    let mut blocked_ids = Vec::new();
+    for offset in [-1, 0] {
+        let run = review(blocked.clone(), Some(day(offset)), "public").await;
+        expected.push((day(offset), run["id"].clone()));
+        blocked_ids.push(run["id"].clone());
+    }
+    let reader_run = review(reader.clone(), Some(day(-3)), "public").await;
+    expected.push((day(-3), reader_run["id"].clone()));
+    review(disabled.clone(), Some(day(0)), "public").await;
+    publication(&f, &disabled, false).await;
+    review(restricted.clone(), Some(day(0)), "public").await;
+    restriction(
+        &f,
+        &operator,
+        "profile",
+        &restricted_profile["public_id"],
+        true,
+        0,
+    )
+    .await;
+    let hidden = review(moderated.clone(), Some(day(0)), "public").await;
+    restriction(&f, &operator, "review", &hidden["id"], true, 0).await;
+    expected.sort_by(|a, b| (b.0, b.1.as_str()).cmp(&(a.0, a.1.as_str())));
+    let ids = |page: &Value| -> Vec<Value> {
+        page["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                assert_eq!(row["kind"], "review");
+                row["item"]["id"].clone()
+            })
+            .collect()
+    };
+    const URI: &str = "/api/public/feed";
+    let everything: Vec<Value> = expected.iter().map(|(_, id)| id.clone()).collect();
+    let full = public_body(&f, URI, None, StatusCode::OK).await;
+    assert_eq!(ids(&full), everything);
+    assert_eq!(full["has_more"], false);
+    assert!(full["next_cursor"].is_null());
+    // Items are the direct review payload, rating and handle included.
+    let first = &full["data"][0]["item"];
+    assert_eq!(first["author_handle"], "prolific");
+    assert_eq!(first["rating"], 8);
+    assert_eq!(
+        *first,
+        public_body(
+            &f,
+            &format!("/api/public/reviews/{}", first["id"].as_str().unwrap()),
+            None,
+            StatusCode::OK
+        )
+        .await
+    );
+    // The capped review is always the same one, and stays on its direct route.
+    assert!(!everything.contains(&dropped["id"]));
+    assert_eq!(
+        ids(&public_body(&f, URI, None, StatusCode::OK).await),
+        everything
+    );
+    public_body(
+        &f,
+        &format!("/api/public/reviews/{}", dropped["id"].as_str().unwrap()),
+        None,
+        StatusCode::OK,
+    )
+    .await;
+
+    // Paging through the capped day neither loses nor repeats a review.
+    for limit in 1..=3 {
+        let mut seen = Vec::new();
+        let mut uri = format!("{URI}?limit={limit}");
+        loop {
+            let page = public_body(&f, &uri, None, StatusCode::OK).await;
+            seen.extend(ids(&page));
+            if page["has_more"] == false {
+                assert!(page["next_cursor"].is_null());
+                break;
+            }
+            let cursor = page["next_cursor"].as_str().unwrap();
+            assert!(cursor.ends_with(":review"));
+            uri = format!("{URI}?limit={limit}&after={cursor}");
+            assert!(seen.len() <= everything.len());
+        }
+        assert_eq!(seen, everything, "limit {limit}");
+    }
+
+    // Blocks apply to signed-in viewers in both directions, and never anonymously.
+    assert_eq!(
+        f.call(
+            "PUT",
+            &block_path(&blocked_profile),
+            Some(&reader),
+            Value::Null
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    let without = |exclude: &[Value]| -> Vec<Value> {
+        everything
+            .iter()
+            .filter(|id| !exclude.contains(id))
+            .cloned()
+            .collect()
+    };
+    assert_eq!(
+        ids(&public_body(&f, URI, Some(&reader), StatusCode::OK).await),
+        without(&blocked_ids)
+    );
+    assert_eq!(
+        ids(&public_body(&f, URI, Some(&blocked), StatusCode::OK).await),
+        without(&[reader_run["id"].clone()])
+    );
+    assert_eq!(
+        ids(&public_body(&f, URI, None, StatusCode::OK).await),
+        everything
+    );
+    assert_eq!(
+        ids(&public_body(&f, URI, Some(&prolific), StatusCode::OK).await),
+        everything
+    );
+
+    let today = day(0);
+    let id = Uuid::nil();
+    for query in [
+        format!("after=f1:unknown:{id}:review"),
+        format!("after=f1:{today}:{id}:note"),
+        format!("after=f1:{today}:{id}:milestone"),
+        "after=garbage".to_owned(),
+        "limit=0".to_owned(),
+        "limit=51".to_owned(),
+        "limit=1&limit=2".to_owned(),
+        "offset=1".to_owned(),
+    ] {
+        public_body(&f, &format!("{URI}?{query}"), None, StatusCode::BAD_REQUEST).await;
+    }
+    f.finish().await;
+}
+
+#[tokio::test]
+#[ignore = "requires PostgreSQL"]
+async fn people_search_ranks_handles_before_names_and_hides_blocked_pairs() {
+    let f = Fixture::new().await;
+    let (_, operator) = safety_operator(&f).await;
+    let person = |name: &'static str, handle: Option<&'static str>| {
+        let f = &f;
+        async move {
+            let (_, token, profile) = discoverable(f, name).await;
+            if let Some(handle) = handle {
+                claim_handle(f, &token, handle).await;
+            }
+            (token, profile["public_id"].clone())
+        }
+    };
+    let (_, exact) = person("Zzz Exact", Some("zel")).await;
+    let (fan, fan_id) = person("Alpha", Some("zelda_fan")).await;
+    let (_, zeldo) = person("beta", Some("zeldo")).await;
+    let (_, mr) = person("Mr Zelnik", None).await;
+    let (_, twin_a) = person("Nozel Twin", None).await;
+    let (_, twin_b) = person("Nozel Twin", None).await;
+    let (_, pro) = person("Pro Zelda", Some("other_person")).await;
+    person("Nope", Some("azel")).await;
+    let (_, percent) = person("100% Done", None).await;
+    let (disabled, _) = person("Zel Disabled", Some("zel_disabled")).await;
+    publication(&f, &disabled, false).await;
+    let (_, restricted) = person("Zel Restricted", Some("zel_restricted")).await;
+    restriction(&f, &operator, "profile", &restricted, true, 0).await;
+    let (reader, reader_id) = person("Searcher Person", Some("reader_one")).await;
+
+    let search = |query: &'static str, viewer: Option<String>| {
+        let f = &f;
+        async move {
+            let body = public_body(
+                f,
+                &format!("/api/public/people?{query}"),
+                viewer.as_deref(),
+                StatusCode::OK,
+            )
+            .await;
+            for row in body["data"].as_array().unwrap() {
+                let mut keys: Vec<_> = row.as_object().unwrap().keys().cloned().collect();
+                keys.sort_unstable();
+                assert_eq!(keys, ["display_name", "handle", "id"]);
+            }
+            body
+        }
+    };
+    let found = |body: &Value| -> Vec<Value> {
+        body["data"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| row["id"].clone())
+            .collect()
+    };
+    let twins = if twin_a.as_str() < twin_b.as_str() {
+        [twin_a, twin_b]
+    } else {
+        [twin_b, twin_a]
+    };
+    // Exact handle, then handle prefixes, then display names; each group by
+    // lowercase display name, then public UUID.
+    let ranked = vec![
+        exact.clone(),
+        fan_id.clone(),
+        zeldo.clone(),
+        mr,
+        twins[0].clone(),
+        twins[1].clone(),
+        pro.clone(),
+    ];
+    let all = search("q=zel", None).await;
+    assert_eq!(found(&all), ranked);
+    assert_eq!(
+        all["data"][0],
+        json!({"id":exact,"handle":"zel","display_name":"Zzz Exact"})
+    );
+    assert_eq!(
+        (
+            all["limit"].clone(),
+            all["offset"].clone(),
+            all["has_more"].clone()
+        ),
+        (json!(20), json!(0), json!(false))
+    );
+    assert!(all.get("total").is_none());
+    // Case-insensitive, with one leading @ ignored after trimming.
+    for query in ["q=ZEL", "q=%40zel", "q=%20%40Zel%20"] {
+        assert_eq!(found(&search(query, None).await), ranked, "{query}");
+    }
+    assert_eq!(found(&search("q=ZELDO", None).await), [zeldo]);
+    // Wildcards are literal characters.
+    assert_eq!(found(&search("q=zeld_", None).await), Vec::<Value>::new());
+    assert_eq!(
+        found(&search("q=zelda_", None).await),
+        std::slice::from_ref(&fan_id)
+    );
+    assert_eq!(
+        found(&search("q=%25", None).await),
+        std::slice::from_ref(&percent)
+    );
+    assert_eq!(found(&search("q=100%25", None).await), [percent]);
+    // Pages are offset windows over the same order.
+    let page = search("q=zel&limit=2&offset=2", None).await;
+    assert_eq!(found(&page), ranked[2..4]);
+    assert_eq!(page["has_more"], true);
+    let last = search("q=zel&limit=2&offset=6", None).await;
+    assert_eq!(found(&last), ranked[6..]);
+    assert_eq!(last["has_more"], false);
+
+    // A block hides each side from the other only while signed in.
+    assert_eq!(
+        f.call(
+            "PUT",
+            &format!("/api/me/blocks/{}", fan_id.as_str().unwrap()),
+            Some(&reader),
+            Value::Null
+        )
+        .await
+        .status(),
+        StatusCode::NO_CONTENT
+    );
+    let unblocked: Vec<Value> = ranked.iter().filter(|id| **id != fan_id).cloned().collect();
+    assert_eq!(
+        found(&search("q=zel", Some(reader.clone())).await),
+        unblocked
+    );
+    assert_eq!(
+        found(&search("q=searcher", Some(fan.clone())).await),
+        Vec::<Value>::new()
+    );
+    assert_eq!(
+        found(&search("q=searcher", None).await),
+        std::slice::from_ref(&reader_id)
+    );
+    assert_eq!(found(&search("q=zel", None).await), ranked);
+
+    for query in [
+        "",
+        "q=",
+        "q=%20%20",
+        "q=%40",
+        "q=a%01b",
+        "q=zel&q=zel",
+        "q=zel&limit=0",
+        "q=zel&limit=51",
+        "q=zel&offset=10001",
+        "q=zel&after=x",
+    ] {
+        public_body(
+            &f,
+            &format!("/api/public/people?{query}"),
+            None,
+            StatusCode::BAD_REQUEST,
+        )
+        .await;
+    }
+    let long = format!("/api/public/people?q={}", "a".repeat(101));
+    public_body(&f, &long, None, StatusCode::BAD_REQUEST).await;
+    for uri in [
+        "/api/public/people?q=zel",
+        "/api/public/feed",
+        "/api/public/trending/games",
+    ] {
+        let response = f.call("HEAD", uri, Some(&reader), Value::Null).await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["cache-control"], "no-store");
+        assert!(!response.headers().contains_key("etag"));
+        assert!(!response.headers().contains_key("last-modified"));
+    }
     f.finish().await;
 }

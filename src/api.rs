@@ -17,6 +17,7 @@ use ts_rs::TS;
 use uuid::Uuid;
 
 mod browsing;
+mod discovery;
 mod lists;
 mod moderation;
 mod notes;
@@ -47,6 +48,7 @@ pub fn routes() -> Router<AppState> {
         .merge(profiles::routes())
         .merge(statistics::routes())
         .merge(social::routes())
+        .merge(discovery::routes())
         .merge(moderation::routes())
         .merge(transfer::routes())
         .route("/api/me", get(me).put(update_profile))

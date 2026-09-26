@@ -13,6 +13,10 @@ import type { ModerationReport } from "./types/ModerationReport";
 import type { ModerationAudit } from "./types/ModerationAudit";
 import type { ModerationQuery } from "./types/ModerationQuery";
 import type { FeedItem } from "./types/FeedItem";
+import type { PeopleQuery } from "./types/PeopleQuery";
+import type { PersonSummary } from "./types/PersonSummary";
+import type { TrendingGames } from "./types/TrendingGames";
+import type { TrendingQuery } from "./types/TrendingQuery";
 import type { FeedQuery } from "./types/FeedQuery";
 import type { FollowedProfile } from "./types/FollowedProfile";
 import type { FollowingQuery } from "./types/FollowingQuery";
@@ -509,6 +513,20 @@ export const unfollow = (profileId: string): Promise<void> =>
 /** Live public components in chosen-date order; identity is (kind, item.id). */
 export const feed = (query: FeedQuery = {}): Promise<SocialPage<FeedItem>> =>
   request("GET", "/api/me/feed", { query });
+
+// --- Global discovery -------------------------------------------------------
+
+/** Distinct public profiles playing or recently finishing each game; counts only. */
+export const trendingGames = (query: TrendingQuery = {}): Promise<TrendingGames> =>
+  request("GET", "/api/public/trending/games", { query });
+
+/** Public reviews from everyone, at most three per author per chosen day. */
+export const everyoneFeed = (query: FeedQuery = {}): Promise<SocialPage<FeedItem>> =>
+  request("GET", "/api/public/feed", { query });
+
+/** Handle prefix or display-name substring; one leading `@` is ignored. */
+export const searchPeople = (query: PeopleQuery): Promise<Page<PersonSummary>> =>
+  request("GET", "/api/public/people", { query });
 
 // --- Blocking, reporting and operator moderation ---------------------------
 
