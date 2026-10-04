@@ -7,18 +7,19 @@ Rust / Axum backend for a video game diary and library, ready for a future Solid
 Requires Rust 1.94 or newer, PostgreSQL 17 with its contrib modules (the migrations create the `pg_trgm` extension, so the connecting role needs privileges to do so), and a C toolchain. WebAuthn pulls in OpenSSL through `webauthn-rs`, so OpenSSL development headers must be installed (`openssl` on Arch, `libssl-dev` on Debian/Ubuntu). Cargo.lock is included for reproducible dependency resolution.
 
 ```sh
-cp .env.example .env
+cp .envrc.example .envrc
+direnv allow
 docker compose up -d --wait
 cargo run --locked
 ```
 
-Compose publishes PostgreSQL on `127.0.0.1:5433`, matching `DATABASE_URL` in `.env.example`. To use a database you manage yourself, skip `docker compose` and point `DATABASE_URL` at it. Stop the development database with `docker compose down`; add `-v` to discard its data.
+Compose publishes PostgreSQL on `127.0.0.1:5433`, matching `DATABASE_URL` in `.envrc.example`. To use a database you manage yourself, skip `docker compose` and point `DATABASE_URL` at it. Stop the development database with `docker compose down`; add `-v` to discard its data.
 
 The API listens on `http://localhost:3000`. Check `GET /health/live` and `GET /health/ready`. Migrations run on startup. The browser frontend will run at `http://localhost:5173`; use `localhost` consistently rather than mixing it with `127.0.0.1`.
 
 ## IGDB setup
 
-Register a confidential application in the [Twitch developer console](https://dev.twitch.tv/console/apps), then set `IGDB_CLIENT_ID` and `IGDB_CLIENT_SECRET` in `.env`. Credentials stay on the backend. The application starts without them; operations requiring upstream metadata return `503 igdb_not_configured` (locally stored games still work).
+Register a confidential application in the [Twitch developer console](https://dev.twitch.tv/console/apps), then set `IGDB_CLIENT_ID` and `IGDB_CLIENT_SECRET` in `.envrc`. Credentials stay on the backend. The application starts without them; operations requiring upstream metadata return `503 igdb_not_configured` (locally stored games still work).
 
 Catalog search and detail lookup are public, read-only proxies: they query IGDB and return the same descriptive fields without writing anything. The SPA can use `GET /api/catalog/games/{igdb_id}` for direct links and page reloads without a prior search, import, or sign-in. A game earns a row in PostgreSQL when an authenticated user commits to it — adding it to a library or recording a playthrough — or through an explicit import, so the local catalog holds games this instance actually references. Games are named publicly by their IGDB ID; the local UUID is an internal primary key that never appears in a URL, which keeps the identifier a client needs available before any row exists.
 
@@ -52,7 +53,7 @@ Or run the checks directly:
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
-# Requires TEST_DATABASE_URL in the environment or .env (see .env.example).
+# Requires TEST_DATABASE_URL in the environment (see .envrc.example).
 cargo test --locked --test backend -- --ignored --skip launch_backup_restore
 # Also requires PostgreSQL 17 client tools:
 scripts/verify.sh --restore
@@ -88,63 +89,20 @@ Authentication rate limiting and IGDB throttling are per process. Before running
 
 Public catalog routes now have per-client token budgets and concurrency limits ahead of the shared IGDB queue. All application writes, public reads, report submission and archive transfer have admission budgets; see [launch operations](docs/operations.md) for exact limits, edge configuration and release gates.
 
-Client identity is resolved from the socket peer before session lookup. Explicit
-`TRUSTED_PROXY_IPS` peers must supply exactly one overwritten `X-Forwarded-For`
-address; untrusted forwarding headers are ignored. The verified IP reaches both
-application admission and Doorman authentication/auditing. Native IPv6 admission
-uses /64 buckets. The supported single-edge topology, failure behavior, proxy
-template, health/monitoring, privacy retention, backup/restore scripts and browser
-acceptance harness are documented in [docs/operations.md](docs/operations.md).
-Actual deployment, real passkey ceremonies, production email and offsite backups
-still require a recorded acceptance run before public launch.
+Client identity is resolved from the socket peer before session lookup. Explicit `TRUSTED_PROXY_IPS` peers must supply exactly one overwritten `X-Forwarded-For` address; untrusted forwarding headers are ignored. The verified IP reaches both application admission and Doorman authentication/auditing. Native IPv6 admission uses /64 buckets. The supported single-edge topology, failure behavior, proxy template, health/monitoring, privacy retention, backup/restore scripts and browser acceptance harness are documented in [docs/operations.md](docs/operations.md). Actual deployment, real passkey ceremonies, production email and offsite backups still require a recorded acceptance run before public launch.
 
 Authentication tables and their migration history live in `gameboxd_auth`; application tables and migration history live in `gameboxd`. `pg_trgm` is installed into `gameboxd` on a fresh database, or reused wherever it already exists. The only schema coupling is a foreign key to Doorman's BYTEA user ID, with deletion cascades for profiles, library entries and playthroughs (and their notes), and lists (and their members). Check this against any Doorman revision update. Runtime application queries never directly mutate authentication tables.
 
-
 ## Lists and favorites
 
-Custom lists and one optional favorites list per owner organize up to 500 games
-in an editable order independently of library/history. Every list starts private;
-publication shares its ordered membership explicitly. All edits require a list
-revision, including reorders and visibility. Lists appear in public profiles and
-visitor preview through separate safe projections. `backlog` remains want-to-play;
-no library status or list membership claims ownership.
-See [the list API contract](docs/api.md#favorites-ordered-lists-and-want-to-play).
+Custom lists and one optional favorites list per owner organize up to 500 games in an editable order independently of library/history. Every list starts private; publication shares its ordered membership explicitly. All edits require a list revision, including reorders and visibility. Lists appear in public profiles and visitor preview through separate safe projections. `backlog` remains want-to-play; no library status or list membership claims ownership. See [the list API contract](docs/api.md#favorites-ordered-lists-and-want-to-play).
 
-Personal statistics are available at `/api/me/statistics`, with chosen-date
-filtering, recorded-run/completion/replay metrics, rating buckets and current
-library status counts. Public summaries require a separate private-by-default
-`statistics_visibility` choice and use only explicitly public inputs. Owner preview
-applies the same rules. See [the statistics contract](docs/api.md#personal-statistics-and-explicitly-shared-summaries).
+Personal statistics are available at `/api/me/statistics`, with chosen-date filtering, recorded-run/completion/replay metrics, rating buckets and current library status counts. Public summaries require a separate private-by-default `statistics_visibility` choice and use only explicitly public inputs. Owner preview applies the same rules. See [the statistics contract](docs/api.md#personal-statistics-and-explicitly-shared-summaries).
 
-Private following and the historical feed are available at `/api/me/following`
-and `/api/me/feed`. Follow/unfollow use the target's public profile UUID and
-idempotent PUT/DELETE. The feed reads live public reviews, notes and explicit
-playthrough-state summaries, in chosen-date order with cursor pagination;
-publication and edits create no new activity timestamps. Relationships remain
-private. See [the social API contract](docs/api.md#private-following-and-chronological-gaming-life-feed).
+Private following and the historical feed are available at `/api/me/following` and `/api/me/feed`. Follow/unfollow use the target's public profile UUID and idempotent PUT/DELETE. The feed reads live public reviews, notes and explicit playthrough-state summaries, in chosen-date order with cursor pagination; publication and edits create no new activity timestamps. Relationships remain private. See [the social API contract](docs/api.md#private-following-and-chronological-gaming-life-feed).
 
-Blocking, private reporting and operator moderation are implemented under
-`/api/me/blocks`, `/api/me/reports`, `/api/me/restrictions` and `/api/operator/*`.
-Blocks remove both follow directions and suppress authenticated public access;
-logged-out public access is still governed by publication choices. Moderation
-uses separate restrictions, preserves private diaries and gates all public
-projections and previews. Operator grants require trusted database administration;
-no account has them by default. Evidence expires after 90 days and is scrubbed
-on reported-account deletion. See the [safety API and operations policy](docs/api.md#blocking-reporting-and-operator-moderation).
+Blocking, private reporting and operator moderation are implemented under `/api/me/blocks`, `/api/me/reports`, `/api/me/restrictions` and `/api/operator/*`. Blocks remove both follow directions and suppress authenticated public access; logged-out public access is still governed by publication choices. Moderation uses separate restrictions, preserves private diaries and gates all public projections and previews. Operator grants require trusted database administration; no account has them by default. Evidence expires after 90 days and is scrubbed on reported-account deletion. See the [safety API and operations policy](docs/api.md#blocking-reporting-and-operator-moderation).
 
-Complete private diary archives are available at `GET /api/me/export` in the
-versioned `gameboxd.personal` JSON format. `/api/me/import/preview` validates and
-reports conflicts; `/api/me/import` performs an atomic create-only merge with
-owner-scoped duplicate protection, ID remapping and private import defaults.
-Existing history is never silently overwritten. See the
-[transfer contract](docs/api.md#personal-export-and-round-trip-import).
+Complete private diary archives are available at `GET /api/me/export` in the versioned `gameboxd.personal` JSON format. `/api/me/import/preview` validates and reports conflicts; `/api/me/import` performs an atomic create-only merge with owner-scoped duplicate protection, ID remapping and private import defaults. Existing history is never silently overwritten. See the [transfer contract](docs/api.md#personal-export-and-round-trip-import).
 
-
-Creation of playthroughs, notes and lists, lifecycle actions, and personal import
-support authenticated `Idempotency-Key` receipts committed atomically with the
-write. Matching retries recover the original response for seven days; expired
-keys remain tombstones until account deletion and cannot duplicate history.
-The maintenance loop removes expired response bodies. Import provenance remains
-permanent and independent. See [request recovery](docs/api.md#retry-safe-creation-and-request-recovery)
-for retention, failure handling and typed-client use.
+Creation of playthroughs, notes and lists, lifecycle actions, and personal import support authenticated `Idempotency-Key` receipts committed atomically with the write. Matching retries recover the original response for seven days; expired keys remain tombstones until account deletion and cannot duplicate history. The maintenance loop removes expired response bodies. Import provenance remains permanent and independent. See [request recovery](docs/api.md#retry-safe-creation-and-request-recovery) for retention, failure handling and typed-client use.

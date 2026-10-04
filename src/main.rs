@@ -12,14 +12,17 @@ use tracing_subscriber::EnvFilter;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    dotenvy::dotenv().ok();
-    tracing_subscriber::fmt()
-        .json()
-        .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-            EnvFilter::new("gameboxd_backend=info,doorman=info,tower_http=info")
-        }))
-        .init();
     let config = Config::from_env()?;
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("gameboxd_backend=info,doorman=info,tower_http=info"));
+    // Readable output for a terminal in development; one JSON object per line
+    // in production, for log collectors.
+    let logs = tracing_subscriber::fmt().with_env_filter(filter);
+    if config.production {
+        logs.json().init();
+    } else {
+        logs.pretty().init();
+    }
     let database = Database::connect(&config.database_url).await?;
     let auth = auth::build(&config, &database.auth, database.app.clone())?;
     let igdb = IgdbClient::new(config.igdb_credentials.clone(), Endpoints::default())?;

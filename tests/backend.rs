@@ -70,7 +70,6 @@ impl Fixture {
     }
 
     async fn build_with_proxies(refresh: bool, trusted_proxy_ips: Vec<std::net::IpAddr>) -> Self {
-        dotenvy::dotenv().ok();
         let url = std::env::var("TEST_DATABASE_URL").expect(
             "Set TEST_DATABASE_URL to a PostgreSQL account with CREATE DATABASE permission",
         );

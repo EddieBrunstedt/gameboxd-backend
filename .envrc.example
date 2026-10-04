@@ -1,36 +1,36 @@
-APP_ENV=development
-BIND_ADDR=127.0.0.1:3000
-DATABASE_URL=postgres://gameboxd:gameboxd@127.0.0.1:5433/gameboxd
+export APP_ENV=development
+export BIND_ADDR=127.0.0.1:3000
+export DATABASE_URL=postgres://gameboxd:gameboxd@127.0.0.1:5433/gameboxd
 # Exact browser origin, used for passkeys, CORS, CSRF and email links.
-FRONTEND_ORIGIN=http://localhost:5173
-RP_ID=localhost
+export FRONTEND_ORIGIN=http://localhost:5173
+export RP_ID=localhost
 # SameSite on the session cookie: lax (default) or none.
 # Lax requires the API and FRONTEND_ORIGIN to be same-site — same registrable
 # domain, ignoring scheme and port. localhost:3000 and localhost:5173 qualify,
 # and so would gameboxd.example with an API on api.gameboxd.example. An API on
 # an unrelated domain does not, and the browser drops the session cookie with no
 # error anywhere; use none there. none requires an https FRONTEND_ORIGIN.
-COOKIE_SAME_SITE=lax
-RUST_LOG=gameboxd_backend=info,doorman=info,tower_http=info
+export COOKIE_SAME_SITE=lax
+export RUST_LOG=gameboxd_backend=info,doorman=info,tower_http=info
 
 # Optional: without these, imported local games and library endpoints still work.
-IGDB_CLIENT_ID=
-IGDB_CLIENT_SECRET=
+export IGDB_CLIENT_ID=
+export IGDB_CLIENT_SECRET=
 
 # Development defaults to terminal email. Production requires smtp and HTTPS.
-EMAIL_TRANSPORT=terminal
-SMTP_HOST=
-SMTP_PORT=587
-SMTP_USERNAME=
-SMTP_PASSWORD=
-SMTP_FROM=
+export EMAIL_TRANSPORT=terminal
+export SMTP_HOST=
+export SMTP_PORT=587
+export SMTP_USERNAME=
+export SMTP_PASSWORD=
+export SMTP_FROM=
 
 # Only used by the explicitly enabled database integration tests.
 # This account must be able to CREATE DATABASE; tests use a new disposable database.
-TEST_DATABASE_URL=postgres://gameboxd:gameboxd@127.0.0.1:5433/postgres
+export TEST_DATABASE_URL=postgres://gameboxd:gameboxd@127.0.0.1:5433/postgres
 
 # Empty for direct connections. Single trusted edge proxy topology only:
 # exact socket peer IPs, comma-separated; never clients or broad networks.
 # Proxy MUST overwrite X-Forwarded-For with ONE client IP (not append).
 # For a same-host nginx edge and a loopback-only backend: 127.0.0.1,::1
-TRUSTED_PROXY_IPS=
+export TRUSTED_PROXY_IPS=

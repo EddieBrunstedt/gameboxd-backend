@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Runs the same checks as CI. Pass --database to include the PostgreSQL
-# integration tests, which need TEST_DATABASE_URL (see .env.example).
+# integration tests, which need TEST_DATABASE_URL (see .envrc.example).
 # --restore runs the separate backup drill and requires PostgreSQL 17 clients.
 set -euo pipefail
 case "${1:-}" in
