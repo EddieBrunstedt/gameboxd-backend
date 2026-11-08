@@ -19,35 +19,42 @@ import type { ErrorCode } from "./types/ErrorCode";
 
 /**
  * Every code Doorman can emit, from `classify` in its `crates/axum/src/error.rs`
- * plus `csrf_origin_mismatch` from its CSRF layer.
+ * plus the session layer's own refusals (`LayerRefusal` in the same file).
  *
- * Hand-written and drift-checked: `tests/contract.rs` parses `classify` at the
- * pinned revision and fails if this union and that match disagree in either
+ * Hand-written and drift-checked: `tests/contract.rs` parses both at the
+ * pinned revision and fails if this union and those disagree in either
  * direction. Doorman is a git dependency, so a moved pin can add or rename a
  * code, and a union that quietly lagged behind would be worse than none.
+ *
+ * The DPoP codes and `ambiguous_session_token` belong to non-browser clients.
+ * This backend starts no DPoP session, so the SPA meets them only by sending a
+ * `DPoP` header it has no reason to send.
  */
 export type AuthCode =
-  | "account_disabled"
+  | "acting_session_not_revocable"
+  | "ambiguous_session_token"
   | "csrf_origin_mismatch"
+  | "dpop_session_not_allowed"
   | "email_already_in_use"
   | "email_error"
   | "internal_error"
+  | "invalid_dpop_proof"
   | "invalid_email"
+  | "invalid_email_link"
   | "invalid_operator_actor"
   | "invalid_passkey_challenge"
-  | "invalid_relying_party"
-  | "invalid_verification_token"
+  | "invalid_passkey_name"
   | "passkey_not_found"
   | "passkey_ownership_mismatch"
   | "passkey_possible_compromise"
   | "rate_limited"
   | "reauth_required"
-  | "recovery_cooldown_active"
+  | "recovery_cool_down_active"
   | "resource_limit_exceeded"
-  | "session_expired"
   | "session_not_found"
   | "signup_not_allowed"
   | "storage_error"
+  | "user_disabled"
   | "user_not_found"
   | "user_verification_required"
   | "webauthn_error";
@@ -102,16 +109,11 @@ export function codeOf(error: unknown): AnyErrorCode | null {
  * middle of doing at the exact moment the server asked them to confirm it was
  * them. **Never branch on the status alone.**
  *
- * `session_expired` comes only from `/auth` routes that consult the session
- * manager directly. An expired cookie on an application route reads as
- * `session_not_found`, because Doorman's session layer attaches no context for
- * a session it could not validate and the `AuthUser` extractor cannot tell
- * "expired" from "never existed". Both are listed because a caller should not
- * have to know which route it was talking to.
+ * Doorman has one code for this: a session that expired, was revoked or never
+ * existed all read as `session_not_found`, on `/auth` and `/api` alike.
  */
 export function isSignedOut(error: unknown): boolean {
-  const code = codeOf(error);
-  return code === "session_not_found" || code === "session_expired";
+  return codeOf(error) === "session_not_found";
 }
 
 /** True when the session is valid but the action needs a fresh assertion. */
@@ -120,12 +122,13 @@ export function isReauthRequired(error: unknown): boolean {
 }
 
 /**
- * True when the account is disabled. Separate from {@link isSignedOut} on
- * purpose: it is a 403, and signing in again does not clear it, so sending the
- * user to the sign-in screen would be an invitation to a loop.
+ * True when an operator has disabled the account. Separate from
+ * {@link isSignedOut} on purpose: it is a 403, and signing in again does not
+ * clear it, so sending the user to the sign-in screen would be an invitation to
+ * a loop.
  */
 export function isAccountDisabled(error: unknown): boolean {
-  return codeOf(error) === "account_disabled";
+  return codeOf(error) === "user_disabled";
 }
 
 /**
@@ -144,11 +147,13 @@ export function isPasskeyCancelled(error: unknown): boolean {
  * True when the cool-down after account recovery is blocking an action.
  *
  * Recovering with a new passkey starts a 24-hour window in which destructive
- * actions stay blocked, so a stolen email cannot immediately be turned into a
- * takeover. The UI has to explain this rather than report a generic failure.
+ * actions — deleting the account, changing its email, removing a passkey,
+ * revoking other sessions — stay blocked for sessions started from that
+ * passkey, so a stolen email cannot immediately be turned into a takeover. The
+ * UI has to explain this rather than report a generic failure.
  */
 export function isRecoveryCooldown(error: unknown): boolean {
-  return codeOf(error) === "recovery_cooldown_active";
+  return codeOf(error) === "recovery_cool_down_active";
 }
 
 // Jargon -> end-user guidance. This is the table a host customises per product
@@ -160,17 +165,18 @@ export const ERROR_GUIDANCE: Record<string, string> = {
   handle_unavailable: "That handle is unavailable. Choose another name.",
   import_conflict: "Nothing was imported. Resolve the reported conflicts and preview the archive again.",
   lifecycle_conflict: "Reload the current run and choose an action allowed in its current state.",
-  recovery_cooldown_active:
+  recovery_cool_down_active:
     "This action is blocked during the 24-hour recovery cool-down. You can still add a passkey and sign out of this session.",
   csrf_origin_mismatch:
     "The request was blocked by the cross-origin check. Make sure you are using the app's real address.",
   session_not_found: "You are signed out. Sign in with a passkey to continue.",
-  session_expired: "Your session expired. Sign in with a passkey again.",
   email_already_in_use: "That email is already linked to an account.",
   invalid_email: "That does not look like a valid email address.",
-  invalid_verification_token: "This link is invalid or has already been used. Request a new one.",
+  invalid_email_link: "This link is invalid, expired or already used. Request a new one.",
   invalid_passkey_challenge: "The passkey step timed out. Try again.",
   passkey_not_found: "That passkey is no longer registered.",
+  invalid_passkey_name: "That passkey name is too long or has characters it cannot hold. Choose another.",
+  acting_session_not_revocable: "This is the session you are using. Sign out instead.",
   passkey_ownership_mismatch: "That passkey does not belong to this account.",
   passkey_possible_compromise:
     "Sign-in was blocked because this authenticator may have been cloned. Use another passkey and review your account.",
@@ -178,12 +184,11 @@ export const ERROR_GUIDANCE: Record<string, string> = {
   resource_limit_exceeded: "You have reached the limit for this resource.",
   webauthn_error: "The passkey step failed. Try again, or use a different authenticator.",
   user_not_found: "No matching account.",
-  // Upstream's table omits this one. It means the authenticator completed the
-  // ceremony without verifying the person holding it — no PIN, no biometric —
-  // while the server required that it did.
+  // The authenticator completed the ceremony without verifying the person
+  // holding it — no PIN, no biometric — while the server required that it did.
   user_verification_required:
     "Your device did not confirm it was you. Use a passkey protected by a PIN, fingerprint or face unlock.",
-  account_disabled: "This account has been disabled. Contact support.",
+  user_disabled: "This account has been disabled. Contact support.",
   // Present so nothing falls through to the signed-out wording below: this 401
   // means the session is still good and the action needs fresh proof.
   reauth_required: "Confirm it is you with your passkey to continue.",

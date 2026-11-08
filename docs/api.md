@@ -391,14 +391,16 @@ The list above is what the *application* emits. It is not everything an `/api` r
 
 | Status | Code | When |
 | --- | --- | --- |
-| 401 | `session_not_found` | No session cookie or bearer token, or one that no longer validates |
+| 401 | `session_not_found` | No session cookie, or one that expired, was revoked or never existed |
 | 401 | `reauth_required` | The session is valid; this action needs a fresh passkey assertion |
-| 403 | `csrf_origin_mismatch` | A cookie-authenticated write with a missing or foreign `Origin`/`Referer` |
-| 403 | `account_disabled` | The account exists but is not active |
+| 403 | `csrf_origin_mismatch` | A state-changing browser request not shown to come from `FRONTEND_ORIGIN` (see below) |
+| 403 | `user_disabled` | An operator has disabled the user |
+| 409 | `recovery_cool_down_active` | A destructive action from a session started by a recently recovered passkey |
+| 500 | `storage_error` | The session store could not be read, so whether the request has a session is unknown |
 
-**An expired session reports `session_not_found`, not `session_expired`.** The session layer attaches no context for a session it could not validate, so the extractor behind every authenticated route cannot tell "expired" from "never existed". `session_expired` exists, but only `/auth` routes that consult the session manager directly can produce it. A client that branches only on `session_expired` will never fire; branch on both, or use `isSignedOut` from the contract, which does.
+**There is one signed-out code.** Doorman has no `session_expired`: an expired, revoked or unknown session all read as `session_not_found`, on `/auth` and `/api` alike. Use `isSignedOut` from the contract.
 
-These codes are published as the `AuthCode` union in `contract/errors.ts`, checked against Doorman's own `classify` at the pinned revision by `tests/contract.rs`. `ApiError.code` and `AuthError.code` are both typed `AnyErrorCode`, the union of that set with this application's `ErrorCode` and the browser-side ceremony codes below, because all three genuinely arrive at the same `catch`.
+These codes are published as the `AuthCode` union in `contract/errors.ts`, checked against Doorman's own `classify` and its session layer's refusals at the pinned revision by `tests/contract.rs`. `ApiError.code` and `AuthError.code` are both typed `AnyErrorCode`, the union of that set with this application's `ErrorCode` and the browser-side ceremony codes below, because all three genuinely arrive at the same `catch`.
 
 **Never branch on the status alone.** `session_not_found` and `reauth_required` are both 401 and mean opposite things: one requires sending the user to sign in, the other requires keeping them exactly where they are and asking for a passkey. Treating the second as the first discards the user's work at the moment the server asked them to confirm their identity.
 
@@ -441,7 +443,7 @@ if (saved.status === 412) {
 }
 ```
 
-The browser must run at `FRONTEND_ORIGIN`. Cookie writes require a matching Origin or Referer; the browser sends Origin automatically for these fetch requests. Cookie-based curl requests must include an equivalent header. Authenticated curl/tool requests can alternatively send `Authorization: Bearer <doorman-session-token>`; this is an opaque session token, not a JWT.
+The browser must run at `FRONTEND_ORIGIN`. Every state-changing request a browser sends — with or without a session cookie — must come from that origin: Doorman accepts `Sec-Fetch-Site: same-origin` (or `none`), or else an `Origin` header naming `FRONTEND_ORIGIN`. `Referer` no longer counts. The browser sends these automatically for `fetch`. A tool sending the session cookie must add `Origin: <FRONTEND_ORIGIN>`, or the write is refused; a request with neither the cookie nor any browser header (plain curl to `/auth/signup/request`, say) passes. There is no bearer token: sessions are cookie sessions only.
 
 ### Where the API may be deployed
 
@@ -449,21 +451,23 @@ The session cookie is `HttpOnly`, `Path=/`, carries no `Domain`, and is `SameSit
 
 Local development never shows the problem. `localhost:5173` and `localhost:3000` differ only by port, so they are same-site and the cookie flows. `gameboxd.example` with an API on `api.gameboxd.example` is also same-site and equally fine. An API on an unrelated domain is **not**, and the browser will silently drop the session cookie on every request — a login that appears to succeed and then behaves as though it never happened, with nothing in the server logs.
 
-Set `COOKIE_SAME_SITE=none` for that topology. It requires an HTTPS `FRONTEND_ORIGIN`, because a browser ignores a `SameSite=None` cookie that is not also `Secure`; startup refuses the combination rather than letting it fail in the browser. Cross-site cookies are still protected against forgery by the Origin/Referer check above, which is independent of `SameSite`. Prefer putting the API on a subdomain of the frontend and leaving this alone.
+Set `COOKIE_SAME_SITE=none` for that topology. It requires an HTTPS `FRONTEND_ORIGIN`, because a browser ignores a `SameSite=None` cookie that is not also `Secure`; startup refuses the combination rather than letting it fail in the browser. Cross-site cookies are still protected against forgery by the origin check above, which is independent of `SameSite`. Prefer putting the API on a subdomain of the frontend and leaving this alone.
 
 ## Doorman routes and passkey flows
 
-Mounted unchanged at `/auth`; authoritative DTOs and flow behavior come from the [pinned Doorman source](https://codeberg.org/EddieBrunstedt/Doorman/src/commit/17bb0dcd509de6ca3bfd2742d3c9e422c92b4597/crates/axum/src/dto.rs).
+Mounted unchanged at `/auth`; authoritative DTOs and flow behavior come from the [pinned Doorman source](https://github.com/EddieBrunstedt/Doorman/blob/ef829117a2c33e601b573b96a207fc5955a0076a/crates/axum/src/dto.rs) and its [routes](https://github.com/EddieBrunstedt/Doorman/tree/ef829117a2c33e601b573b96a207fc5955a0076a/crates/axum/src/routes).
 
-- Signup: `POST /auth/signup/request` with `{email}` → email link to SPA `/signup?token=...` → `POST /auth/signup/consume` with `{token}` → WebAuthn registration in browser → `POST /auth/signup/finish` with challenge ID and credential.
+- Signup: `POST /auth/signup/request` with `{email}` → email link to SPA `/signup?token=...` → `POST /auth/signup/redeem` with `{token}` → WebAuthn registration in browser → `POST /auth/signup/finish` with challenge ID and credential.
 - Sign-in: `POST /auth/passkey/authenticate/start` → browser WebAuthn assertion → `POST /auth/passkey/authenticate/finish`.
-- Recovery follows `/auth/recovery/request`, `/consume`, `/finish`, with an email link to the SPA `/recovery` screen and passkey enrollment.
-- Passkeys: `GET /auth/passkey`, registration start/finish, rename and removal via `/auth/passkey/{credential_id}`.
-- Sessions: `GET /auth/sessions`, `POST /auth/logout`, `POST /auth/logout-all`, and session revocation routes.
-- Account: `POST /auth/account/email`, `POST /auth/account/email/confirm`, `DELETE /auth/account`.
+- Recovery follows `/auth/recovery/request`, `/redeem`, `/finish`, with an email link to the SPA `/recovery` screen and a new passkey registration.
+- Passkeys: `GET /auth/passkey`, registration start/finish, rename (`PATCH`) and removal (`DELETE`) via `/auth/passkey/{credential_id}`.
+- Sessions: `GET /auth/sessions`, `POST /auth/logout`, `POST /auth/logout-all`, `DELETE /auth/sessions` (every other session) and `DELETE /auth/sessions/{id}` (one session; the current one's ID logs out).
+- User: `POST /auth/user/email`, `POST /auth/user/email/confirm`, `DELETE /auth/user`.
 - Re-authentication: `POST /auth/reauth/start`; provide the resulting fresh assertion in the protected action's `reauthentication` field according to Doorman's DTOs.
 
-Email links only start signup/recovery; they do not create sessions on their own. Successful passkey finish sets the HttpOnly session cookie. Email changes, passkey removal and account deletion require re-authentication; recovery cooldowns also apply. Render frontend screens for `/signup`, `/recovery` and `/account/email`, consume their tokens once, and remove tokens from browser history after reading them. Use the [Doorman browser helper reference](https://codeberg.org/EddieBrunstedt/Doorman/src/commit/17bb0dcd509de6ca3bfd2742d3c9e422c92b4597/examples/web-client) to serialize WebAuthn ArrayBuffers correctly.
+Signup, recovery and sign-in answer `{user, session}`; the session token is only in the HttpOnly cookie and never in a body. `session.transport` is always `"cookie"` here.
+
+Email links only start signup/recovery or confirm an email change; they never create sessions on their own. A signup link only reaches someone who has not finished signup; requesting signup for an existing user's address sends nothing. Successful passkey finish sets the HttpOnly session cookie. Email changes, passkey removal and account deletion require re-authentication. Logging out everywhere and revoking other sessions run through the same gate without needing it, and like every destructive action are refused during the recovery cool-down, which applies to sessions started from the recovered passkey (and passkeys added from them), not to the user's other passkeys. Render frontend screens for `/signup`, `/recovery` and `/account/email`, redeem their tokens once, and remove tokens from browser history after reading them. `contract/auth.ts` serializes WebAuthn ArrayBuffers for every flow above.
 
 
 ## Per-item visibility and public representations

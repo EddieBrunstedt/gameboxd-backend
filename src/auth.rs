@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use async_trait::async_trait;
 use doorman::{
@@ -7,7 +7,6 @@ use doorman::{
         email::{Email, EmailSender},
         error::{EmailError, EmailResult},
         memory::InMemoryRateLimiter,
-        verification::TOKEN_PLACEHOLDER,
     },
     prelude::*,
 };
@@ -20,12 +19,12 @@ use sqlx::PgPool;
 
 use crate::config::Config;
 
-pub fn build(
-    config: &Config,
-    storage: &PostgresStorage,
-    pool: PgPool,
-) -> anyhow::Result<AuthService> {
-    let email: Arc<dyn EmailSender> = match &config.smtp {
+/// How often expired sessions, email links and passkey challenges are purged.
+const PURGE_EVERY: Duration = Duration::from_secs(300);
+
+/// Where Doorman's emails go: SMTP when configured, otherwise the terminal.
+pub fn email_sender(config: &Config) -> anyhow::Result<Arc<dyn EmailSender>> {
+    Ok(match &config.smtp {
         None => Arc::new(TerminalEmailSender),
         Some(smtp) => Arc::new(SmtpSender {
             from: smtp.from.parse()?,
@@ -35,54 +34,66 @@ pub fn build(
                     smtp.username.clone(),
                     smtp.password.clone(),
                 ))
-                .timeout(Some(std::time::Duration::from_secs(15)))
+                .timeout(Some(Duration::from_secs(15)))
                 .build(),
         }),
-    };
+    })
+}
+
+/// Assembles Doorman. Must run inside a Tokio runtime: the service purges
+/// expired authentication rows on a task of its own.
+pub fn build(
+    config: &Config,
+    storage: &PostgresStorage,
+    pool: PgPool,
+    email: Arc<dyn EmailSender>,
+) -> anyhow::Result<AuthService> {
     let base = config.frontend_origin.as_str().trim_end_matches('/');
-    Ok(AuthService::builder(storage.all_stores())
-        .email(email)
-        .passkey(PasskeyConfig::new(
-            &config.rp_id,
-            config.frontend_origin.clone(),
-            "Gameboxd",
-        ))
-        .audit(Arc::new(DatabaseAudit(pool)))
-        .limiter(Arc::new(InMemoryRateLimiter::new(Arc::new(SystemClock))))
-        .signup(SignupConfig {
-            url_template: format!("{base}/signup?token={TOKEN_PLACEHOLDER}"),
-            ..Default::default()
-        })
-        .recovery(RecoveryConfig {
-            url_template: format!("{base}/recovery?token={TOKEN_PLACEHOLDER}"),
-            ..Default::default()
-        })
-        .account(AccountConfig {
-            url_template: format!("{base}/account/email?token={TOKEN_PLACEHOLDER}"),
-            ..Default::default()
-        })
-        .reauthentication(ReauthPolicy::required_for([
-            ReauthAction::DeleteAccount,
+    let link = |path: &str| LinkTemplate::parse(format!("{base}{path}?token={TOKEN_PLACEHOLDER}"));
+    let relying_party = RelyingParty::builder(config.frontend_origin.clone(), "Gameboxd")
+        .id(&config.rp_id)
+        .build()?;
+    // No `dpop_origin` in the session config: every session is a browser's
+    // cookie session, and Doorman refuses to start a DPoP session.
+    let core = AuthCore::builder(AuthCoreRequired {
+        storage: storage.all_stores(),
+        email_sender: email,
+        audit_sink: Arc::new(DatabaseAudit(pool)),
+        passkey: PasskeyConfig::new(relying_party),
+        reauthentication: ReauthPolicy::required_for([
+            ReauthAction::DeleteUser,
             ReauthAction::RemovePasskey,
             ReauthAction::RequestEmailChange,
-        ]))
-        .external_origin(config.frontend_origin.clone())
-        .cookie(CookieConfig {
-            session_cookie_name: if config.production {
-                "__Host-gameboxd_session"
-            } else {
-                "gameboxd_session"
-            }
-            .into(),
-            secure: config.frontend_origin.scheme() == "https",
-            // See `Config::cookie_same_site`: `Lax` is right whenever the API
-            // and the SPA are same-site, and wrong — silently — when they are
-            // not, so it is a deployment decision rather than a default to
-            // inherit.
-            same_site: config.cookie_same_site,
-            ..Default::default()
-        })
-        .build()?)
+        ]),
+        rate_limiting: RateLimiting::enforced(Arc::new(InMemoryRateLimiter::new(Arc::new(
+            SystemClock,
+        )))),
+        links: LinkTemplates {
+            signup: link("/signup")?,
+            recovery: link("/recovery")?,
+            email_change: link("/account/email")?,
+        },
+    })
+    .build();
+    let mut cookie = CookieConfig::builder(if config.production {
+        "__Host-gameboxd_session"
+    } else {
+        "gameboxd_session"
+    })
+    // See `Config::cookie_same_site`: `Lax` is right whenever the API and the
+    // SPA are same-site, and wrong — silently — when they are not, so it is a
+    // deployment decision rather than a default to inherit.
+    .same_site(config.cookie_same_site);
+    if config.frontend_origin.scheme() != "https" {
+        cookie = cookie.insecure();
+    }
+    // The relying party's origin, `FRONTEND_ORIGIN`, is the one origin Doorman
+    // trusts for state-changing browser requests.
+    Ok(
+        AuthService::builder(core, PurgeSchedule::in_process(PURGE_EVERY)?)
+            .cookie(cookie.build()?)
+            .build()?,
+    )
 }
 
 struct DatabaseAudit(PgPool);

@@ -3,9 +3,9 @@
 //! The generated half of the contract cannot drift: `contract/types` is written
 //! from the same structs that serialize the responses, and CI fails on a dirty
 //! working tree after regenerating it. The hand-written half — the documented
-//! error codes, the Doorman revision the docs point at, and the browser adapter
-//! derived from Doorman's reference client — has no such guarantee, so it is
-//! checked here instead of trusted to a habit.
+//! error codes, the Doorman revision the docs point at, and the Doorman codes
+//! the contract publishes — has no such guarantee, so it is checked here
+//! instead of trusted to a habit.
 
 use std::{fs, path::PathBuf};
 
@@ -92,28 +92,6 @@ fn commit_hashes(text: &str) -> Vec<String> {
     found
 }
 
-/// The vendored copy of Doorman's reference browser client still matches the
-/// pinned revision.
-///
-/// `contract/auth.ts` is derived from that file by hand, so a change upstream
-/// is a change this app has to review rather than inherit silently. Comparing
-/// the pristine copy — not the adapted one — is what makes the check exact.
-#[test]
-fn the_vendored_doorman_client_matches_the_pinned_revision() {
-    let pinned = pinned_doorman_revision();
-    let vendored = repo_file("contract/doorman/passkey.upstream.ts");
-    let upstream_path = doorman_checkout(&pinned).join("examples/web-client/passkey.ts");
-    let upstream = fs::read_to_string(&upstream_path)
-        .unwrap_or_else(|error| panic!("reading {}: {error}", upstream_path.display()));
-    assert_eq!(
-        vendored,
-        upstream,
-        "contract/doorman/passkey.upstream.ts differs from Doorman {pinned}.\n\
-         Copy {} over it, then re-derive contract/auth.ts from the difference.",
-        upstream_path.display()
-    );
-}
-
 /// Cargo's checkout of the pinned Doorman revision.
 ///
 /// Any run of this test has already compiled Doorman from that checkout, so it
@@ -133,7 +111,9 @@ fn doorman_checkout(revision: &str) -> PathBuf {
             entry
                 .file_name()
                 .to_str()
-                .is_some_and(|name| name.starts_with("Doorman-"))
+                // Cargo names the directory after the repository URL's last
+                // segment, whose case has changed between Doorman's hosts.
+                .is_some_and(|name| name.to_ascii_lowercase().starts_with("doorman-"))
         })
         .map(|entry| entry.path().join(short))
         .filter(|path| path.is_dir())
@@ -221,15 +201,22 @@ fn the_published_auth_codes_match_the_pinned_doorman_revision() {
         );
     let mut upstream = string_literals(&body);
 
-    // The CSRF layer rejects before `classify` is ever reached, so its code is
-    // not in that match and has to be picked up where it is actually written.
-    let csrf_source = fs::read_to_string(checkout.join("crates/axum/src/csrf.rs")).unwrap();
-    let csrf = csrf_source
-        .lines()
-        .find_map(|line| line.trim().strip_prefix("code: "))
-        .map(|rest| rest.trim_end_matches(',').trim_matches('"').to_owned())
-        .expect("Doorman csrf.rs should name a stable code");
-    upstream.push(csrf);
+    // The session layer refuses some requests before any route runs, so those
+    // codes are not in `classify`; they are in `LayerRefusal`'s response, whose
+    // other literals are messages and so are not snake_case.
+    let refusals = error_source
+        .split_once("impl IntoResponse for LayerRefusal")
+        .expect("Doorman error.rs should answer LayerRefusal")
+        .1
+        .split_once("fn json_error(")
+        .expect("LayerRefusal's response should precede json_error")
+        .0;
+    let refusal_codes = string_literals(refusals);
+    assert!(
+        refusal_codes.contains(&"csrf_origin_mismatch".to_owned()),
+        "the layer refusals should include the CSRF code: {refusal_codes:?}"
+    );
+    upstream.extend(refusal_codes);
     upstream.sort();
     upstream.dedup();
 
@@ -308,13 +295,17 @@ fn every_published_code_a_user_can_act_on_has_guidance() {
         .split_once("export const ERROR_GUIDANCE")
         .expect("contract/errors.ts should declare ERROR_GUIDANCE")
         .1;
-    const INTERNAL: [&str; 6] = [
+    // The DPoP codes and `ambiguous_session_token` answer non-browser clients,
+    // which this backend does not admit, so the SPA has no user to guide.
+    const INTERNAL: [&str; 8] = [
         "storage_error",
         "email_error",
         "internal_error",
-        "invalid_relying_party",
         "invalid_operator_actor",
         "signup_not_allowed",
+        "dpop_session_not_allowed",
+        "invalid_dpop_proof",
+        "ambiguous_session_token",
     ];
     for code in published_union("AuthCode")
         .into_iter()

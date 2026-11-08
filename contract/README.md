@@ -15,7 +15,6 @@ contract/
   errors.ts                  the code vocabulary and predicates both clients share
   client.ts                  typed client for /api routes
   auth.ts                    browser adapter for /auth routes
-  doorman/passkey.upstream.ts  pristine copy of Doorman's reference client
   index.ts                   what a consumer imports
   tsconfig.json              type-check settings; no build, `noEmit` is set
 ```
@@ -67,19 +66,18 @@ clients now throw errors extending one `GameboxdError` base, `code` is typed
 `AnyErrorCode` — the application's codes, Doorman's, and the browser-side
 ceremony codes — and the predicates work on either class:
 
-- `isSignedOut` — the session is gone; sign-in is the only way forward. Accepts
-  `session_not_found` **and** `session_expired`, because an expired cookie on an
-  application route reads as the former: the session layer attaches no context
-  for a session it could not validate, and the extractor cannot tell "expired"
-  from "never existed".
+- `isSignedOut` — the session is gone; sign-in is the only way forward.
+  Doorman has one code for that, `session_not_found`, whether the session
+  expired, was revoked or never existed.
 - `isReauthRequired` — the session is fine and the action needs fresh proof.
   Also a 401. **Never branch on the status alone.**
 - `isPasskeyCancelled` — the user dismissed the prompt. Usually deserves no
   message at all.
 - `isAccountDisabled`, `isRecoveryCooldown`, and `isStale` in `client.ts`.
 
-`AuthCode` is hand-written and drift-checked against Doorman's own `classify` at
-the pinned revision by `tests/contract.rs`, in both directions, so a moved pin
+`AuthCode` is hand-written and drift-checked against Doorman's own `classify`
+and its session layer's refusals at the pinned revision by `tests/contract.rs`,
+in both directions, so a moved pin
 that adds or renames a code fails the build rather than leaving a union quietly
 behind. `ERROR_GUIDANCE` maps every code a user can act on to product copy; a
 missing entry is a test failure too.
@@ -97,29 +95,31 @@ everything it got wrong in a single round trip.
 
 ## Authentication
 
-`auth.ts` is derived by hand from Doorman's reference browser client at the
-revision this backend pins,
-`17bb0dcd509de6ca3bfd2742d3c9e422c92b4597`. The unmodified original sits in
-`doorman/passkey.upstream.ts` and is byte-compared against the pinned checkout
-by `tests/contract.rs`. When the pin moves and that file changed, the test
-fails: copy the new upstream over it and re-derive the adapter from the diff.
-Nothing about the auth surface is inherited silently.
+`auth.ts` is written by hand against Doorman's routes
+(`crates/axum/src/routes/`) and DTOs (`crates/axum/src/dto.rs`) at the revision
+this backend pins, `ef829117a2c33e601b573b96a207fc5955a0076a`. Doorman no longer
+ships a reference browser client, so there is nothing upstream to diff against:
+when the pin moves, re-read those two places. Only the error codes are
+drift-checked; a wrong route or shape fails loudly as a 404 or 422 instead.
 
-Gameboxd changes four things, all of which the diff shows:
+Every session this backend starts is a cookie session, so no response carries a
+token and the adapter never handles one.
 
-- **A base URL.** The SPA and the API are separate origins; the upstream
-  reference assumes it is served from the backend's origin.
-- **Re-authentication.** Upstream sends destructive requests without proof and
-  hands the resulting 401 to the caller. `withReauth` runs the step-up ceremony
-  and retries once, so removing a passkey, changing an email or deleting an
-  account works without the UI reimplementing it three times.
-- **The error vocabulary**, moved to `errors.ts` and shared with `client.ts`.
-  Upstream's predicates only understood upstream's error class, which is wrong
-  for every screen that calls an `/api` route.
+On top of the raw routes the adapter adds four things:
+
+- **A base URL.** The SPA and the API are separate origins, so every request
+  needs an absolute one.
+- **Re-authentication.** A gated action sent without proof answers
+  `401 reauth_required`. `withReauth` runs the step-up ceremony and retries
+  once, so removing a passkey, changing an email, deleting an account or
+  revoking sessions works without the UI reimplementing it. Which actions are
+  gated is the server's policy; the adapter wraps every destructive one.
+- **The error vocabulary**, in `errors.ts` and shared with `client.ts`, because
+  Doorman's codes arrive on `/api` routes too.
 - **Ceremony failures.** `navigator.credentials.create()` and `.get()` *reject*
-  with a `DOMException` rather than resolving `null`, so upstream's `if (!cred)`
-  guard almost never fires and a dismissed prompt — the most common outcome of
-  all — escapes as an unrecognised exception carrying browser-authored text.
+  with a `DOMException` rather than resolving `null`, so an `if (!cred)` guard
+  almost never fires and a dismissed prompt — the most common outcome of all —
+  would escape as an unrecognised exception carrying browser-authored text.
   They are translated into `AuthError`s with the `ClientCode` codes instead.
 
 ## Type-checking

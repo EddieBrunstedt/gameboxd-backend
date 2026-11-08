@@ -56,9 +56,10 @@ pub fn router(config: &Config, state: AppState, auth: &AuthService) -> Router {
         ])
         // `If-Match` carries the concurrency precondition on playthrough edits,
         // and an `ETag` is useless to the SPA unless the browser may read it.
+        // No `Authorization`: every session is a cookie session, and Doorman
+        // starts no session whose token a script would carry in a header.
         .allow_headers([
             header::CONTENT_TYPE,
-            header::AUTHORIZATION,
             header::IF_MATCH,
             header::HeaderName::from_static("idempotency-key"),
         ])

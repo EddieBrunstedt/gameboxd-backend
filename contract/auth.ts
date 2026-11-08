@@ -1,28 +1,30 @@
 // Gameboxd's browser adapter for Doorman's passkey HTTP surface.
 //
-// Derived from `examples/web-client/passkey.ts` in Doorman at the revision this
-// backend pins. The unmodified original sits beside this file as
-// `doorman/passkey.upstream.ts` and is byte-compared against the pinned
-// checkout by `tests/contract.rs`, so bumping the pin fails loudly here rather
-// than letting this adapter drift away from the server it talks to. Diff the
-// two files to see exactly what Gameboxd changed:
+// Written against Doorman's own routes and DTOs (`crates/axum/src/routes/` and
+// `crates/axum/src/dto.rs`) at the revision this backend pins. Doorman no
+// longer ships a reference browser client, so there is no upstream file to
+// diff against: when the pin moves, re-read those two places. The error codes
+// are drift-checked by `tests/contract.rs`; the routes and shapes below are
+// not, and fail loudly (404, 422) when they are wrong.
+//
+// What this adapter adds on top of the raw routes:
 //
 //   1. `configureAuth` — the SPA and the API are different origins, so every
-//      request needs an absolute base URL. The upstream reference assumes it
-//      is served from the same origin as the backend.
-//   2. Re-authentication — the upstream reference sends destructive requests
-//      without proof and surfaces the resulting 401 to the caller. Gameboxd
-//      runs the step-up ceremony and retries, because a 401 meaning "prove it
-//      again" must not be handled like a 401 meaning "you are signed out".
-//   3. Error vocabulary — the codes, the guidance table and the predicates moved
-//      to `./errors.ts`, shared with `./client.ts`. Doorman's session layer
-//      fronts the application routes too, so its codes arrive there as well and
-//      a predicate that only understood this file's error class was wrong for
-//      every screen that called an `/api` route.
+//      request needs an absolute base URL.
+//   2. Re-authentication — Doorman answers a gated action without proof with
+//      `401 reauth_required`. `withReauth` runs the step-up ceremony and
+//      retries once, because a 401 meaning "prove it again" must not be handled
+//      like a 401 meaning "you are signed out".
+//   3. Error vocabulary — the codes, the guidance table and the predicates live
+//      in `./errors.ts`, shared with `./client.ts`. Doorman's session layer
+//      fronts the application routes too, so its codes arrive there as well.
 //   4. Ceremony failures — `navigator.credentials` rejects with a
-//      `DOMException`, which upstream lets escape raw. Those rejections are
-//      translated into `AuthError`s carrying a code, because a dismissed prompt
-//      is an ordinary outcome the UI has to recognise, not an unknown crash.
+//      `DOMException`. Those rejections are translated into `AuthError`s
+//      carrying a code, because a dismissed prompt is an ordinary outcome the
+//      UI has to recognise, not an unknown crash.
+//
+// Every session this backend starts is a cookie session: the token travels
+// only in the HttpOnly cookie, and no response body carries it.
 //
 // The server serializes WebAuthn options and responses as base64url JSON.
 // The browser APIs require ArrayBuffer fields, so these helpers translate
@@ -96,25 +98,31 @@ type Challenge<T> = { challenge_id: string; options: T };
 export type UserDto = {
   id: string;
   email: string | null;
-  email_verified: boolean;
   created_at: string;
   passkey_count: number;
 };
 
+/**
+ * How a session's token travels. This backend only starts cookie sessions;
+ * the DPoP variant is listed because it is what Doorman's DTO can carry.
+ */
+export type SessionTransport = "cookie" | { dpop: { jkt: string } };
+
 export type SessionDto = {
   id: string;
+  transport: SessionTransport;
   created_at: string;
   expires_at: string;
-  ip: string | null;
+  ip: string;
   user_agent: string | null;
   device_label: string | null;
   is_current: boolean;
 };
 
+/** What signup, recovery and sign-in return. The token is in the cookie only. */
 export type AuthResponse = {
   user: UserDto;
   session: SessionDto;
-  token: string;
 };
 
 export type PasskeyDto = {
@@ -231,7 +239,7 @@ async function requestJson<T>(path: string, init: RequestInit = {}): Promise<T> 
           | AnyErrorCode
           | undefined) ?? null;
     } catch {
-      // non-JSON body (e.g. the CSRF layer); fall back to status-based guidance.
+      // non-JSON body; fall back to status-based guidance.
     }
     throw new AuthError(code, res.status, guidanceFor(code, res.status));
   }
@@ -261,10 +269,9 @@ async function deleteJson(path: string, body?: unknown): Promise<void> {
 /**
  * Runs one WebAuthn ceremony and turns its failures into `AuthError`s.
  *
- * This is the part upstream's reference leaves to the caller. Both
- * `navigator.credentials.create()` and `.get()` signal every outcome except
- * success by *rejecting* with a `DOMException` — they do not resolve `null`,
- * which is why the `if (!cred)` guard the reference carries almost never fires.
+ * Both `navigator.credentials.create()` and `.get()` signal every outcome
+ * except success by *rejecting* with a `DOMException` — they do not resolve
+ * `null`, so an `if (!cred)` guard alone almost never fires.
  * Letting those reject raw means the single most common outcome of a passkey
  * prompt, the user dismissing it, arrives at the UI as an unrecognised
  * exception with a browser-authored message.
@@ -344,7 +351,7 @@ export async function requestSignup(email: string): Promise<void> {
 }
 
 export async function finishSignup(token: string, passkeyName?: string): Promise<AuthResponse> {
-  const start = await postJson<Challenge<ServerCreationOptions>>("/auth/signup/consume", { token });
+  const start = await postJson<Challenge<ServerCreationOptions>>("/auth/signup/redeem", { token });
   return finishRegistration<AuthResponse>(start, "/auth/signup/finish", passkeyName);
 }
 
@@ -353,7 +360,7 @@ export async function requestRecovery(email: string): Promise<void> {
 }
 
 export async function finishRecovery(token: string, passkeyName?: string): Promise<AuthResponse> {
-  const start = await postJson<Challenge<ServerCreationOptions>>("/auth/recovery/consume", { token });
+  const start = await postJson<Challenge<ServerCreationOptions>>("/auth/recovery/redeem", { token });
   return finishRegistration<AuthResponse>(start, "/auth/recovery/finish", passkeyName);
 }
 
@@ -419,12 +426,19 @@ export async function listSessions(): Promise<SessionDto[]> {
   return getJson<SessionDto[]>("/auth/sessions");
 }
 
+// Revoking sessions runs through the same gate as every destructive action, so
+// it is refused during the recovery cool-down and steps up if the server's
+// policy asks. Revoking the current session's own ID logs it out instead.
 export async function revokeSession(id: string): Promise<void> {
-  await deleteJson(`/auth/sessions/${id}`);
+  await withReauth((reauthentication) =>
+    deleteJson(`/auth/sessions/${id}`, reauthentication && { reauthentication }),
+  );
 }
 
 export async function revokeOtherSessions(): Promise<void> {
-  await deleteJson("/auth/sessions");
+  await withReauth((reauthentication) =>
+    deleteJson("/auth/sessions", reauthentication && { reauthentication }),
+  );
 }
 
 // End the current session server-side; the server also clears the cookie.
@@ -434,7 +448,9 @@ export async function logout(): Promise<void> {
 
 // Revoke every session for the user, including this one.
 export async function logoutEverywhere(): Promise<void> {
-  await postJson<void>("/auth/logout-all");
+  await withReauth((reauthentication) =>
+    postJson<void>("/auth/logout-all", reauthentication && { reauthentication }),
+  );
 }
 
 // Start a verified email change. Mails a confirmation link to the new address;
@@ -442,20 +458,20 @@ export async function logoutEverywhere(): Promise<void> {
 // token. Blocked during the recovery cool-down.
 export async function requestEmailChange(newEmail: string): Promise<void> {
   await withReauth((reauthentication) =>
-    postJson<void>("/auth/account/email", { new_email: newEmail, reauthentication }),
+    postJson<void>("/auth/user/email", { new_email: newEmail, reauthentication }),
   );
 }
 
 // Redeem the token from the new address's link. No session required — the
 // single-use token authorises the change. Returns the updated user.
 export async function confirmEmailChange(token: string): Promise<UserDto> {
-  return postJson<UserDto>("/auth/account/email/confirm", { token });
+  return postJson<UserDto>("/auth/user/email/confirm", { token });
 }
 
-// Irreversibly delete the current account and everything tied to it; the
-// server also clears the cookie. Blocked during the recovery cool-down.
+// Irreversibly delete the current user and everything tied to it; the server
+// also clears the cookie. Blocked during the recovery cool-down.
 export async function deleteAccount(): Promise<void> {
   await withReauth((reauthentication) =>
-    deleteJson("/auth/account", reauthentication && { reauthentication }),
+    deleteJson("/auth/user", reauthentication && { reauthentication }),
   );
 }

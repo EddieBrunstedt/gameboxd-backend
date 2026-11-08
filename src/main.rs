@@ -24,7 +24,12 @@ async fn main() -> anyhow::Result<()> {
         logs.pretty().init();
     }
     let database = Database::connect(&config.database_url).await?;
-    let auth = auth::build(&config, &database.auth, database.app.clone())?;
+    let auth = auth::build(
+        &config,
+        &database.auth,
+        database.app.clone(),
+        auth::email_sender(&config)?,
+    )?;
     let igdb = IgdbClient::new(config.igdb_credentials.clone(), Endpoints::default())?;
     if config.igdb_credentials.is_none() {
         tracing::info!("IGDB not configured; local catalog remains available");
@@ -57,9 +62,6 @@ async fn main() -> anyhow::Result<()> {
             }
             if let Err(error) = gameboxd_backend::db::purge_auth_audit(&moderation_pool).await {
                 tracing::error!(%error, "Authentication audit cleanup failed");
-            }
-            if let Err(error) = auth.purge_expired(chrono::Utc::now()).await {
-                tracing::error!(%error, "Expired authentication data cleanup failed");
             }
             tracing::info!("Maintenance cycle completed");
         }

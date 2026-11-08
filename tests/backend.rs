@@ -1,6 +1,7 @@
 use std::{
     net::SocketAddr,
     str::FromStr,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -11,11 +12,11 @@ use axum::{
     http::{Request, StatusCode},
     response::Response,
 };
-use chrono::Utc;
-use doorman::{
-    core::{audit::Actor, storage::AccountStatus},
-    prelude::{AuthService, OperatorActor, SessionContext, User, UserId},
+use doorman::prelude::{
+    Actor, AuditEventKind, AuthService, ClientIp, OperatorActor, RequestTransport, SameSite,
+    SessionContext, UserId,
 };
+use doorman_test_support::{CapturingEmailSender, ResidentAuthenticator, token_from_email};
 use gameboxd_backend::{
     AppState, auth,
     config::Config,
@@ -42,11 +43,22 @@ fn test_peer() -> SocketAddr {
     SocketAddr::new(std::net::IpAddr::V4((0x0a00_0000 | n).into()), 12345)
 }
 
+/// Where the test SPA runs. Doorman trusts it, as the relying party's origin,
+/// for state-changing requests that carry the session cookie.
+const FRONTEND_ORIGIN: &str = "http://localhost:5173";
+
+/// The `Cookie` header a browser at `FRONTEND_ORIGIN` sends for a session.
+fn session_cookie(token: &str) -> String {
+    format!("gameboxd_session={token}")
+}
+
 struct Fixture {
     name: String,
     admin: PgPool,
     database: Database,
     auth: AuthService,
+    /// Every email Doorman sends, so a test can follow a signup link.
+    mail: Arc<CapturingEmailSender>,
     app: Router,
     server: MockServer,
     refresh: Option<JoinHandle<()>>,
@@ -100,12 +112,14 @@ impl Fixture {
             database_url: test_url.to_string(),
             frontend_origin: "http://localhost:5173".parse().unwrap(),
             rp_id: "localhost".into(),
-            cookie_same_site: cookie::SameSite::Lax,
+            cookie_same_site: SameSite::Lax,
             production: false,
             igdb_credentials: None,
             smtp: None,
         };
-        let auth = auth::build(&config, &database.auth, database.app.clone()).unwrap();
+        let mail = Arc::new(CapturingEmailSender::new());
+        let auth =
+            auth::build(&config, &database.auth, database.app.clone(), mail.clone()).unwrap();
         let server = MockServer::start().await;
         Mock::given(path("/token"))
             .respond_with(
@@ -151,35 +165,47 @@ impl Fixture {
             admin,
             database,
             auth,
+            mail,
             app,
             server,
             refresh,
         }
     }
 
+    /// Signs a new user up the way a browser does — email link, then a passkey
+    /// registration — and returns their ID and cookie session token.
     async fn user(&self, name: &str) -> (UserId, String) {
-        let id = UserId::new();
-        self.auth
-            .state()
-            .user_store()
-            .create_user(User {
-                id,
-                email: Some(format!("{name}@example.test")),
-                email_verified_at: Some(Utc::now()),
-                status: AccountStatus::Active,
-                created_at: Utc::now(),
-                updated_at: Utc::now(),
-            })
+        let email = format!("{name}@example.test");
+        let context = || SessionContext::new(ClientIp::new(test_peer().ip()), None);
+        let signup = self.auth.state().signup();
+        signup
+            .request_signup(&email, None, context())
             .await
             .unwrap();
-        let session = self
-            .auth
-            .state()
-            .session_manager()
-            .create(id, SessionContext::default())
+        let link = self
+            .mail
+            .sent()
+            .into_iter()
+            .rfind(|sent| sent.to == email)
+            .expect("Doorman emails a signup link");
+        let token = token_from_email(
+            &link.body_text,
+            &format!("{FRONTEND_ORIGIN}/signup?token={{token}}"),
+        );
+        let started = signup.redeem_signup_link(&token, context()).await.unwrap();
+        let mut authenticator = ResidentAuthenticator::new(&FRONTEND_ORIGIN.parse().unwrap());
+        let credential = authenticator.do_registration(started.options);
+        let outcome = signup
+            .finish_signup(
+                started.challenge_id,
+                &credential,
+                None,
+                RequestTransport::Cookie,
+                context(),
+            )
             .await
             .unwrap();
-        (id, session.token)
+        (outcome.user.id, outcome.session.token)
     }
 
     async fn call(&self, method: &str, path: &str, token: Option<&str>, body: Value) -> Response {
@@ -202,7 +228,9 @@ impl Fixture {
             .extension(ConnectInfo(test_peer()))
             .header("Content-Type", "application/json");
         if let Some(token) = token {
-            request = request.header("Authorization", format!("Bearer {token}"));
+            request = request
+                .header("Cookie", session_cookie(token))
+                .header("Origin", FRONTEND_ORIGIN);
         }
         for (name, value) in headers {
             request = request.header(*name, *value);
@@ -223,7 +251,8 @@ impl Fixture {
             .uri(path)
             .extension(ConnectInfo(test_peer()))
             .header("Content-Type", content_type)
-            .header("Authorization", format!("Bearer {token}"))
+            .header("Cookie", session_cookie(token))
+            .header("Origin", FRONTEND_ORIGIN)
             .body(Body::from(body.to_owned()))
             .unwrap();
         self.app.clone().oneshot(request).await.unwrap()
@@ -1197,12 +1226,26 @@ async fn socket_authentication_limits_and_audit_ignore_forwarding_headers() {
             .fetch_all(&fixture.database.app)
             .await
             .unwrap();
-    assert!(events.len() >= 2, "signup must persist audit events");
-    for event in events {
-        assert!(matches!(event.0.actor,
-            Actor::Subject { ip: Some(ref ip), user_agent: Some(ref ua) }
-            if ip == "127.0.0.1" && ua == "client-ip-regression"
-        ));
+    // Doorman audits the refused sign-in starts as well as the signups, and
+    // every one of them, spoofed forwarding headers or not, names the socket.
+    let kinds: Vec<&str> = events
+        .iter()
+        .map(|event| match event.0.kind {
+            AuditEventKind::SignupRequested { .. } => "signup",
+            AuditEventKind::RateLimited { .. } => "rate_limited",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(kinds.iter().filter(|kind| **kind == "signup").count(), 2);
+    assert!(kinds.contains(&"rate_limited"), "{kinds:?}");
+    for event in &events {
+        let Actor::Subject { ip, user_agent } = &event.0.actor else {
+            panic!("unauthenticated requests are audited as subjects: {event:?}");
+        };
+        assert_eq!(ip.to_string(), "127.0.0.1");
+        if matches!(event.0.kind, AuditEventKind::SignupRequested { .. }) {
+            assert_eq!(user_agent.as_deref(), Some("client-ip-regression"));
+        }
     }
     shutdown.send(()).unwrap();
     server.await.unwrap();
@@ -1754,7 +1797,7 @@ async fn browser_security_validation_and_account_deletion_cascade() {
     // The user-facing route must demand a fresh passkey proof.
     let delete = json_body(
         fixture
-            .call("DELETE", "/auth/account", Some(&token), json!({}))
+            .call("DELETE", "/auth/user", Some(&token), json!({}))
             .await,
         StatusCode::UNAUTHORIZED,
     )
@@ -1765,7 +1808,7 @@ async fn browser_security_validation_and_account_deletion_cascade() {
         .auth
         .state()
         .operator()
-        .delete_account(
+        .delete_user(
             id,
             OperatorActor::new("integration-test", None, None, None).unwrap(),
         )
@@ -4032,7 +4075,7 @@ async fn diary_notes_survive_membership_removal_and_replay_but_follow_parent_and
     f.auth
         .state()
         .operator()
-        .delete_account(
+        .delete_user(
             id,
             OperatorActor::new("integration-test", None, None, None).unwrap(),
         )
@@ -5924,7 +5967,7 @@ async fn public_handles_are_unique_revision_protected_and_safe_across_renames() 
     f.auth
         .state()
         .operator()
-        .delete_account(
+        .delete_user(
             winner_id,
             OperatorActor::new("profile-test", None, None, None).unwrap(),
         )
@@ -8081,7 +8124,7 @@ async fn following_is_private_idempotent_and_cascades_after_migration() {
     f.auth
         .state()
         .operator()
-        .delete_account(
+        .delete_user(
             author_id,
             OperatorActor::new("follow-test", None, None, None).unwrap(),
         )
@@ -8103,7 +8146,7 @@ async fn following_is_private_idempotent_and_cascades_after_migration() {
     f.auth
         .state()
         .operator()
-        .delete_account(
+        .delete_user(
             reader_id,
             OperatorActor::new("follow-test", None, None, None).unwrap(),
         )
@@ -8278,7 +8321,7 @@ async fn feed_projects_independent_components_and_revokes_every_source_live() {
     f.auth
         .state()
         .operator()
-        .delete_account(
+        .delete_user(
             author_id,
             OperatorActor::new("feed-test", None, None, None).unwrap(),
         )
@@ -9415,7 +9458,7 @@ async fn safety_report_quota_retention_deletion_and_migration_preserve_private_d
     f.auth
         .state()
         .operator()
-        .delete_account(
+        .delete_user(
             reporter_id,
             OperatorActor::new("safety-test", None, None, None).unwrap(),
         )
@@ -9438,7 +9481,7 @@ async fn safety_report_quota_retention_deletion_and_migration_preserve_private_d
     f.auth
         .state()
         .operator()
-        .delete_account(
+        .delete_user(
             author_id,
             OperatorActor::new("safety-test", None, None, None).unwrap(),
         )
@@ -11061,7 +11104,8 @@ async fn retry_contention_is_bounded_and_cancelled_requests_release_reservations
             "127.0.0.1:12345".parse::<SocketAddr>().unwrap(),
         ))
         .header("Content-Type", "application/json")
-        .header("Authorization", format!("Bearer {token}"))
+        .header("Cookie", session_cookie(&token))
+        .header("Origin", FRONTEND_ORIGIN)
         .header("Idempotency-Key", "blocked")
         .body(Body::from(
             json!({"kind":"custom","title":"One list"}).to_string(),
@@ -11265,11 +11309,9 @@ async fn launch_trusted_proxy_socket_limits_and_audit_use_verified_client() {
             .fetch_all(&f.database.app)
             .await
             .unwrap();
-    assert!(
-        events.iter().any(
-            |e| matches!(&e.0.actor, Actor::Subject { ip: Some(ip), .. } if ip == "203.0.113.5")
-        )
-    );
+    assert!(events.iter().any(
+        |e| matches!(&e.0.actor, Actor::Subject { ip, .. } if ip.to_string() == "203.0.113.5")
+    ));
     // More expensive writes are gated even when authentication fails.
     for (route, burst) in [
         ("/api/me/reports", 5),
@@ -11465,12 +11507,18 @@ async fn launch_backup_restore_preserves_all_tables_and_application_behavior() {
         database_url: restored_url.to_string(),
         frontend_origin: "http://localhost:5173".parse().unwrap(),
         rp_id: "localhost".into(),
-        cookie_same_site: cookie::SameSite::Lax,
+        cookie_same_site: SameSite::Lax,
         production: false,
         igdb_credentials: None,
         smtp: None,
     };
-    let auth = auth::build(&config, &restored.auth, restored.app.clone()).unwrap();
+    let auth = auth::build(
+        &config,
+        &restored.auth,
+        restored.app.clone(),
+        Arc::new(CapturingEmailSender::new()),
+    )
+    .unwrap();
     let app = router(
         &config,
         AppState {
@@ -11490,7 +11538,8 @@ async fn launch_backup_restore_preserves_all_tables_and_application_behavior() {
                 Request::builder()
                     .uri(route)
                     .extension(ConnectInfo(test_peer()))
-                    .header("Authorization", format!("Bearer {token}"))
+                    .header("Cookie", session_cookie(&token))
+                    .header("Origin", FRONTEND_ORIGIN)
                     .body(Body::empty())
                     .unwrap(),
             )
@@ -11525,7 +11574,8 @@ async fn launch_backup_restore_preserves_all_tables_and_application_behavior() {
                 .method("POST")
                 .uri("/api/me/lists")
                 .extension(ConnectInfo(test_peer()))
-                .header("Authorization", format!("Bearer {token}"))
+                .header("Cookie", session_cookie(&token))
+                .header("Origin", FRONTEND_ORIGIN)
                 .header("Content-Type", "application/json")
                 .header("Idempotency-Key", "backup-receipt")
                 .body(Body::from(

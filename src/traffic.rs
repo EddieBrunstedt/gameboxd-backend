@@ -6,7 +6,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
 };
-use doorman::axum::extractors::ClientIp;
+use doorman::axum::ClientIp;
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
@@ -168,7 +168,7 @@ pub async fn admit(State(traffic): State<Traffic>, mut request: Request, next: N
         Ok(ip) => ip,
         Err(error) => return error.into_response(),
     };
-    request.extensions_mut().insert(ClientIp(ip));
+    request.extensions_mut().insert(ClientIp::new(ip));
     let path = request.uri().path();
     let write = !matches!(
         *request.method(),

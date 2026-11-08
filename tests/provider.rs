@@ -354,7 +354,7 @@ fn configuration_rejects_unsafe_browser_origins() {
         database_url: "unused".into(),
         frontend_origin: "http://localhost:5173".parse().unwrap(),
         rp_id: "localhost".into(),
-        cookie_same_site: cookie::SameSite::Lax,
+        cookie_same_site: doorman::axum::SameSite::Lax,
         production: false,
         igdb_credentials: None,
         smtp: None,
@@ -389,7 +389,7 @@ fn a_cross_site_cookie_must_also_be_secure() {
         database_url: "unused".into(),
         frontend_origin: "http://localhost:5173".parse().unwrap(),
         rp_id: "localhost".into(),
-        cookie_same_site: cookie::SameSite::None,
+        cookie_same_site: doorman::axum::SameSite::None,
         production: false,
         igdb_credentials: None,
         smtp: None,
@@ -405,6 +405,6 @@ fn a_cross_site_cookie_must_also_be_secure() {
     // And the default stays valid on localhost, where it is also correct.
     config.frontend_origin = "http://localhost:5173".parse().unwrap();
     config.rp_id = "localhost".into();
-    config.cookie_same_site = cookie::SameSite::Lax;
+    config.cookie_same_site = doorman::axum::SameSite::Lax;
     assert!(config.validate().is_ok());
 }

@@ -4,7 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, bail};
-use cookie::SameSite;
+use doorman::axum::SameSite;
 use url::Url;
 
 #[derive(Clone)]
